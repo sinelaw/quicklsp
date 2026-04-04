@@ -569,7 +569,7 @@ impl LanguageServer for QuickLspServer {
                             },
                         },
                     },
-                    container_name: None,
+                    container_name: s.container.clone(),
                 }
             })
             .collect();
@@ -580,14 +580,24 @@ impl LanguageServer for QuickLspServer {
         &self,
         params: WorkspaceSymbolParams,
     ) -> Result<Option<Vec<SymbolInformation>>> {
+        use crate::parsing::tokenizer::Visibility;
         let enc = *self.pos_encoding.read().await;
         if params.query.is_empty() {
             return Ok(None);
         }
-        let results = self.workspace.search_symbols(&params.query);
+        let mut results = self.workspace.search_symbols(&params.query);
         if results.is_empty() {
             return Ok(None);
         }
+        // Rank public symbols higher than private ones
+        results.sort_by(|a, b| {
+            let vis_score = |v: Visibility| match v {
+                Visibility::Public => 2,
+                Visibility::Unknown => 1,
+                Visibility::Private => 0,
+            };
+            vis_score(b.symbol.visibility).cmp(&vis_score(a.symbol.visibility))
+        });
         let syms: Vec<SymbolInformation> = results
             .iter()
             .take(20)
@@ -601,7 +611,7 @@ impl LanguageServer for QuickLspServer {
                     tags: None,
                     deprecated: None,
                     location,
-                    container_name: None,
+                    container_name: loc.symbol.container.clone(),
                 })
             })
             .collect();
@@ -753,12 +763,29 @@ impl LanguageServer for QuickLspServer {
             Some(s) if !s.is_empty() => s,
             _ => return Ok(None),
         };
+        let current_file = uri.to_file_path().ok();
         let mut results = self.workspace.completions(&partial);
         // Merge dependency completions
         let dep_results = self.dep_index.completions(&partial);
         results.extend(dep_results);
         if results.is_empty() {
             return Ok(None);
+        }
+        // Rank: same-file private > public > unknown > other-file private
+        {
+            use crate::parsing::tokenizer::Visibility;
+            results.sort_by(|a, b| {
+                let vis_score = |loc: &crate::workspace::SymbolLocation| {
+                    let same_file = current_file.as_deref() == Some(loc.file.as_path());
+                    match (loc.symbol.visibility, same_file) {
+                        (Visibility::Private, true) => 3, // same-file private is best
+                        (Visibility::Public, _) => 2,
+                        (Visibility::Unknown, _) => 1,
+                        (Visibility::Private, false) => 0,
+                    }
+                };
+                vis_score(b).cmp(&vis_score(a))
+            });
         }
         let mut seen = std::collections::HashSet::new();
         let items: Vec<CompletionItem> = results

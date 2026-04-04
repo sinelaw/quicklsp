@@ -1,6 +1,6 @@
 //! Symbol types and extraction from tokenizer output.
 
-use super::tokenizer::{LangFamily, Token, TokenKind};
+use super::tokenizer::{DefContext, LangFamily, Token, TokenKind, Visibility};
 
 /// A symbol extracted from source code.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16,6 +16,12 @@ pub struct Symbol {
     pub doc_comment: Option<String>,
     /// The full signature line(s) of the definition.
     pub signature: Option<String>,
+    /// Visibility of the definition (public, private, or unknown).
+    pub visibility: Visibility,
+    /// Name of the containing scope (e.g., "Config" for methods inside `impl Config`).
+    pub container: Option<String>,
+    /// Brace/indentation depth of the definition.
+    pub depth: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -59,8 +65,17 @@ impl Symbol {
     /// The tokenizer emits `DefKeyword` tokens followed by `Ident` tokens.
     /// We pair them up to produce symbols.
     pub fn from_tokens(tokens: &[Token]) -> Vec<Symbol> {
+        Self::from_tokens_with_contexts(tokens, &[])
+    }
+
+    /// Extract symbols from tokenizer output with scope/visibility contexts.
+    ///
+    /// `contexts` is parallel to the definition pairs in `tokens` —
+    /// the Nth DefContext corresponds to the Nth DefKeyword+Ident pair.
+    pub fn from_tokens_with_contexts(tokens: &[Token], contexts: &[DefContext]) -> Vec<Symbol> {
         let mut symbols = Vec::new();
         let mut i = 0;
+        let mut ctx_idx = 0;
 
         while i < tokens.len() {
             if tokens[i].kind == TokenKind::DefKeyword
@@ -69,6 +84,7 @@ impl Symbol {
             {
                 let keyword = &tokens[i];
                 let ident = &tokens[i + 1];
+                let ctx = contexts.get(ctx_idx);
                 symbols.push(Symbol {
                     name: ident.text.clone(),
                     kind: SymbolKind::from_keyword(&keyword.text),
@@ -77,7 +93,11 @@ impl Symbol {
                     def_keyword: keyword.text.clone(),
                     doc_comment: None,
                     signature: None,
+                    visibility: ctx.map(|c| c.visibility).unwrap_or(Visibility::Unknown),
+                    container: ctx.and_then(|c| c.container.clone()),
+                    depth: ctx.map(|c| c.depth).unwrap_or(0),
                 });
+                ctx_idx += 1;
                 i += 2;
                 continue;
             }
