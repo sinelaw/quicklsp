@@ -298,7 +298,15 @@ impl Workspace {
             if let Some(line) = lines.get(line_idx) {
                 let trimmed = line.trim_start();
                 // Check for patterns like: `impl Foo`, `struct Foo`, `class Foo`
-                for keyword in &["impl", "struct", "class", "trait", "enum", "interface", "object"] {
+                for keyword in &[
+                    "impl",
+                    "struct",
+                    "class",
+                    "trait",
+                    "enum",
+                    "interface",
+                    "object",
+                ] {
                     if let Some(rest) = trimmed.strip_prefix(keyword) {
                         // The qualifier should appear as the next word after the keyword
                         let rest = rest.trim_start();
@@ -447,11 +455,7 @@ impl Workspace {
                             // Extract qualifier before the function name
                             // (e.g., "Workspace" from "Workspace::new(")
                             let qualifier = extract_qualifier_before(&chars, name_start);
-                            self.rank_definitions(
-                                &mut defs,
-                                None,
-                                qualifier.as_deref(),
-                            );
+                            self.rank_definitions(&mut defs, None, qualifier.as_deref());
                             if let Some(loc) = defs.into_iter().next() {
                                 return Some((loc, comma_count));
                             }
@@ -1020,10 +1024,7 @@ mod tests {
     fn extract_qualifier_before_arrow() {
         let chars: Vec<char> = "ptr->method()".chars().collect();
         // "method" starts at index 5 (p=0,t=1,r=2,-=3,>=4,m=5)
-        assert_eq!(
-            extract_qualifier_before(&chars, 5),
-            Some("ptr".to_string())
-        );
+        assert_eq!(extract_qualifier_before(&chars, 5), Some("ptr".to_string()));
     }
 
     #[test]
@@ -1059,14 +1060,8 @@ mod tests {
     #[test]
     fn rank_definitions_prefers_same_file() {
         let ws = Workspace::new();
-        ws.index_file(
-            PathBuf::from("/src/a.rs"),
-            "fn helper() {}".to_string(),
-        );
-        ws.index_file(
-            PathBuf::from("/src/b.rs"),
-            "fn helper() {}".to_string(),
-        );
+        ws.index_file(PathBuf::from("/src/a.rs"), "fn helper() {}".to_string());
+        ws.index_file(PathBuf::from("/src/b.rs"), "fn helper() {}".to_string());
 
         let mut defs = ws.find_definitions("helper");
         assert_eq!(defs.len(), 2);
@@ -1097,11 +1092,7 @@ mod tests {
         assert_eq!(defs.len(), 2);
 
         // Even though current_file is a.rs, qualifier "Workspace" should win
-        ws.rank_definitions(
-            &mut defs,
-            Some(Path::new("/src/a.rs")),
-            Some("Workspace"),
-        );
+        ws.rank_definitions(&mut defs, Some(Path::new("/src/a.rs")), Some("Workspace"));
         assert_eq!(defs[0].file, PathBuf::from("/src/b.rs"));
     }
 }
