@@ -1,4 +1,7 @@
 //! Index persistence: meta.json for freshness checks, warm startup.
+//!
+//! Indexes are stored in the XDG cache directory under a per-project subdirectory:
+//! `~/.cache/quicklsp/<project-hash>/index.v<N>.qlsp`
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -52,6 +55,44 @@ impl IndexMeta {
 
 /// Current index format version.
 pub const CURRENT_VERSION: u32 = 1;
+
+/// Compute the XDG cache directory for a project's index.
+///
+/// Returns `$XDG_CACHE_HOME/quicklsp/<project-hash>/` where project-hash
+/// is a hex-encoded FNV-1a hash of the canonicalized project root path.
+/// Falls back to `~/.cache/quicklsp/<project-hash>/` if XDG_CACHE_HOME is unset.
+pub fn index_dir_for_project(project_root: &Path) -> Option<PathBuf> {
+    let cache_base = std::env::var("XDG_CACHE_HOME")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| PathBuf::from(h).join(".cache"))
+        })?;
+
+    // Hash the canonical project root for a stable, unique directory name
+    let canonical = std::fs::canonicalize(project_root)
+        .unwrap_or_else(|_| project_root.to_path_buf());
+    let hash = path_hash(&canonical);
+
+    Some(cache_base.join("quicklsp").join(format!("{hash:016x}")))
+}
+
+/// Versioned index filename: `index.v<N>.qlsp`
+pub fn index_filename() -> String {
+    format!("index.v{CURRENT_VERSION}.qlsp")
+}
+
+/// FNV-1a hash of a path, used for per-project cache directory naming.
+fn path_hash(path: &Path) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in path.to_string_lossy().as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
 
 /// Compute a content hash from file paths and their modification times.
 /// This is a fast, non-cryptographic hash for freshness checking.
@@ -160,5 +201,32 @@ mod tests {
         let files1 = vec![(PathBuf::from("/a.rs"), SystemTime::UNIX_EPOCH)];
         let files2 = vec![(PathBuf::from("/b.rs"), SystemTime::UNIX_EPOCH)];
         assert_ne!(compute_content_hash(&files1), compute_content_hash(&files2));
+    }
+
+    #[test]
+    fn index_dir_uses_xdg_cache() {
+        // With XDG_CACHE_HOME set
+        std::env::set_var("XDG_CACHE_HOME", "/tmp/test-xdg-cache");
+        let dir = index_dir_for_project(Path::new("/home/user/myproject")).unwrap();
+        assert!(dir.starts_with("/tmp/test-xdg-cache/quicklsp/"));
+        assert!(!dir.to_string_lossy().contains("myproject")); // hashed, not literal
+        std::env::remove_var("XDG_CACHE_HOME");
+    }
+
+    #[test]
+    fn index_filename_includes_version() {
+        let name = index_filename();
+        assert!(name.starts_with("index.v"), "got: {name}");
+        assert!(name.ends_with(".qlsp"), "got: {name}");
+        assert!(name.contains(&CURRENT_VERSION.to_string()), "got: {name}");
+    }
+
+    #[test]
+    fn different_projects_get_different_dirs() {
+        std::env::set_var("XDG_CACHE_HOME", "/tmp/test-xdg-cache2");
+        let d1 = index_dir_for_project(Path::new("/project/a")).unwrap();
+        let d2 = index_dir_for_project(Path::new("/project/b")).unwrap();
+        assert_ne!(d1, d2);
+        std::env::remove_var("XDG_CACHE_HOME");
     }
 }

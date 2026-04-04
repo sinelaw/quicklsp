@@ -8,4 +8,6 @@ mod format;
 pub mod persistence;
 
 pub use format::{IndexEntry, WordDirectory, WordIndex, WordIndexBuilder};
-pub use persistence::{IndexMeta, collect_file_mtimes, compute_content_hash};
+pub use persistence::{
+    IndexMeta, collect_file_mtimes, compute_content_hash, index_dir_for_project, index_filename,
+};
