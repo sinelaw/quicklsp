@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 use dashmap::DashMap;
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use rayon::iter::{IntoParallelRefIterator, ParallelBridge, ParallelIterator};
 
 use tower_lsp::lsp_types::Url;
 
@@ -390,16 +390,15 @@ impl Workspace {
     /// It's the only operation that scans file contents, and it's exhaustive —
     /// no probabilistic filtering, no missed files.
     pub fn find_references(&self, name: &str) -> Vec<Reference> {
-        let mut results = Vec::new();
-
-        for entry in self.files.iter() {
-            let path = entry.key();
-            let file = entry.value();
-
-            find_word_occurrences(name, &file.source, path, &mut results);
-        }
-
-        results
+        self.files
+            .iter()
+            .par_bridge()
+            .flat_map_iter(|entry| {
+                let mut refs = Vec::new();
+                find_word_occurrences(name, &entry.value().source, entry.key(), &mut refs);
+                refs
+            })
+            .collect()
     }
 
     /// Get all symbols defined in a specific file.
