@@ -15,6 +15,61 @@
 //! non-ASCII bytes in identifier positions. Definition keywords are always ASCII,
 //! so the hot path for keyword matching stays byte-level for performance.
 
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+/// Global tokenizer counters for profiling diagnostics.
+/// Cheap atomic increments; zero overhead when not read.
+pub mod stats {
+    use super::*;
+
+    pub static SCAN_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static TOTAL_BYTES: AtomicU64 = AtomicU64::new(0);
+    pub static IDENT_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static IDENT_ASCII_ONLY: AtomicU64 = AtomicU64::new(0);
+    pub static IDENT_HIT_UNICODE: AtomicU64 = AtomicU64::new(0);
+    pub static IDENT_UNICODE_CHARS: AtomicU64 = AtomicU64::new(0);
+    pub static SKIPPED_COMMENT_BYTES: AtomicU64 = AtomicU64::new(0);
+    pub static SKIPPED_STRING_BYTES: AtomicU64 = AtomicU64::new(0);
+    pub static NON_IDENT_UNICODE_SKIPS: AtomicU64 = AtomicU64::new(0);
+
+    pub fn reset() {
+        SCAN_CALLS.store(0, Relaxed);
+        TOTAL_BYTES.store(0, Relaxed);
+        IDENT_CALLS.store(0, Relaxed);
+        IDENT_ASCII_ONLY.store(0, Relaxed);
+        IDENT_HIT_UNICODE.store(0, Relaxed);
+        IDENT_UNICODE_CHARS.store(0, Relaxed);
+        SKIPPED_COMMENT_BYTES.store(0, Relaxed);
+        SKIPPED_STRING_BYTES.store(0, Relaxed);
+        NON_IDENT_UNICODE_SKIPS.store(0, Relaxed);
+    }
+
+    pub fn summary() -> String {
+        let total = TOTAL_BYTES.load(Relaxed);
+        let ident_calls = IDENT_CALLS.load(Relaxed);
+        let ident_ascii = IDENT_ASCII_ONLY.load(Relaxed);
+        let ident_unicode = IDENT_HIT_UNICODE.load(Relaxed);
+        let unicode_chars = IDENT_UNICODE_CHARS.load(Relaxed);
+        let comment = SKIPPED_COMMENT_BYTES.load(Relaxed);
+        let string = SKIPPED_STRING_BYTES.load(Relaxed);
+        let non_ident_skips = NON_IDENT_UNICODE_SKIPS.load(Relaxed);
+        let pct = |n: u64, d: u64| if d == 0 { 0.0 } else { n as f64 / d as f64 * 100.0 };
+
+        format!(
+            "Scans: {}, Bytes: {} ({:.1} MB)\n\
+             Skip: comments {} ({:.1}%), strings {} ({:.1}%)\n\
+             Idents: {} total, {} ascii ({:.1}%), {} unicode ({:.1}%), {} unicode chars\n\
+             Non-ident unicode skips: {}",
+            SCAN_CALLS.load(Relaxed),
+            total, total as f64 / 1_048_576.0,
+            comment, pct(comment, total), string, pct(string, total),
+            ident_calls, ident_ascii, pct(ident_ascii, ident_calls),
+            ident_unicode, pct(ident_unicode, ident_calls),
+            unicode_chars, non_ident_skips,
+        )
+    }
+}
+
 /// A token extracted by the scanner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Token {
@@ -143,6 +198,9 @@ pub fn scan(source: &str, lang: LangFamily) -> Vec<Token> {
     let len = bytes.len();
     let def_keywords = lang.def_keywords();
 
+    stats::SCAN_CALLS.fetch_add(1, Relaxed);
+    stats::TOTAL_BYTES.fetch_add(len as u64, Relaxed);
+
     let mut tokens = Vec::new();
     let mut i = 0;
     let mut line = 0usize;
@@ -167,17 +225,23 @@ pub fn scan(source: &str, lang: LangFamily) -> Vec<Token> {
 
         // Skip line comments
         if lang.hash_line_comment() && b == b'#' {
+            let before = i;
             i = skip_to_eol(bytes, i);
+            stats::SKIPPED_COMMENT_BYTES.fetch_add((i - before) as u64, Relaxed);
             continue;
         }
         if lang.slash_line_comment() && b == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
+            let before = i;
             i = skip_to_eol(bytes, i);
+            stats::SKIPPED_COMMENT_BYTES.fetch_add((i - before) as u64, Relaxed);
             continue;
         }
 
         // Skip block comments
         if lang.block_comments() && b == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+            let before = i;
             i = skip_block_comment(bytes, i + 2, &mut line, &mut line_start);
+            stats::SKIPPED_COMMENT_BYTES.fetch_add((i - before) as u64, Relaxed);
             continue;
         }
 
@@ -187,8 +251,10 @@ pub fn scan(source: &str, lang: LangFamily) -> Vec<Token> {
             && ((b == b'"' && bytes[i + 1] == b'"' && bytes[i + 2] == b'"')
                 || (b == b'\'' && bytes[i + 1] == b'\'' && bytes[i + 2] == b'\''))
         {
+            let before = i;
             let quote = b;
             i = skip_triple_quote(bytes, i + 3, quote, &mut line, &mut line_start);
+            stats::SKIPPED_STRING_BYTES.fetch_add((i - before) as u64, Relaxed);
             continue;
         }
 
@@ -208,13 +274,17 @@ pub fn scan(source: &str, lang: LangFamily) -> Vec<Token> {
                 }
                 continue;
             }
+            let before = i;
             i = skip_string(bytes, i + 1, b, &mut line, &mut line_start);
+            stats::SKIPPED_STRING_BYTES.fetch_add((i - before) as u64, Relaxed);
             continue;
         }
 
         // Skip backtick template literals (JS/TS)
         if b == b'`' && matches!(lang, LangFamily::JsTs) {
+            let before = i;
             i = skip_string(bytes, i + 1, b'`', &mut line, &mut line_start);
+            stats::SKIPPED_STRING_BYTES.fetch_add((i - before) as u64, Relaxed);
             continue;
         }
 
@@ -227,6 +297,15 @@ pub fn scan(source: &str, lang: LangFamily) -> Vec<Token> {
             // If the first byte is ASCII, the keyword fast-path can stay byte-level.
             // If any byte >= 0x80, we need to switch to char iteration.
             i = consume_identifier(source, i);
+
+            // Non-alphanumeric Unicode chars (e.g., box-drawing │, em-dash ─) have
+            // a leading byte >= 0xC0 that passes is_ident_start_byte, but the full
+            // char is not an identifier character. Skip the whole UTF-8 sequence.
+            if i == start {
+                stats::NON_IDENT_UNICODE_SKIPS.fetch_add(1, Relaxed);
+                i += utf8_char_len(b);
+                continue;
+            }
 
             let word = &source[start..i];
 
@@ -287,25 +366,32 @@ fn consume_identifier(source: &str, start: usize) -> usize {
     let bytes = source.as_bytes();
     let mut i = start;
 
+    stats::IDENT_CALLS.fetch_add(1, Relaxed);
+
     // Fast path: pure ASCII identifier
     while i < bytes.len() && bytes[i] < 0x80 {
         if is_ident_continue_byte(bytes[i]) {
             i += 1;
         } else {
+            stats::IDENT_ASCII_ONLY.fetch_add(1, Relaxed);
             return i;
         }
     }
 
     // If we hit a high byte, switch to char-level iteration for the rest
     if i < bytes.len() && bytes[i] >= 0x80 {
+        stats::IDENT_HIT_UNICODE.fetch_add(1, Relaxed);
         // Continue consuming from position i using chars
         for ch in source[i..].chars() {
             if is_ident_continue_char(ch) {
+                stats::IDENT_UNICODE_CHARS.fetch_add(1, Relaxed);
                 i += ch.len_utf8();
             } else {
                 break;
             }
         }
+    } else {
+        stats::IDENT_ASCII_ONLY.fetch_add(1, Relaxed);
     }
 
     i
@@ -790,5 +876,23 @@ fn also_real() {}
         let names = extract_names(src, LangFamily::Go);
         assert!(names.contains(&"Обработать".to_string()));
         assert!(names.contains(&"Конфиг".to_string()));
+    }
+
+    #[test]
+    fn non_alphanumeric_unicode_does_not_hang() {
+        // Box-drawing chars like │ (U+2502, UTF-8: 0xE2 0x94 0x82) have a leading
+        // byte >= 0xC0 which passes is_ident_start_byte, but the char itself is not
+        // alphanumeric. The tokenizer must not loop forever on these.
+        //
+        // Place the Unicode punctuation outside strings/comments so it actually
+        // reaches the identifier check in the main scan loop.
+        let src = "let x = 1\n│\nfn real() {}";
+        let names = extract_names(src, LangFamily::Rust);
+        assert!(names.contains(&"real".to_string()));
+
+        // Em-dash outside strings
+        let src2 = "let x = 1\n──\nfunction foo() {}";
+        let names2 = extract_names(src2, LangFamily::JsTs);
+        assert!(names2.contains(&"foo".to_string()));
     }
 }
