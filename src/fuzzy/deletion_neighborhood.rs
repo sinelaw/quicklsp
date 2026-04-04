@@ -57,8 +57,8 @@ impl DeletionIndex {
     /// Uses trigrams to find candidate symbols, then verifies each with
     /// bounded Levenshtein edit distance.
     pub fn resolve(&self, query: &str) -> Vec<&str> {
-        let query_chars: Vec<char> = query.chars().collect();
-        let query_len = query_chars.len();
+        let query_bytes = query.as_bytes();
+        let query_len = query_bytes.len();
 
         // Collect candidate indices via trigram lookup
         let candidates = self.trigram_candidates(query);
@@ -66,14 +66,14 @@ impl DeletionIndex {
         let mut results = Vec::new();
         for &idx in &candidates {
             let symbol = &self.symbols[idx as usize];
-            let sym_chars: Vec<char> = symbol.chars().collect();
+            let sym_bytes = symbol.as_bytes();
 
             // Length filter: edit distance is at least |len_a - len_b|
-            if query_len.abs_diff(sym_chars.len()) > MAX_EDIT_DISTANCE {
+            if query_len.abs_diff(sym_bytes.len()) > MAX_EDIT_DISTANCE {
                 continue;
             }
 
-            if bounded_levenshtein(&query_chars, &sym_chars, MAX_EDIT_DISTANCE) {
+            if bounded_levenshtein(query_bytes, sym_bytes, MAX_EDIT_DISTANCE) {
                 if !results.contains(&symbol.as_str()) {
                     results.push(symbol.as_str());
                 }
@@ -94,7 +94,7 @@ impl DeletionIndex {
 
         if lower.len() < 3 {
             // Short query: full scan with length filter only
-            return self.length_filtered_candidates(query_len);
+            return self.length_filtered_candidates(query.len());
         }
 
         // Any symbol sharing at least one trigram is a candidate.
@@ -117,18 +117,18 @@ impl DeletionIndex {
         // This handles cases where typos corrupt all overlapping trigrams
         // (e.g., transpositions like "sokcet" vs "socket").
         if candidates.is_empty() {
-            return self.length_filtered_candidates(query_len);
+            return self.length_filtered_candidates(query.len());
         }
 
         candidates
     }
 
     /// Full scan returning only symbols within edit-distance length range.
-    fn length_filtered_candidates(&self, query_len: usize) -> Vec<u32> {
+    fn length_filtered_candidates(&self, query_byte_len: usize) -> Vec<u32> {
         (0..self.symbols.len() as u32)
             .filter(|&idx| {
-                let sym_len = self.symbols[idx as usize].chars().count();
-                query_len.abs_diff(sym_len) <= MAX_EDIT_DISTANCE
+                let sym_len = self.symbols[idx as usize].len();
+                query_byte_len.abs_diff(sym_len) <= MAX_EDIT_DISTANCE
             })
             .collect()
     }
@@ -155,13 +155,16 @@ impl Default for DeletionIndex {
     }
 }
 
-/// Check if two strings are within `max_dist` edit distance using a single-row
-/// Levenshtein computation with early termination.
+/// Check if two byte strings are within `max_dist` edit distance using a
+/// single-row Levenshtein computation with early termination.
+///
+/// Operates on bytes directly — no heap allocation. For ASCII-only identifiers
+/// (99%+ of code symbols), byte distance equals character distance.
 ///
 /// Returns true if distance <= max_dist, false otherwise.
 /// Terminates as soon as the minimum possible distance exceeds max_dist.
 #[inline]
-fn bounded_levenshtein(a: &[char], b: &[char], max_dist: usize) -> bool {
+fn bounded_levenshtein(a: &[u8], b: &[u8], max_dist: usize) -> bool {
     let a_len = a.len();
     let b_len = b.len();
 
@@ -170,16 +173,28 @@ fn bounded_levenshtein(a: &[char], b: &[char], max_dist: usize) -> bool {
         return bounded_levenshtein(b, a, max_dist);
     }
 
-    // Current row of the edit distance matrix
-    let mut row: Vec<usize> = (0..=a_len).collect();
+    // Stack-allocate the row for short strings (covers names up to 31 chars)
+    const STACK_SIZE: usize = 32;
+    let mut stack_buf = [0usize; STACK_SIZE];
+    let mut heap_buf;
+    let row: &mut [usize] = if a_len < STACK_SIZE {
+        let slice = &mut stack_buf[..=a_len];
+        for (i, v) in slice.iter_mut().enumerate() {
+            *v = i;
+        }
+        slice
+    } else {
+        heap_buf = (0..=a_len).collect::<Vec<usize>>();
+        &mut heap_buf
+    };
 
-    for (i, &b_char) in b.iter().enumerate() {
+    for (i, &b_byte) in b.iter().enumerate() {
         let mut prev = row[0];
         row[0] = i + 1;
         let mut row_min = row[0];
 
-        for (j, &a_char) in a.iter().enumerate() {
-            let cost = if a_char == b_char { 0 } else { 1 };
+        for (j, &a_byte) in a.iter().enumerate() {
+            let cost = if a_byte == b_byte { 0 } else { 1 };
             let val = (row[j + 1] + 1) // deletion
                 .min(row[j] + 1) // insertion
                 .min(prev + cost); // substitution
@@ -188,8 +203,6 @@ fn bounded_levenshtein(a: &[char], b: &[char], max_dist: usize) -> bool {
             row_min = row_min.min(val);
         }
 
-        // Early termination: if every value in this row exceeds max_dist,
-        // no subsequent row can bring it back within range.
         if row_min > max_dist {
             return false;
         }
@@ -329,14 +342,10 @@ mod tests {
 
     #[test]
     fn bounded_levenshtein_basic() {
-        let a: Vec<char> = "kitten".chars().collect();
-        let b: Vec<char> = "sitting".chars().collect();
         // kitten → sitting = distance 3
-        assert!(!bounded_levenshtein(&a, &b, 2));
+        assert!(!bounded_levenshtein(b"kitten", b"sitting", 2));
 
-        let c: Vec<char> = "socket".chars().collect();
-        let d: Vec<char> = "sokcet".chars().collect();
         // transposition = distance 2
-        assert!(bounded_levenshtein(&c, &d, 2));
+        assert!(bounded_levenshtein(b"socket", b"sokcet", 2));
     }
 }
