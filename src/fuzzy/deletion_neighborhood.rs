@@ -58,7 +58,7 @@ impl DeletionIndex {
     /// bounded Levenshtein edit distance.
     pub fn resolve(&self, query: &str) -> Vec<&str> {
         let query_bytes = query.as_bytes();
-        let query_len = query_bytes.len();
+        let query_ascii = query.is_ascii();
 
         // Collect candidate indices via trigram lookup
         let candidates = self.trigram_candidates(query);
@@ -66,14 +66,23 @@ impl DeletionIndex {
         let mut results = Vec::new();
         for &idx in &candidates {
             let symbol = &self.symbols[idx as usize];
-            let sym_bytes = symbol.as_bytes();
 
-            // Length filter: edit distance is at least |len_a - len_b|
-            if query_len.abs_diff(sym_bytes.len()) > MAX_EDIT_DISTANCE {
-                continue;
-            }
-
-            if bounded_levenshtein(query_bytes, sym_bytes, MAX_EDIT_DISTANCE) {
+            // Use byte-level fast path for ASCII, char-level for non-ASCII
+            let within_distance = if query_ascii && symbol.is_ascii() {
+                let sym_bytes = symbol.as_bytes();
+                if query_bytes.len().abs_diff(sym_bytes.len()) > MAX_EDIT_DISTANCE {
+                    continue;
+                }
+                bounded_levenshtein(query_bytes, sym_bytes, MAX_EDIT_DISTANCE)
+            } else {
+                let qc: Vec<char> = query.chars().collect();
+                let sc: Vec<char> = symbol.chars().collect();
+                if qc.len().abs_diff(sc.len()) > MAX_EDIT_DISTANCE {
+                    continue;
+                }
+                bounded_levenshtein_chars(&qc, &sc, MAX_EDIT_DISTANCE)
+            };
+            if within_distance {
                 if !results.contains(&symbol.as_str()) {
                     results.push(symbol.as_str());
                 }
@@ -90,8 +99,6 @@ impl DeletionIndex {
     /// all overlapping trigrams).
     fn trigram_candidates(&self, query: &str) -> Vec<u32> {
         let lower: Vec<u8> = query.bytes().map(|b| b.to_ascii_lowercase()).collect();
-        let query_len = query.chars().count();
-
         if lower.len() < 3 {
             // Short query: full scan with length filter only
             return self.length_filtered_candidates(query.len());
@@ -208,6 +215,45 @@ fn bounded_levenshtein(a: &[u8], b: &[u8], max_dist: usize) -> bool {
         }
     }
 
+    row[a_len] <= max_dist
+}
+
+/// Char-level bounded Levenshtein for non-ASCII strings.
+/// Same algorithm as the byte version but correct for multi-byte characters.
+#[inline]
+fn bounded_levenshtein_chars(a: &[char], b: &[char], max_dist: usize) -> bool {
+    let (a, b) = if a.len() > b.len() { (b, a) } else { (a, b) };
+    let a_len = a.len();
+
+    const STACK_SIZE: usize = 32;
+    let mut stack_buf = [0usize; STACK_SIZE];
+    let mut heap_buf;
+    let row: &mut [usize] = if a_len < STACK_SIZE {
+        let slice = &mut stack_buf[..=a_len];
+        for (i, v) in slice.iter_mut().enumerate() {
+            *v = i;
+        }
+        slice
+    } else {
+        heap_buf = (0..=a_len).collect::<Vec<usize>>();
+        &mut heap_buf
+    };
+
+    for (i, &b_ch) in b.iter().enumerate() {
+        let mut prev = row[0];
+        row[0] = i + 1;
+        let mut row_min = row[0];
+        for (j, &a_ch) in a.iter().enumerate() {
+            let cost = if a_ch == b_ch { 0 } else { 1 };
+            let val = (row[j + 1] + 1).min(row[j] + 1).min(prev + cost);
+            prev = row[j + 1];
+            row[j + 1] = val;
+            row_min = row_min.min(val);
+        }
+        if row_min > max_dist {
+            return false;
+        }
+    }
     row[a_len] <= max_dist
 }
 
@@ -338,6 +384,40 @@ mod tests {
         let r = idx.resolve("process_daata");
         assert!(r.contains(&"process_data"), "extra char in middle");
         assert_eq!(r.len(), 1, "should only match process_data, got: {:?}", r);
+    }
+
+    #[test]
+    fn unicode_fuzzy_matching() {
+        let mut idx = DeletionIndex::new();
+        idx.insert("über_config");
+        idx.insert("données");
+        idx.insert("名前");
+        idx.insert("Обработать");
+        idx.insert("café");
+
+        // Substitution in accented identifier
+        let r = idx.resolve("über_comfig");
+        assert!(r.contains(&"über_config"), "substitution in Unicode ident");
+
+        // Missing accent (byte-level would overcount this)
+        let r = idx.resolve("cafe");
+        assert!(r.contains(&"café"), "missing accent: cafe → café (edit dist 1)");
+
+        // Substitution in CJK
+        let r = idx.resolve("名目");
+        assert!(r.contains(&"名前"), "CJK substitution (edit dist 1)");
+
+        // Cyrillic with too many edits — should not match
+        let r = idx.resolve("Обхахатать");
+        assert!(!r.contains(&"Обработать"), "too distant (>2 edits)");
+
+        // Exact match with Unicode
+        let r = idx.resolve("données");
+        assert!(r.contains(&"données"), "exact match Unicode");
+
+        // Extra char in Unicode ident
+        let r = idx.resolve("caféé");
+        assert!(r.contains(&"café"), "extra char: caféé → café");
     }
 
     #[test]
