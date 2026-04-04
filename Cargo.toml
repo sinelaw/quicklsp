@@ -34,9 +34,6 @@ tower-lsp = "0.20"
 # Concurrent data structures
 dashmap = "6"
 
-# High-performance hashing (non-cryptographic, optimized for short strings)
-ahash = "0.8"
-
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "io-std", "time"] }
 

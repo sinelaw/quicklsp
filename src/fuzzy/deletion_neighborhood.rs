@@ -1,89 +1,57 @@
-//! k-Deletion Neighborhood index for O(1) fuzzy symbol resolution.
+//! Fuzzy symbol index using Levenshtein automaton for typo-tolerant resolution.
 //!
-//! For every symbol, we precompute its k=1 and k=2 deletion variants
-//! (e.g., `socket` -> `ocket`, `scket`, `soket`, `socet`, `sockt`, `socke`).
+//! Stores symbol names in a plain Vec. On query, computes bounded edit distance
+//! against each symbol with early termination. For k=2 and typical symbol names,
+//! non-matches terminate after a few characters, making the scan fast despite
+//! being O(n).
 //!
-//! To prevent combinatorial explosion for long strings, we use truncated
-//! deletion neighborhoods — only indexing variants of a fixed-length prefix.
+//! This replaces the previous deletion-neighborhood approach which precomputed
+//! all k=1 and k=2 deletion variants at insert time. That was O(1) at query
+//! time but extremely expensive to build (70%+ of dependency indexing time was
+//! spent generating and hashing variant strings).
 
-use std::collections::{HashMap, HashSet};
+/// Maximum edit distance for fuzzy matching.
+const MAX_EDIT_DISTANCE: usize = 2;
 
-use ahash::RandomState;
-
-/// Maximum prefix length for deletion neighborhood computation.
-/// Captures the vast majority of human typing errors without unbounded memory.
-const MAX_PREFIX_LEN: usize = 12;
-
-/// A fuzzy symbol index using precomputed deletion neighborhoods.
+/// A fuzzy symbol index using Levenshtein automaton matching.
 pub struct DeletionIndex {
-    /// Maps deletion-variant hashes -> canonical symbol names
-    index: HashMap<u64, Vec<String>, RandomState>,
-    /// All canonical symbols
     symbols: Vec<String>,
 }
 
 impl DeletionIndex {
     pub fn new() -> Self {
         Self {
-            index: HashMap::with_hasher(RandomState::new()),
             symbols: Vec::new(),
         }
     }
 
-    /// Add a symbol to the fuzzy index, precomputing its deletion neighborhoods.
+    /// Add a symbol to the fuzzy index.
     pub fn insert(&mut self, symbol: &str) {
         self.symbols.push(symbol.to_string());
-
-        // Index the symbol itself
-        let hasher = self.index.hasher().clone();
-        let hash = hasher.hash_one(symbol);
-        self.index.entry(hash).or_default().push(symbol.to_string());
-
-        // Truncate to prefix for neighborhood generation
-        let prefix: String = symbol.chars().take(MAX_PREFIX_LEN).collect();
-
-        // k=1 deletion variants
-        let k1_variants = deletion_variants(&prefix, 1);
-        for variant in &k1_variants {
-            let h = hasher.hash_one(variant.as_str());
-            self.index.entry(h).or_default().push(symbol.to_string());
-        }
-
-        // k=2 deletion variants
-        let k2_variants = deletion_variants(&prefix, 2);
-        for variant in &k2_variants {
-            let h = hasher.hash_one(variant.as_str());
-            self.index.entry(h).or_default().push(symbol.to_string());
-        }
     }
 
     /// Resolve a potentially misspelled query to canonical symbols.
     ///
-    /// Computes the 1-deletion and 2-deletion neighborhoods of the query
-    /// on the fly and checks each against the precomputed index.
+    /// Scans all symbols and returns those within edit distance 2 of the query.
+    /// Uses bounded Levenshtein with early termination — non-matches typically
+    /// bail after examining only a few characters.
     pub fn resolve(&self, query: &str) -> Vec<&str> {
+        let query_chars: Vec<char> = query.chars().collect();
+        let query_len = query_chars.len();
         let mut results = Vec::new();
-        let mut seen: HashSet<*const str> = HashSet::new();
-        let hasher = self.index.hasher().clone();
-        let prefix: String = query.chars().take(MAX_PREFIX_LEN).collect();
 
-        // Collect all hashes to probe: exact + k=1 + k=2 variants
-        let mut hashes = Vec::new();
-        hashes.push(hasher.hash_one(query));
-        for variant in deletion_variants(&prefix, 1) {
-            hashes.push(hasher.hash_one(variant.as_str()));
-        }
-        for variant in deletion_variants(&prefix, 2) {
-            hashes.push(hasher.hash_one(variant.as_str()));
-        }
+        for symbol in &self.symbols {
+            let sym_chars: Vec<char> = symbol.chars().collect();
+            let sym_len = sym_chars.len();
 
-        for h in hashes {
-            if let Some(matches) = self.index.get(&h) {
-                for m in matches {
-                    let ptr = m.as_str() as *const str;
-                    if seen.insert(ptr) {
-                        results.push(m.as_str());
-                    }
+            // Length filter: edit distance is at least |len_a - len_b|
+            if query_len.abs_diff(sym_len) > MAX_EDIT_DISTANCE {
+                continue;
+            }
+
+            if bounded_levenshtein(&query_chars, &sym_chars, MAX_EDIT_DISTANCE) {
+                if !results.contains(&symbol.as_str()) {
+                    results.push(symbol.as_str());
                 }
             }
         }
@@ -102,7 +70,6 @@ impl DeletionIndex {
 
     /// Clear the entire index.
     pub fn clear(&mut self) {
-        self.index.clear();
         self.symbols.clear();
     }
 }
@@ -113,52 +80,47 @@ impl Default for DeletionIndex {
     }
 }
 
-/// Generate all k-deletion variants of a string.
+/// Check if two strings are within `max_dist` edit distance using a single-row
+/// Levenshtein computation with early termination.
 ///
-/// A 1-deletion variant is the string with exactly one character removed.
-/// A 2-deletion variant has exactly two characters removed.
-fn deletion_variants(s: &str, k: usize) -> Vec<String> {
-    if k == 0 {
-        return vec![s.to_string()];
+/// Returns true if distance <= max_dist, false otherwise.
+/// Terminates as soon as the minimum possible distance exceeds max_dist.
+#[inline]
+fn bounded_levenshtein(a: &[char], b: &[char], max_dist: usize) -> bool {
+    let a_len = a.len();
+    let b_len = b.len();
+
+    // Ensure a is the shorter string (fewer columns = smaller row buffer)
+    if a_len > b_len {
+        return bounded_levenshtein(b, a, max_dist);
     }
 
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= k {
-        return vec![];
-    }
+    // Current row of the edit distance matrix
+    let mut row: Vec<usize> = (0..=a_len).collect();
 
-    let mut results = Vec::new();
+    for (i, &b_char) in b.iter().enumerate() {
+        let mut prev = row[0];
+        row[0] = i + 1;
+        let mut row_min = row[0];
 
-    if k == 1 {
-        for i in 0..chars.len() {
-            let mut variant: String = String::with_capacity(chars.len() - 1);
-            for (j, &ch) in chars.iter().enumerate() {
-                if j != i {
-                    variant.push(ch);
-                }
-            }
-            results.push(variant);
+        for (j, &a_char) in a.iter().enumerate() {
+            let cost = if a_char == b_char { 0 } else { 1 };
+            let val = (row[j + 1] + 1) // deletion
+                .min(row[j] + 1) // insertion
+                .min(prev + cost); // substitution
+            prev = row[j + 1];
+            row[j + 1] = val;
+            row_min = row_min.min(val);
         }
-    } else {
-        // k >= 2: recursively generate by removing one char and then k-1 more.
-        // Use a HashSet for O(1) dedup instead of Vec::contains O(n).
-        let mut seen = HashSet::new();
-        for i in 0..chars.len() {
-            let reduced: String = chars
-                .iter()
-                .enumerate()
-                .filter(|&(j, _)| j != i)
-                .map(|(_, &ch)| ch)
-                .collect();
-            for variant in deletion_variants(&reduced, k - 1) {
-                if seen.insert(variant.clone()) {
-                    results.push(variant);
-                }
-            }
+
+        // Early termination: if every value in this row exceeds max_dist,
+        // no subsequent row can bring it back within range.
+        if row_min > max_dist {
+            return false;
         }
     }
 
-    results
+    row[a_len] <= max_dist
 }
 
 #[cfg(test)]
@@ -179,8 +141,7 @@ mod tests {
         let mut idx = DeletionIndex::new();
         idx.insert("socket");
 
-        // "sokcet" is a transposition error. Its 1-deletion neighborhood
-        // includes "soket", which is also in socket's 1-deletion neighborhood.
+        // "sokcet" is a transposition error (edit distance 2)
         let results = idx.resolve("sokcet");
         assert!(
             results.contains(&"socket"),
@@ -193,7 +154,7 @@ mod tests {
         let mut idx = DeletionIndex::new();
         idx.insert("process");
 
-        // "processs" has an extra 's' — its 1-deletion includes "process"
+        // "processs" has an extra 's' — edit distance 1
         let results = idx.resolve("processs");
         assert!(
             results.contains(&"process"),
@@ -202,11 +163,105 @@ mod tests {
     }
 
     #[test]
-    fn deletion_variants_k1() {
-        let variants = deletion_variants("abc", 1);
-        assert_eq!(variants.len(), 3);
-        assert!(variants.contains(&"bc".to_string()));
-        assert!(variants.contains(&"ac".to_string()));
-        assert!(variants.contains(&"ab".to_string()));
+    fn typo_substitution() {
+        let mut idx = DeletionIndex::new();
+        idx.insert("HashMap");
+
+        let results = idx.resolve("HashMpa");
+        assert!(results.contains(&"HashMap"), "Should resolve substitution");
+    }
+
+    #[test]
+    fn no_match_beyond_distance() {
+        let mut idx = DeletionIndex::new();
+        idx.insert("socket");
+
+        // "abcdef" is far from "socket"
+        let results = idx.resolve("abcdef");
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn length_filter() {
+        let mut idx = DeletionIndex::new();
+        idx.insert("ab");
+
+        // "abcdef" differs by 4 chars in length — skip without computing
+        let results = idx.resolve("abcdef");
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn quality_against_realistic_symbol_set() {
+        let mut idx = DeletionIndex::new();
+        let symbols = &[
+            "HashMap", "HashSet", "BTreeMap", "BTreeSet", "Vec", "String",
+            "process_data", "process_event", "process_request",
+            "handle_connection", "handle_error", "handle_request",
+            "serialize", "deserialize", "Deserializer",
+            "Config", "Context", "Connection", "Controller",
+            "read_file", "read_line", "write_file", "write_line",
+            "TokenKind", "Token", "Tokenizer",
+            "SymbolKind", "SymbolLocation", "Symbol",
+            "Workspace", "DependencyIndex",
+        ];
+        for s in symbols {
+            idx.insert(s);
+        }
+
+        // Transpositions (edit distance 2)
+        let r = idx.resolve("HashMpa");
+        assert!(r.contains(&"HashMap"), "transposition in HashMap");
+        assert!(!r.contains(&"HashSet"), "HashSet is dist 3 from HashMpa");
+
+        // Single substitution (edit distance 1)
+        let r = idx.resolve("Comfig");
+        assert!(r.contains(&"Config"), "substitution: Comfig → Config");
+        assert!(!r.contains(&"Context"), "Context is dist 3 from Comfig");
+
+        // Extra character (edit distance 1)
+        let r = idx.resolve("Stringg");
+        assert!(r.contains(&"String"), "extra char: Stringg → String");
+
+        // Missing character (edit distance 1)
+        let r = idx.resolve("Tken");
+        assert!(r.contains(&"Token"), "missing char: Tken → Token");
+        assert!(!r.contains(&"TokenKind"), "TokenKind is too far from Tken");
+
+        // Prefix typo (edit distance 1)
+        let r = idx.resolve("derialize");
+        assert!(r.contains(&"serialize"), "missing char: derialize → serialize");
+        assert!(r.contains(&"deserialize"), "missing char at different pos");
+
+        // No false positives for distant strings
+        let r = idx.resolve("foobar");
+        assert!(r.is_empty(), "foobar should match nothing");
+
+        // Exact match still works amid similar names
+        let r = idx.resolve("handle_error");
+        assert!(r.contains(&"handle_error"), "exact match");
+        assert!(!r.contains(&"handle_connection"), "too distant");
+
+        // Short symbols: more sensitive to typos
+        let r = idx.resolve("Vex");
+        assert!(r.contains(&"Vec"), "substitution in short symbol");
+
+        // Verify we don't return the whole index
+        let r = idx.resolve("process_daata");
+        assert!(r.contains(&"process_data"), "extra char in middle");
+        assert_eq!(r.len(), 1, "should only match process_data, got: {:?}", r);
+    }
+
+    #[test]
+    fn bounded_levenshtein_basic() {
+        let a: Vec<char> = "kitten".chars().collect();
+        let b: Vec<char> = "sitting".chars().collect();
+        // kitten → sitting = distance 3
+        assert!(!bounded_levenshtein(&a, &b, 2));
+
+        let c: Vec<char> = "socket".chars().collect();
+        let d: Vec<char> = "sokcet".chars().collect();
+        // transposition = distance 2
+        assert!(bounded_levenshtein(&c, &d, 2));
     }
 }

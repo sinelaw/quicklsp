@@ -1,6 +1,6 @@
-//! Typo-Tolerant Resolution via Deletion Neighborhoods
+//! Typo-Tolerant Resolution via Levenshtein Automaton
 //!
-//! Implements k-Deletion Neighborhoods to transform fuzzy matching from
-//! a quadratic Levenshtein computation into O(1) hash lookups.
+//! Stores symbol names and resolves fuzzy queries using bounded edit distance
+//! with early termination. Near-zero build cost, fast enough for interactive use.
 
 pub mod deletion_neighborhood;
