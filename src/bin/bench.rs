@@ -20,6 +20,35 @@ use std::time::Instant;
 use quicklsp::workspace::Workspace;
 use quicklsp::DependencyIndex;
 
+/// Read current process RSS from /proc/self/statm.
+/// Returns (rss_bytes, total_vm_bytes) or None on non-Linux / error.
+fn memory_rss() -> Option<(usize, usize)> {
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let mut fields = statm.split_whitespace();
+    let vm_pages: usize = fields.next()?.parse().ok()?;
+    let rss_pages: usize = fields.next()?.parse().ok()?;
+    let page_size = 4096; // almost always 4K on Linux
+    Some((rss_pages * page_size, vm_pages * page_size))
+}
+
+fn fmt_bytes(b: usize) -> String {
+    if b < 1024 {
+        format!("{b} B")
+    } else if b < 1024 * 1024 {
+        format!("{:.1} KB", b as f64 / 1024.0)
+    } else if b < 1024 * 1024 * 1024 {
+        format!("{:.1} MB", b as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.2} GB", b as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
+fn log_memory(label: &str) {
+    if let Some((rss, vm)) = memory_rss() {
+        tracing::info!("memory [{}]: rss={}, vm={}", label, fmt_bytes(rss), fmt_bytes(vm));
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -85,6 +114,7 @@ fn main() {
 }
 
 fn run_index(root: &Path) {
+    log_memory("start");
     let ws = Workspace::new();
     let t = Instant::now();
     let stats = ws.scan_directory(root);
@@ -98,9 +128,11 @@ fn run_index(root: &Path) {
         ws.definition_count(),
         ws.unique_symbol_count()
     );
+    log_memory("after index");
 }
 
 fn run_deps(root: &Path) {
+    log_memory("start");
     let dep_index = DependencyIndex::new();
     let t = Instant::now();
     dep_index.detect_and_resolve(root);
@@ -115,6 +147,7 @@ fn run_deps(root: &Path) {
     }));
     let t_index = t.elapsed();
     tracing::info!("deps index: {:.2?}", t_index);
+    log_memory("after deps");
 }
 
 fn run_query(root: &Path) {
@@ -158,6 +191,8 @@ fn run_query(root: &Path) {
 }
 
 fn run_all(root: &Path) {
+    log_memory("start");
+
     // Index once, reuse for queries
     let ws = Workspace::new();
     let t = Instant::now();
@@ -171,6 +206,7 @@ fn run_all(root: &Path) {
         ws.definition_count(),
         ws.unique_symbol_count()
     );
+    log_memory("after index");
 
     let dep_index = DependencyIndex::new();
     let t = Instant::now();
@@ -188,6 +224,7 @@ fn run_all(root: &Path) {
         "  deps: {} definitions",
         dep_index.definition_count()
     );
+    log_memory("after deps");
 
     let names = ws.sample_symbol_names(500);
 
@@ -230,4 +267,6 @@ fn run_all(root: &Path) {
         }
     }
     tracing::info!("fuzzy (deps, {} queries): {:.2?}", dep_fuzzy_count, t.elapsed());
+
+    log_memory("end");
 }
