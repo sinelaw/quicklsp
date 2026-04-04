@@ -15,6 +15,10 @@ path = "src/main.rs"
 name = "quicklsp-bench"
 path = "src/bin/bench.rs"
 
+[[bin]]
+name = "tokenizer-stats"
+path = "src/bin/tokenizer_stats.rs"
+
 [lib]
 name = "quicklsp"
 path = "src/lib.rs"
