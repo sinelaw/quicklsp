@@ -13,8 +13,10 @@
 //! 5. All data is exact — no false positives, no false negatives for definitions
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 use dashmap::DashMap;
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
 use tower_lsp::lsp_types::Url;
 
@@ -72,6 +74,12 @@ impl Workspace {
 
     /// Index a file: tokenize, extract symbols, update all indices.
     pub fn index_file(&self, path: PathBuf, source: String) {
+        self.index_file_core(path, source, true);
+    }
+
+    /// Core indexing: tokenize, extract symbols, update definition index.
+    /// Optionally updates the fuzzy index (skipped during bulk parallel scans).
+    fn index_file_core(&self, path: PathBuf, source: String, update_fuzzy: bool) {
         let lang = path
             .extension()
             .and_then(|e| e.to_str())
@@ -103,28 +111,64 @@ impl Workspace {
                 .push(loc);
         }
 
-        // Update fuzzy index
-        if let Ok(mut fuzzy) = self.fuzzy.write() {
-            for sym in &symbols {
-                fuzzy.insert(&sym.name);
+        // Update fuzzy index (skipped during parallel bulk scans)
+        if update_fuzzy {
+            if let Ok(mut fuzzy) = self.fuzzy.write() {
+                for sym in &symbols {
+                    fuzzy.insert(&sym.name);
+                }
             }
         }
 
         self.files.insert(path, FileEntry { source, symbols });
     }
 
+    /// Rebuild the fuzzy index from all currently indexed symbols.
+    fn rebuild_fuzzy(&self) {
+        let mut fuzzy = self.fuzzy.write().unwrap();
+        fuzzy.clear();
+        for entry in self.definitions.iter() {
+            fuzzy.insert(entry.key());
+        }
+    }
+
     /// Scan a directory tree and index all files with supported extensions.
     ///
-    /// This is the workspace-level equivalent of dependency indexing: walk the
-    /// project root and index every source file so cross-file resolution works
-    /// from startup. Safe to call from a background thread — DashMap provides
-    /// concurrent read access while scanning is in progress.
+    /// Phase 1: Sequential directory walk to collect file paths.
+    /// Phase 2: Parallel read + tokenize + index (using rayon).
+    /// Phase 3: Rebuild fuzzy index from collected symbols.
     ///
-    /// Files already in the index (e.g., from a prior `did_open`) are skipped
-    /// unless `force` is true.
+    /// Files already in the index (e.g., from a prior `did_open`) are skipped.
     pub fn scan_directory(&self, root: &Path) -> ScanStats {
-        let mut stats = ScanStats::default();
-        self.scan_dir_recursive(root, &mut stats, 0);
+        // Phase 1: collect file paths (sequential — just readdir syscalls)
+        let mut paths = Vec::new();
+        let mut skipped = 0usize;
+        Self::collect_paths(root, &self.files, &mut paths, &mut skipped, 0);
+
+        // Phase 2: parallel read + index (no fuzzy updates)
+        let indexed = AtomicUsize::new(0);
+        let errors = AtomicUsize::new(0);
+
+        paths.par_iter().for_each(|path| {
+            match std::fs::read_to_string(path) {
+                Ok(source) => {
+                    self.index_file_core(path.clone(), source, false);
+                    indexed.fetch_add(1, Relaxed);
+                }
+                Err(_) => {
+                    errors.fetch_add(1, Relaxed);
+                }
+            }
+        });
+
+        // Phase 3: rebuild fuzzy index once from all symbols
+        self.rebuild_fuzzy();
+
+        let stats = ScanStats {
+            indexed: indexed.load(Relaxed),
+            skipped,
+            errors: errors.load(Relaxed),
+        };
         tracing::info!(
             "Workspace scan complete: {} files indexed, {} skipped, {} errors",
             stats.indexed,
@@ -137,7 +181,14 @@ impl Workspace {
     /// Maximum directory depth for workspace scanning.
     const MAX_SCAN_DEPTH: usize = 20;
 
-    fn scan_dir_recursive(&self, dir: &Path, stats: &mut ScanStats, depth: usize) {
+    /// Collect file paths eligible for indexing (sequential directory walk).
+    fn collect_paths(
+        dir: &Path,
+        existing_files: &DashMap<PathBuf, FileEntry>,
+        paths: &mut Vec<PathBuf>,
+        skipped: &mut usize,
+        depth: usize,
+    ) {
         if depth > Self::MAX_SCAN_DEPTH {
             return;
         }
@@ -151,15 +202,13 @@ impl Workspace {
             let path = entry.path();
 
             if path.is_dir() {
-                // Skip directories that shouldn't be scanned
                 if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                     if should_skip_dir(name) {
                         continue;
                     }
                 }
-                self.scan_dir_recursive(&path, stats, depth + 1);
+                Self::collect_paths(&path, existing_files, paths, skipped, depth + 1);
             } else if path.is_file() {
-                // Only index files with extensions the tokenizer supports
                 let has_lang = path
                     .extension()
                     .and_then(|e| e.to_str())
@@ -171,20 +220,12 @@ impl Workspace {
                 }
 
                 // Skip files already opened by the editor (they have fresher content)
-                if self.files.contains_key(&path) {
-                    stats.skipped += 1;
+                if existing_files.contains_key(&path) {
+                    *skipped += 1;
                     continue;
                 }
 
-                match std::fs::read_to_string(&path) {
-                    Ok(source) => {
-                        self.index_file(path, source);
-                        stats.indexed += 1;
-                    }
-                    Err(_) => {
-                        stats.errors += 1;
-                    }
-                }
+                paths.push(path);
             }
         }
     }
