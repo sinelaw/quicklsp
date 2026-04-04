@@ -490,6 +490,15 @@ impl Workspace {
     pub fn unique_symbol_count(&self) -> usize {
         self.definitions.len()
     }
+
+    /// Collect up to `max` unique symbol names from the index.
+    pub fn sample_symbol_names(&self, max: usize) -> Vec<String> {
+        self.definitions
+            .iter()
+            .take(max)
+            .map(|e| e.key().clone())
+            .collect()
+    }
 }
 
 impl Default for Workspace {
