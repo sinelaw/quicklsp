@@ -172,8 +172,22 @@ fn run_all(root: &Path) {
         ws.unique_symbol_count()
     );
 
-    run_deps(root);
-    tracing::info!("(deps dropped)");
+    let dep_index = DependencyIndex::new();
+    let t = Instant::now();
+    dep_index.detect_and_resolve(root);
+    tracing::info!("deps resolve: {:.2?}", t.elapsed());
+
+    let t = Instant::now();
+    dep_index.index_pending(Some(&|done, total| {
+        if done % 100 == 0 {
+            tracing::info!("  deps indexed: {done}/{total}");
+        }
+    }));
+    tracing::info!("deps index: {:.2?}", t.elapsed());
+    tracing::info!(
+        "  deps: {} definitions",
+        dep_index.definition_count()
+    );
 
     let names = ws.sample_symbol_names(500);
 
@@ -189,14 +203,31 @@ fn run_all(root: &Path) {
     }
     tracing::info!("references: {:.2?}", t.elapsed());
 
+    // Fuzzy queries against local workspace
     let t = Instant::now();
+    let mut fuzzy_count = 0;
     for name in names.iter().take(200) {
         if name.len() >= 4 {
             let mut chars: Vec<char> = name.chars().collect();
             chars.swap(1, 2);
             let typo: String = chars.into_iter().collect();
             ws.search_symbols(&typo);
+            fuzzy_count += 1;
         }
     }
-    tracing::info!("fuzzy: {:.2?}", t.elapsed());
+    tracing::info!("fuzzy (local, {} queries): {:.2?}", fuzzy_count, t.elapsed());
+
+    // Fuzzy queries against dependency index
+    let t = Instant::now();
+    let mut dep_fuzzy_count = 0;
+    for name in names.iter().take(200) {
+        if name.len() >= 4 {
+            let mut chars: Vec<char> = name.chars().collect();
+            chars.swap(1, 2);
+            let typo: String = chars.into_iter().collect();
+            dep_index.completions(&typo);
+            dep_fuzzy_count += 1;
+        }
+    }
+    tracing::info!("fuzzy (deps, {} queries): {:.2?}", dep_fuzzy_count, t.elapsed());
 }

@@ -1,51 +1,75 @@
-//! Fuzzy symbol index using Levenshtein automaton for typo-tolerant resolution.
+//! Fuzzy symbol index using trigram pre-filtering + Levenshtein verification.
 //!
-//! Stores symbol names in a plain Vec. On query, computes bounded edit distance
-//! against each symbol with early termination. For k=2 and typical symbol names,
-//! non-matches terminate after a few characters, making the scan fast despite
-//! being O(n).
+//! Each symbol is split into overlapping 3-character windows (trigrams) and
+//! indexed in a HashMap. On query, extract query trigrams, union candidate sets,
+//! then verify with bounded Levenshtein edit distance.
 //!
-//! This replaces the previous deletion-neighborhood approach which precomputed
-//! all k=1 and k=2 deletion variants at insert time. That was O(1) at query
-//! time but extremely expensive to build (70%+ of dependency indexing time was
-//! spent generating and hashing variant strings).
+//! Build cost: O(n × avg_name_length) — a few trigram insertions per symbol.
+//! Query cost: O(candidates × name_length) where candidates ≪ total symbols.
+
+use std::collections::HashMap;
 
 /// Maximum edit distance for fuzzy matching.
 const MAX_EDIT_DISTANCE: usize = 2;
 
-/// A fuzzy symbol index using Levenshtein automaton matching.
+/// A fuzzy symbol index using trigram pre-filtering and Levenshtein verification.
 pub struct DeletionIndex {
+    /// All canonical symbols.
     symbols: Vec<String>,
+    /// Trigram → indices into `symbols` that contain this trigram.
+    trigrams: HashMap<[u8; 3], Vec<u32>>,
 }
 
 impl DeletionIndex {
     pub fn new() -> Self {
         Self {
             symbols: Vec::new(),
+            trigrams: HashMap::new(),
         }
     }
 
     /// Add a symbol to the fuzzy index.
     pub fn insert(&mut self, symbol: &str) {
+        let idx = self.symbols.len() as u32;
         self.symbols.push(symbol.to_string());
+
+        // Index trigrams. Use lowercase bytes for case-insensitive trigram
+        // matching, but final Levenshtein check is case-sensitive.
+        let lower: Vec<u8> = symbol.bytes().map(|b| b.to_ascii_lowercase()).collect();
+        if lower.len() >= 3 {
+            for window in lower.windows(3) {
+                let key = [window[0], window[1], window[2]];
+                self.trigrams.entry(key).or_default().push(idx);
+            }
+        } else {
+            // Short symbols (1-2 chars) can't form trigrams.
+            // Index them under a sentinel so they're still searchable via
+            // the full-scan fallback for short queries.
+            self.trigrams
+                .entry([0, 0, symbol.len() as u8])
+                .or_default()
+                .push(idx);
+        }
     }
 
     /// Resolve a potentially misspelled query to canonical symbols.
     ///
-    /// Scans all symbols and returns those within edit distance 2 of the query.
-    /// Uses bounded Levenshtein with early termination — non-matches typically
-    /// bail after examining only a few characters.
+    /// Uses trigrams to find candidate symbols, then verifies each with
+    /// bounded Levenshtein edit distance.
     pub fn resolve(&self, query: &str) -> Vec<&str> {
         let query_chars: Vec<char> = query.chars().collect();
         let query_len = query_chars.len();
-        let mut results = Vec::new();
 
-        for symbol in &self.symbols {
+        // Collect candidate indices via trigram lookup
+        let candidates = self.trigram_candidates(query);
+
+        let mut results = Vec::new();
+        for &idx in &candidates {
+            let symbol = &self.symbols[idx as usize];
             let sym_chars: Vec<char> = symbol.chars().collect();
-            let sym_len = sym_chars.len();
 
             // Length filter: edit distance is at least |len_a - len_b|
-            if query_len.abs_diff(sym_len) > MAX_EDIT_DISTANCE {
+            if query_len.abs_diff(sym_chars.len()) > MAX_EDIT_DISTANCE {
                 continue;
             }
 
@@ -57,6 +81,56 @@ impl DeletionIndex {
         }
 
         results
+    }
+
+    /// Find candidate symbol indices by trigram overlap with the query.
+    ///
+    /// Falls back to a full length-filtered scan when the query is short
+    /// or trigrams produce no candidates (e.g., transpositions that corrupt
+    /// all overlapping trigrams).
+    fn trigram_candidates(&self, query: &str) -> Vec<u32> {
+        let lower: Vec<u8> = query.bytes().map(|b| b.to_ascii_lowercase()).collect();
+        let query_len = query.chars().count();
+
+        if lower.len() < 3 {
+            // Short query: full scan with length filter only
+            return self.length_filtered_candidates(query_len);
+        }
+
+        // Any symbol sharing at least one trigram is a candidate.
+        let mut seen = vec![false; self.symbols.len()];
+        let mut candidates = Vec::new();
+
+        for window in lower.windows(3) {
+            let key = [window[0], window[1], window[2]];
+            if let Some(indices) = self.trigrams.get(&key) {
+                for &idx in indices {
+                    if !seen[idx as usize] {
+                        seen[idx as usize] = true;
+                        candidates.push(idx);
+                    }
+                }
+            }
+        }
+
+        // If trigrams found no candidates, fall back to length-filtered scan.
+        // This handles cases where typos corrupt all overlapping trigrams
+        // (e.g., transpositions like "sokcet" vs "socket").
+        if candidates.is_empty() {
+            return self.length_filtered_candidates(query_len);
+        }
+
+        candidates
+    }
+
+    /// Full scan returning only symbols within edit-distance length range.
+    fn length_filtered_candidates(&self, query_len: usize) -> Vec<u32> {
+        (0..self.symbols.len() as u32)
+            .filter(|&idx| {
+                let sym_len = self.symbols[idx as usize].chars().count();
+                query_len.abs_diff(sym_len) <= MAX_EDIT_DISTANCE
+            })
+            .collect()
     }
 
     /// Number of canonical symbols in the index.
@@ -71,6 +145,7 @@ impl DeletionIndex {
     /// Clear the entire index.
     pub fn clear(&mut self) {
         self.symbols.clear();
+        self.trigrams.clear();
     }
 }
 
