@@ -15,44 +15,91 @@
 //! non-ASCII bytes in identifier positions. Definition keywords are always ASCII,
 //! so the hot path for keyword matching stays byte-level for performance.
 
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-
-/// Global tokenizer counters for profiling diagnostics.
-/// Cheap atomic increments; zero overhead when not read.
+/// Thread-local tokenizer counters for profiling diagnostics.
+/// Plain integer increments — no atomics, no cache line contention.
+/// Call `stats::summary()` to collect totals from all threads.
 pub mod stats {
-    use super::*;
+    use std::cell::Cell;
+    use std::sync::Mutex;
 
-    pub static SCAN_CALLS: AtomicU64 = AtomicU64::new(0);
-    pub static TOTAL_BYTES: AtomicU64 = AtomicU64::new(0);
-    pub static IDENT_CALLS: AtomicU64 = AtomicU64::new(0);
-    pub static IDENT_ASCII_ONLY: AtomicU64 = AtomicU64::new(0);
-    pub static IDENT_HIT_UNICODE: AtomicU64 = AtomicU64::new(0);
-    pub static IDENT_UNICODE_CHARS: AtomicU64 = AtomicU64::new(0);
-    pub static SKIPPED_COMMENT_BYTES: AtomicU64 = AtomicU64::new(0);
-    pub static SKIPPED_STRING_BYTES: AtomicU64 = AtomicU64::new(0);
-    pub static NON_IDENT_UNICODE_SKIPS: AtomicU64 = AtomicU64::new(0);
+    /// Per-thread counters.
+    #[derive(Default)]
+    struct Counters {
+        scan_calls: u64,
+        total_bytes: u64,
+        ident_calls: u64,
+        ident_ascii_only: u64,
+        ident_hit_unicode: u64,
+        ident_unicode_chars: u64,
+        skipped_comment_bytes: u64,
+        skipped_string_bytes: u64,
+        non_ident_unicode_skips: u64,
+    }
+
+    /// Registry of all thread-local counter snapshots, collected on drop.
+    static REGISTRY: Mutex<Vec<Counters>> = Mutex::new(Vec::new());
+
+    thread_local! {
+        static LOCAL: Cell<Counters> = const { Cell::new(Counters {
+            scan_calls: 0,
+            total_bytes: 0,
+            ident_calls: 0,
+            ident_ascii_only: 0,
+            ident_hit_unicode: 0,
+            ident_unicode_chars: 0,
+            skipped_comment_bytes: 0,
+            skipped_string_bytes: 0,
+            non_ident_unicode_skips: 0,
+        }) };
+    }
+
+    /// Flush the current thread's counters into the global registry.
+    /// Called automatically, but can be called explicitly before `summary()`.
+    pub fn flush() {
+        LOCAL.with(|cell| {
+            let c = cell.take();
+            if c.scan_calls > 0 || c.total_bytes > 0 {
+                if let Ok(mut reg) = REGISTRY.lock() {
+                    reg.push(c);
+                }
+            }
+        });
+    }
 
     pub fn reset() {
-        SCAN_CALLS.store(0, Relaxed);
-        TOTAL_BYTES.store(0, Relaxed);
-        IDENT_CALLS.store(0, Relaxed);
-        IDENT_ASCII_ONLY.store(0, Relaxed);
-        IDENT_HIT_UNICODE.store(0, Relaxed);
-        IDENT_UNICODE_CHARS.store(0, Relaxed);
-        SKIPPED_COMMENT_BYTES.store(0, Relaxed);
-        SKIPPED_STRING_BYTES.store(0, Relaxed);
-        NON_IDENT_UNICODE_SKIPS.store(0, Relaxed);
+        LOCAL.with(|cell| cell.set(Counters::default()));
+        if let Ok(mut reg) = REGISTRY.lock() {
+            reg.clear();
+        }
     }
 
     pub fn summary() -> String {
-        let total = TOTAL_BYTES.load(Relaxed);
-        let ident_calls = IDENT_CALLS.load(Relaxed);
-        let ident_ascii = IDENT_ASCII_ONLY.load(Relaxed);
-        let ident_unicode = IDENT_HIT_UNICODE.load(Relaxed);
-        let unicode_chars = IDENT_UNICODE_CHARS.load(Relaxed);
-        let comment = SKIPPED_COMMENT_BYTES.load(Relaxed);
-        let string = SKIPPED_STRING_BYTES.load(Relaxed);
-        let non_ident_skips = NON_IDENT_UNICODE_SKIPS.load(Relaxed);
+        // Flush current thread first
+        flush();
+
+        let reg = REGISTRY.lock().unwrap();
+        let mut total_bytes = 0u64;
+        let mut scan_calls = 0u64;
+        let mut ident_calls = 0u64;
+        let mut ident_ascii = 0u64;
+        let mut ident_unicode = 0u64;
+        let mut unicode_chars = 0u64;
+        let mut comment = 0u64;
+        let mut string = 0u64;
+        let mut non_ident_skips = 0u64;
+
+        for c in reg.iter() {
+            scan_calls += c.scan_calls;
+            total_bytes += c.total_bytes;
+            ident_calls += c.ident_calls;
+            ident_ascii += c.ident_ascii_only;
+            ident_unicode += c.ident_hit_unicode;
+            unicode_chars += c.ident_unicode_chars;
+            comment += c.skipped_comment_bytes;
+            string += c.skipped_string_bytes;
+            non_ident_skips += c.non_ident_unicode_skips;
+        }
+
         let pct = |n: u64, d: u64| if d == 0 { 0.0 } else { n as f64 / d as f64 * 100.0 };
 
         format!(
@@ -60,14 +107,47 @@ pub mod stats {
              Skip: comments {} ({:.1}%), strings {} ({:.1}%)\n\
              Idents: {} total, {} ascii ({:.1}%), {} unicode ({:.1}%), {} unicode chars\n\
              Non-ident unicode skips: {}",
-            SCAN_CALLS.load(Relaxed),
-            total, total as f64 / 1_048_576.0,
-            comment, pct(comment, total), string, pct(string, total),
+            scan_calls,
+            total_bytes, total_bytes as f64 / 1_048_576.0,
+            comment, pct(comment, total_bytes), string, pct(string, total_bytes),
             ident_calls, ident_ascii, pct(ident_ascii, ident_calls),
             ident_unicode, pct(ident_unicode, ident_calls),
             unicode_chars, non_ident_skips,
         )
     }
+
+    // --- Inline increment helpers (no atomics, just Cell::get/set) ---
+
+    macro_rules! inc {
+        ($field:ident, $val:expr) => {
+            LOCAL.with(|cell| {
+                let mut c = cell.take();
+                c.$field += $val as u64;
+                cell.set(c);
+            });
+        };
+    }
+
+    #[inline(always)]
+    pub(super) fn scan_call(bytes: u64) {
+        inc!(scan_calls, 1);
+        inc!(total_bytes, bytes);
+    }
+    #[inline(always)]
+    pub(super) fn comment_bytes(n: u64) { inc!(skipped_comment_bytes, n); }
+    #[inline(always)]
+    pub(super) fn string_bytes(n: u64) { inc!(skipped_string_bytes, n); }
+    #[inline(always)]
+    pub(super) fn ident_ascii() { inc!(ident_ascii_only, 1); }
+    #[inline(always)]
+    pub(super) fn ident_unicode(chars: u64) {
+        inc!(ident_hit_unicode, 1);
+        inc!(ident_unicode_chars, chars);
+    }
+    #[inline(always)]
+    pub(super) fn ident_call() { inc!(ident_calls, 1); }
+    #[inline(always)]
+    pub(super) fn non_ident_unicode_skip() { inc!(non_ident_unicode_skips, 1); }
 }
 
 /// A token extracted by the scanner.
@@ -198,8 +278,7 @@ pub fn scan(source: &str, lang: LangFamily) -> Vec<Token> {
     let len = bytes.len();
     let def_keywords = lang.def_keywords();
 
-    stats::SCAN_CALLS.fetch_add(1, Relaxed);
-    stats::TOTAL_BYTES.fetch_add(len as u64, Relaxed);
+    stats::scan_call(len as u64);
 
     let mut tokens = Vec::new();
     let mut i = 0;
@@ -227,13 +306,13 @@ pub fn scan(source: &str, lang: LangFamily) -> Vec<Token> {
         if lang.hash_line_comment() && b == b'#' {
             let before = i;
             i = skip_to_eol(bytes, i);
-            stats::SKIPPED_COMMENT_BYTES.fetch_add((i - before) as u64, Relaxed);
+            stats::comment_bytes((i - before) as u64);
             continue;
         }
         if lang.slash_line_comment() && b == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
             let before = i;
             i = skip_to_eol(bytes, i);
-            stats::SKIPPED_COMMENT_BYTES.fetch_add((i - before) as u64, Relaxed);
+            stats::comment_bytes((i - before) as u64);
             continue;
         }
 
@@ -241,7 +320,7 @@ pub fn scan(source: &str, lang: LangFamily) -> Vec<Token> {
         if lang.block_comments() && b == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
             let before = i;
             i = skip_block_comment(bytes, i + 2, &mut line, &mut line_start);
-            stats::SKIPPED_COMMENT_BYTES.fetch_add((i - before) as u64, Relaxed);
+            stats::comment_bytes((i - before) as u64);
             continue;
         }
 
@@ -254,7 +333,7 @@ pub fn scan(source: &str, lang: LangFamily) -> Vec<Token> {
             let before = i;
             let quote = b;
             i = skip_triple_quote(bytes, i + 3, quote, &mut line, &mut line_start);
-            stats::SKIPPED_STRING_BYTES.fetch_add((i - before) as u64, Relaxed);
+            stats::string_bytes((i - before) as u64);
             continue;
         }
 
@@ -276,7 +355,7 @@ pub fn scan(source: &str, lang: LangFamily) -> Vec<Token> {
             }
             let before = i;
             i = skip_string(bytes, i + 1, b, &mut line, &mut line_start);
-            stats::SKIPPED_STRING_BYTES.fetch_add((i - before) as u64, Relaxed);
+            stats::string_bytes((i - before) as u64);
             continue;
         }
 
@@ -284,7 +363,7 @@ pub fn scan(source: &str, lang: LangFamily) -> Vec<Token> {
         if b == b'`' && matches!(lang, LangFamily::JsTs) {
             let before = i;
             i = skip_string(bytes, i + 1, b'`', &mut line, &mut line_start);
-            stats::SKIPPED_STRING_BYTES.fetch_add((i - before) as u64, Relaxed);
+            stats::string_bytes((i - before) as u64);
             continue;
         }
 
@@ -302,7 +381,7 @@ pub fn scan(source: &str, lang: LangFamily) -> Vec<Token> {
             // a leading byte >= 0xC0 that passes is_ident_start_byte, but the full
             // char is not an identifier character. Skip the whole UTF-8 sequence.
             if i == start {
-                stats::NON_IDENT_UNICODE_SKIPS.fetch_add(1, Relaxed);
+                stats::non_ident_unicode_skip();
                 i += utf8_char_len(b);
                 continue;
             }
@@ -366,32 +445,33 @@ fn consume_identifier(source: &str, start: usize) -> usize {
     let bytes = source.as_bytes();
     let mut i = start;
 
-    stats::IDENT_CALLS.fetch_add(1, Relaxed);
+    stats::ident_call();
 
     // Fast path: pure ASCII identifier
     while i < bytes.len() && bytes[i] < 0x80 {
         if is_ident_continue_byte(bytes[i]) {
             i += 1;
         } else {
-            stats::IDENT_ASCII_ONLY.fetch_add(1, Relaxed);
+            stats::ident_ascii();
             return i;
         }
     }
 
     // If we hit a high byte, switch to char-level iteration for the rest
     if i < bytes.len() && bytes[i] >= 0x80 {
-        stats::IDENT_HIT_UNICODE.fetch_add(1, Relaxed);
+        let mut uc = 0u64;
         // Continue consuming from position i using chars
         for ch in source[i..].chars() {
             if is_ident_continue_char(ch) {
-                stats::IDENT_UNICODE_CHARS.fetch_add(1, Relaxed);
+                uc += 1;
                 i += ch.len_utf8();
             } else {
                 break;
             }
         }
+        stats::ident_unicode(uc);
     } else {
-        stats::IDENT_ASCII_ONLY.fetch_add(1, Relaxed);
+        stats::ident_ascii();
     }
 
     i

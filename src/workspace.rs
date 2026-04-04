@@ -159,6 +159,8 @@ impl Workspace {
                     errors.fetch_add(1, Relaxed);
                 }
             }
+            // Flush thread-local tokenizer stats so they're visible to summary()
+            crate::parsing::tokenizer::stats::flush();
         });
 
         // Phase 3: rebuild fuzzy index once from all symbols
