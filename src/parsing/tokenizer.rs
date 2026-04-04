@@ -167,6 +167,48 @@ pub enum TokenKind {
     Ident,
 }
 
+/// Visibility of a definition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Visibility {
+    Public,
+    Private,
+    Unknown,
+}
+
+/// Role of an identifier occurrence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OccurrenceRole {
+    Definition,
+    Reference,
+}
+
+/// A single identifier occurrence found during scanning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Occurrence {
+    pub word: String,
+    pub line: usize,
+    pub col: usize,
+    pub len: usize,
+    pub role: OccurrenceRole,
+}
+
+/// Result of scanning a source file.
+#[derive(Debug, Clone)]
+pub struct ScanResult {
+    /// Definition keyword+ident pairs (existing behavior).
+    pub tokens: Vec<Token>,
+    /// Every identifier occurrence (new).
+    pub occurrences: Vec<Occurrence>,
+}
+
+/// Context tracked per definition during scanning.
+#[derive(Debug, Clone)]
+pub struct DefContext {
+    pub visibility: Visibility,
+    pub container: Option<String>,
+    pub depth: usize,
+}
+
 /// Language family determines comment/string syntax and definition keywords.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LangFamily {
@@ -244,6 +286,55 @@ impl LangFamily {
     fn triple_quote_strings(&self) -> bool {
         matches!(self, Self::Python)
     }
+
+    /// Does this language use indentation-based scoping (Python)?
+    fn indent_scoping(&self) -> bool {
+        matches!(self, Self::Python)
+    }
+
+    /// Keywords that open named scopes (containers).
+    fn scope_openers(&self) -> &[&str] {
+        match self {
+            Self::Rust => &["impl", "struct", "enum", "trait", "mod"],
+            Self::CLike => &["class", "struct", "enum", "namespace"],
+            Self::Go => &[],
+            Self::Python => &["class"],
+            Self::JsTs => &["class", "interface", "enum", "namespace"],
+            Self::JavaCSharp => &["class", "interface", "enum"],
+            Self::Ruby => &["class", "module"],
+        }
+    }
+
+    /// Check if a token is a visibility keyword, returning the visibility.
+    fn check_visibility(&self, word: &str) -> Option<Visibility> {
+        match self {
+            Self::Rust => match word {
+                "pub" => Some(Visibility::Public),
+                _ => None,
+            },
+            Self::JsTs => match word {
+                "export" => Some(Visibility::Public),
+                _ => None,
+            },
+            Self::JavaCSharp => match word {
+                "public" => Some(Visibility::Public),
+                "private" | "protected" => Some(Visibility::Private),
+                _ => None,
+            },
+            Self::CLike => match word {
+                // In C++ class context: public/private/protected are markers
+                "public" => Some(Visibility::Public),
+                "private" | "protected" => Some(Visibility::Private),
+                _ => None,
+            },
+            Self::Ruby => match word {
+                "public" => Some(Visibility::Public),
+                "private" | "protected" => Some(Visibility::Private),
+                _ => None,
+            },
+            Self::Go | Self::Python => None,
+        }
+    }
 }
 
 /// Check if a character can continue an identifier (Unicode-aware).
@@ -274,16 +365,49 @@ fn is_ident_continue_byte(b: u8) -> bool {
 /// Returns tokens in document order. Each `DefKeyword` token is followed by
 /// an `Ident` token if an identifier was found after the keyword.
 pub fn scan(source: &str, lang: LangFamily) -> Vec<Token> {
+    scan_full(source, lang).0.tokens
+}
+
+/// Scan source code and return full results including all identifier occurrences,
+/// scope depth, visibility, and container context, plus definition contexts.
+pub fn scan_full(source: &str, lang: LangFamily) -> (ScanResult, Vec<DefContext>) {
     let bytes = source.as_bytes();
     let len = bytes.len();
     let def_keywords = lang.def_keywords();
+    let scope_openers = lang.scope_openers();
 
     stats::scan_call(len as u64);
 
     let mut tokens = Vec::new();
+    let mut occurrences = Vec::new();
     let mut i = 0;
     let mut line = 0usize;
     let mut line_start = 0usize;
+
+    // Scope tracking
+    let mut brace_depth: usize = 0;
+
+    // Container stack: (name, brace_depth_when_opened)
+    let mut container_stack: Vec<(String, usize)> = Vec::with_capacity(8);
+
+    // Visibility: the last visibility keyword seen (reset after consuming a def)
+    let mut pending_visibility: Option<Visibility> = None;
+
+    // For detecting scope openers: track last identifier that could be a scope name
+    // Format: (keyword, after_keyword_byte_pos)
+    let mut pending_scope_opener: Option<String> = None;
+
+    // Python indentation tracking
+    let mut indent_stack: Vec<usize> = if lang.indent_scoping() {
+        vec![0]
+    } else {
+        Vec::new()
+    };
+    let mut py_at_line_start = true;
+
+    // Def context map: indexed by token pair index (tokens.len() / 2 at time of push)
+    // Stored parallel to definition tokens
+    let mut def_contexts: Vec<DefContext> = Vec::new();
 
     while i < len {
         let b = bytes[i];
@@ -293,10 +417,27 @@ pub fn scan(source: &str, lang: LangFamily) -> Vec<Token> {
             line += 1;
             line_start = i + 1;
             i += 1;
+            if lang.indent_scoping() {
+                py_at_line_start = true;
+            }
             continue;
         }
 
-        // Skip whitespace (ASCII whitespace only — non-breaking spaces etc. are rare in code)
+        // Python indentation tracking at line start
+        if lang.indent_scoping() && py_at_line_start && !b.is_ascii_whitespace() && b != b'#' {
+            let indent = i - line_start;
+            // Pop scopes that have ended (dedented)
+            while indent_stack.len() > 1 && indent <= indent_stack[indent_stack.len() - 1] {
+                indent_stack.pop();
+                if let Some(pos) = container_stack.iter().rposition(|(_,d)| *d >= indent_stack.len()) {
+                    container_stack.truncate(pos);
+                }
+            }
+            brace_depth = indent_stack.len().saturating_sub(1);
+            py_at_line_start = false;
+        }
+
+        // Skip whitespace (ASCII whitespace only)
         if b.is_ascii_whitespace() {
             i += 1;
             continue;
@@ -367,19 +508,55 @@ pub fn scan(source: &str, lang: LangFamily) -> Vec<Token> {
             continue;
         }
 
+        // Track brace depth (not for Python)
+        if !lang.indent_scoping() {
+            if b == b'{' {
+                // If we have a pending scope opener + name, push container
+                if let Some(ref name) = pending_scope_opener {
+                    container_stack.push((name.clone(), brace_depth));
+                    pending_scope_opener = None;
+                }
+                brace_depth += 1;
+                i += 1;
+                continue;
+            }
+            if b == b'}' {
+                brace_depth = brace_depth.saturating_sub(1);
+                // Pop containers whose depth matches
+                while let Some((_, d)) = container_stack.last() {
+                    if *d >= brace_depth {
+                        container_stack.pop();
+                    } else {
+                        break;
+                    }
+                }
+                i += 1;
+                continue;
+            }
+        }
+
+        // Python colon starts a new scope
+        if lang.indent_scoping() && b == b':' {
+            if let Some(ref name) = pending_scope_opener {
+                // Next indented block will be inside this container
+                container_stack.push((name.clone(), indent_stack.len()));
+                // Push a new indent level (will be adjusted when we see the actual indent)
+                indent_stack.push(indent_stack.last().copied().unwrap_or(0) + 1);
+                brace_depth = indent_stack.len().saturating_sub(1);
+                pending_scope_opener = None;
+            }
+            i += 1;
+            continue;
+        }
+
         // Identifier or keyword
         if is_ident_start_byte(b) {
             let start = i;
             let col = i - line_start;
 
-            // Consume the full identifier (Unicode-aware).
-            // If the first byte is ASCII, the keyword fast-path can stay byte-level.
-            // If any byte >= 0x80, we need to switch to char iteration.
             i = consume_identifier(source, i);
 
-            // Non-alphanumeric Unicode chars (e.g., box-drawing │, em-dash ─) have
-            // a leading byte >= 0xC0 that passes is_ident_start_byte, but the full
-            // char is not an identifier character. Skip the whole UTF-8 sequence.
+            // Non-alphanumeric Unicode chars
             if i == start {
                 stats::non_ident_unicode_skip();
                 i += utf8_char_len(b);
@@ -387,10 +564,59 @@ pub fn scan(source: &str, lang: LangFamily) -> Vec<Token> {
             }
 
             let word = &source[start..i];
-
-            // All definition keywords are ASCII, so a word containing non-ASCII
-            // can never be a keyword — skip the keyword check.
             let is_ascii_word = word.is_ascii();
+
+            // Check for visibility keywords
+            if is_ascii_word {
+                if let Some(vis) = lang.check_visibility(word) {
+                    pending_visibility = Some(vis);
+                    // Don't emit visibility keywords as occurrences
+                    continue;
+                }
+            }
+
+            // Check for scope opener keywords (impl, class, struct, etc.)
+            if is_ascii_word && scope_openers.contains(&word) {
+                // The next identifier after this keyword is the container name
+                let saved_i = i;
+                let saved_line = line;
+                let saved_line_start = line_start;
+                let peek_i = skip_to_ident(bytes, i, lang, &mut line, &mut line_start);
+                if peek_i < len && is_ident_start_byte(bytes[peek_i]) {
+                    let name_start = peek_i;
+                    let peek_end = consume_identifier(source, peek_i);
+                    let name = &source[name_start..peek_end];
+                    if !(name.is_ascii() && is_noise_word(name, lang)) {
+                        pending_scope_opener = Some(name.to_string());
+                    }
+                }
+                // Restore position — we only peeked
+                i = saved_i;
+                line = saved_line;
+                line_start = saved_line_start;
+            }
+
+            // Go visibility: uppercase first char = public
+            let go_visibility = if matches!(lang, LangFamily::Go) && is_ascii_word {
+                if word.starts_with(|c: char| c.is_ascii_uppercase()) {
+                    Some(Visibility::Public)
+                } else {
+                    Some(Visibility::Private)
+                }
+            } else {
+                None
+            };
+
+            // Python visibility: _ prefix = private
+            let py_visibility = if matches!(lang, LangFamily::Python) {
+                if word.starts_with('_') {
+                    Some(Visibility::Private)
+                } else {
+                    Some(Visibility::Public)
+                }
+            } else {
+                None
+            };
 
             if is_ascii_word && def_keywords.contains(&word) {
                 tokens.push(Token {
@@ -407,7 +633,7 @@ pub fn scan(source: &str, lang: LangFamily) -> Vec<Token> {
                     let name_col = i - line_start;
                     i = consume_identifier(source, i);
                     let name = &source[name_start..i];
-                    // Skip language noise identifiers (all noise words are ASCII)
+                    // Skip language noise identifiers
                     if !(name.is_ascii() && is_noise_word(name, lang)) {
                         tokens.push(Token {
                             kind: TokenKind::Ident,
@@ -415,15 +641,51 @@ pub fn scan(source: &str, lang: LangFamily) -> Vec<Token> {
                             line,
                             col: name_col,
                         });
+
+                        // Determine visibility for this definition
+                        let vis = pending_visibility
+                            .take()
+                            .or(go_visibility)
+                            .or(py_visibility)
+                            .unwrap_or(Visibility::Unknown);
+
+                        let container = container_stack.last().map(|(n, _)| n.clone());
+
+                        def_contexts.push(DefContext {
+                            visibility: vis,
+                            container,
+                            depth: brace_depth,
+                        });
+
+                        // Emit definition occurrence
+                        occurrences.push(Occurrence {
+                            word: name.to_string(),
+                            line,
+                            col: name_col,
+                            len: name.len(),
+                            role: OccurrenceRole::Definition,
+                        });
+                    } else {
+                        pending_visibility = None;
                     }
+                } else {
+                    pending_visibility = None;
                 }
+            } else {
+                // Not a definition keyword — emit as reference occurrence
+                pending_visibility = None;
+                occurrences.push(Occurrence {
+                    word: word.to_string(),
+                    line,
+                    col,
+                    len: word.len(),
+                    role: OccurrenceRole::Reference,
+                });
             }
             continue;
         }
 
-        // Skip non-ASCII bytes that aren't identifier starts (e.g., punctuation
-        // like em-dashes, exotic operators). Advance by the full UTF-8 character
-        // length to avoid landing in the middle of a multi-byte sequence.
+        // Skip non-ASCII bytes that aren't identifier starts
         if b >= 0x80 {
             i += utf8_char_len(b);
             continue;
@@ -433,7 +695,12 @@ pub fn scan(source: &str, lang: LangFamily) -> Vec<Token> {
         i += 1;
     }
 
-    tokens
+    (ScanResult { tokens, occurrences }, def_contexts)
+}
+
+/// Alias for scan_full for backward compatibility.
+pub fn scan_with_contexts(source: &str, lang: LangFamily) -> (ScanResult, Vec<DefContext>) {
+    scan_full(source, lang)
 }
 
 /// Consume a full identifier starting at byte position `i`, returning the new
