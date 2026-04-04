@@ -25,6 +25,7 @@ use crate::parsing::symbols::Symbol;
 use crate::parsing::tokenizer::{self, LangFamily, Occurrence};
 use crate::word_index::{
     IndexMeta, WordIndex, WordIndexBuilder, collect_file_mtimes, compute_content_hash,
+    index_dir_for_project, index_filename,
 };
 
 /// A symbol definition with its file location.
@@ -161,13 +162,21 @@ impl Workspace {
     }
 
     /// Build the on-disk word index from all file occurrences and save metadata.
+    ///
+    /// Index is stored in the XDG cache directory: `~/.cache/quicklsp/<project-hash>/`
     fn build_word_index(&self, root: &Path, content_hash: u64) {
-        let index_dir = root.join(".quicklsp");
+        let index_dir = match index_dir_for_project(root) {
+            Some(d) => d,
+            None => {
+                tracing::warn!("Cannot determine cache directory for word index");
+                return;
+            }
+        };
         if std::fs::create_dir_all(&index_dir).is_err() {
-            tracing::warn!("Failed to create .quicklsp directory");
+            tracing::warn!("Failed to create index cache directory: {}", index_dir.display());
             return;
         }
-        let index_path = index_dir.join("index.qlsp");
+        let index_path = index_dir.join(index_filename());
 
         let mut builder = WordIndexBuilder::new();
         for entry in self.files.iter() {
@@ -179,10 +188,11 @@ impl Workspace {
             Ok(index) => {
                 let dir_size = index.word_dir().len();
                 tracing::info!(
-                    "Word index built: {} entries, {} unique words, dir memory ~{} KB",
+                    "Word index built: {} entries, {} unique words, dir memory ~{} KB, path: {}",
                     entry_count,
                     dir_size,
                     index.word_dir().memory_usage() / 1024,
+                    index_path.display(),
                 );
 
                 // Save metadata for warm startup
@@ -212,8 +222,11 @@ impl Workspace {
     /// Try to load a persisted word index if it's still fresh.
     /// Returns true if warm startup succeeded.
     fn try_warm_startup(&self, root: &Path, content_hash: u64) -> bool {
-        let index_dir = root.join(".quicklsp");
-        let index_path = index_dir.join("index.qlsp");
+        let index_dir = match index_dir_for_project(root) {
+            Some(d) => d,
+            None => return false,
+        };
+        let index_path = index_dir.join(index_filename());
 
         // Check if meta.json exists and is fresh
         let meta = match IndexMeta::load(&index_dir) {
@@ -230,8 +243,9 @@ impl Workspace {
         match WordIndex::load(&index_path) {
             Ok(index) => {
                 tracing::info!(
-                    "Warm startup: loaded index with {} words from disk",
+                    "Warm startup: loaded index with {} words from {}",
                     index.word_dir().len(),
+                    index_path.display(),
                 );
                 *self.word_index.write().unwrap() = Some(index);
                 true
