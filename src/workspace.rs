@@ -225,6 +225,110 @@ impl Workspace {
             .unwrap_or_default()
     }
 
+    /// Rank definitions so the most contextually relevant one comes first.
+    ///
+    /// Scoring heuristic (higher = better):
+    ///  - Same file as cursor: +2
+    ///  - Qualifier matches a container near the definition (e.g., the word
+    ///    `Workspace` appears on an `impl`/`struct`/`class` line within 20
+    ///    lines above the definition): +4
+    ///
+    /// This is a heuristic, not a type system — but it handles the most
+    /// common cases (e.g., `Workspace::new` vs `Mutex::new`) well.
+    pub fn rank_definitions(
+        &self,
+        defs: &mut Vec<SymbolLocation>,
+        current_file: Option<&Path>,
+        qualifier: Option<&str>,
+    ) {
+        if defs.len() <= 1 {
+            return;
+        }
+
+        defs.sort_by(|a, b| {
+            let score_a = self.definition_score(a, current_file, qualifier);
+            let score_b = self.definition_score(b, current_file, qualifier);
+            score_b.cmp(&score_a) // higher score first
+        });
+    }
+
+    fn definition_score(
+        &self,
+        loc: &SymbolLocation,
+        current_file: Option<&Path>,
+        qualifier: Option<&str>,
+    ) -> i32 {
+        let mut score = 0;
+
+        // Prefer definitions in the same file
+        if let Some(cur) = current_file {
+            if loc.file == cur {
+                score += 2;
+            }
+        }
+
+        // If there's a qualifier (e.g., "Workspace" from "Workspace::new"),
+        // check whether the definition lives inside a matching container.
+        if let Some(qual) = qualifier {
+            if self.definition_matches_qualifier(loc, qual) {
+                score += 4;
+            }
+        }
+
+        score
+    }
+
+    /// Check whether a definition is inside a container matching the qualifier.
+    ///
+    /// Looks at the source text of the file containing the definition, scanning
+    /// up to 30 lines above for a line containing `impl <qualifier>`,
+    /// `struct <qualifier>`, `class <qualifier>`, `trait <qualifier>`, etc.
+    fn definition_matches_qualifier(&self, loc: &SymbolLocation, qualifier: &str) -> bool {
+        let entry = match self.files.get(&loc.file) {
+            Some(e) => e,
+            None => return false,
+        };
+
+        let lines: Vec<&str> = entry.source.lines().collect();
+        let def_line = loc.symbol.line;
+
+        // Scan backwards from the definition line looking for a container declaration
+        let start = def_line.saturating_sub(30);
+        for line_idx in (start..def_line).rev() {
+            if let Some(line) = lines.get(line_idx) {
+                let trimmed = line.trim_start();
+                // Check for patterns like: `impl Foo`, `struct Foo`, `class Foo`
+                for keyword in &["impl", "struct", "class", "trait", "enum", "interface", "object"] {
+                    if let Some(rest) = trimmed.strip_prefix(keyword) {
+                        // The qualifier should appear as the next word after the keyword
+                        let rest = rest.trim_start();
+                        // Handle generic parameters: `impl<T> Foo`
+                        let rest = if rest.starts_with('<') {
+                            // Skip past the generic params
+                            match rest.find('>') {
+                                Some(pos) => rest[pos + 1..].trim_start(),
+                                None => rest,
+                            }
+                        } else {
+                            rest
+                        };
+                        // Check if qualifier matches the type name
+                        if rest.starts_with(qualifier) {
+                            let after = &rest[qualifier.len()..];
+                            if after.is_empty()
+                                || after.starts_with(|c: char| !c.is_alphanumeric() && c != '_')
+                            {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
     /// Find all references (usages) of a symbol name across all indexed files.
     ///
     /// This does a word-boundary text search on every indexed file's source.
@@ -339,7 +443,15 @@ impl Workspace {
                         }
                         if name_start < name_end {
                             let func_name: String = chars[name_start..name_end].iter().collect();
-                            let defs = self.find_definitions(&func_name);
+                            let mut defs = self.find_definitions(&func_name);
+                            // Extract qualifier before the function name
+                            // (e.g., "Workspace" from "Workspace::new(")
+                            let qualifier = extract_qualifier_before(&chars, name_start);
+                            self.rank_definitions(
+                                &mut defs,
+                                None,
+                                qualifier.as_deref(),
+                            );
                             if let Some(loc) = defs.into_iter().next() {
                                 return Some((loc, comma_count));
                             }
@@ -410,6 +522,43 @@ fn should_skip_dir(name: &str) -> bool {
             | ".idea"
             | ".vscode"
     ) || name.starts_with('.')
+}
+
+// ── Qualifier extraction ────────────────────────────────────────────────
+
+/// Extract the qualifier identifier before a separator (`::`, `.`, `->`)
+/// that appears immediately before position `pos` in `chars`.
+///
+/// For example, given `Workspace::new(` with `pos` pointing to the start of
+/// `new`, returns `Some("Workspace")`.
+fn extract_qualifier_before(chars: &[char], pos: usize) -> Option<String> {
+    let mut i = pos;
+
+    // Check for separator: `::`, `.`, or `->`
+    if i >= 2 && chars[i - 2] == ':' && chars[i - 1] == ':' {
+        i -= 2;
+    } else if i >= 2 && chars[i - 2] == '-' && chars[i - 1] == '>' {
+        i -= 2;
+    } else if i >= 1 && chars[i - 1] == '.' {
+        i -= 1;
+    } else {
+        return None;
+    }
+
+    // Skip whitespace
+    while i > 0 && chars[i - 1] == ' ' {
+        i -= 1;
+    }
+
+    // Extract identifier
+    let end = i;
+    while i > 0 && (chars[i - 1] == '_' || chars[i - 1].is_alphanumeric()) {
+        i -= 1;
+    }
+    if i == end {
+        return None;
+    }
+    Some(chars[i..end].iter().collect())
 }
 
 // ── Word-boundary text search ───────────────────────────────────────────
@@ -844,5 +993,115 @@ mod tests {
         assert_eq!(ws.find_definitions("generated").len(), 0);
         assert_eq!(ws.find_definitions("dep").len(), 0);
         assert_eq!(ws.find_definitions("hook").len(), 0);
+    }
+
+    #[test]
+    fn extract_qualifier_before_double_colon() {
+        let chars: Vec<char> = "Workspace::new()".chars().collect();
+        // "new" starts at index 11 (W=0..e=8, :=9, :=10, n=11)
+        assert_eq!(
+            extract_qualifier_before(&chars, 11),
+            Some("Workspace".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_qualifier_before_dot() {
+        let chars: Vec<char> = "self.workspace.scan_directory()".chars().collect();
+        // "scan_directory" starts at index 15
+        // s=0,e=1,l=2,f=3,.=4,w=5..e=13,.=14,s=15
+        assert_eq!(
+            extract_qualifier_before(&chars, 15),
+            Some("workspace".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_qualifier_before_arrow() {
+        let chars: Vec<char> = "ptr->method()".chars().collect();
+        // "method" starts at index 5 (p=0,t=1,r=2,-=3,>=4,m=5)
+        assert_eq!(
+            extract_qualifier_before(&chars, 5),
+            Some("ptr".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_qualifier_bare_ident() {
+        let chars: Vec<char> = "some_function()".chars().collect();
+        assert_eq!(extract_qualifier_before(&chars, 0), None);
+    }
+
+    #[test]
+    fn rank_definitions_prefers_qualifier_match() {
+        let ws = Workspace::new();
+        ws.index_file(
+            PathBuf::from("/src/mutex.rs"),
+            "impl Mutex {\n    pub fn new() {}\n}".to_string(),
+        );
+        ws.index_file(
+            PathBuf::from("/src/workspace.rs"),
+            "impl Workspace {\n    pub fn new() {}\n}".to_string(),
+        );
+
+        let mut defs = ws.find_definitions("new");
+        assert_eq!(defs.len(), 2);
+
+        // With qualifier "Workspace", the Workspace::new should rank first
+        ws.rank_definitions(&mut defs, None, Some("Workspace"));
+        assert_eq!(defs[0].file, PathBuf::from("/src/workspace.rs"));
+
+        // With qualifier "Mutex", the Mutex::new should rank first
+        ws.rank_definitions(&mut defs, None, Some("Mutex"));
+        assert_eq!(defs[0].file, PathBuf::from("/src/mutex.rs"));
+    }
+
+    #[test]
+    fn rank_definitions_prefers_same_file() {
+        let ws = Workspace::new();
+        ws.index_file(
+            PathBuf::from("/src/a.rs"),
+            "fn helper() {}".to_string(),
+        );
+        ws.index_file(
+            PathBuf::from("/src/b.rs"),
+            "fn helper() {}".to_string(),
+        );
+
+        let mut defs = ws.find_definitions("helper");
+        assert_eq!(defs.len(), 2);
+
+        // Without qualifier, prefer same-file
+        ws.rank_definitions(&mut defs, Some(Path::new("/src/b.rs")), None);
+        assert_eq!(defs[0].file, PathBuf::from("/src/b.rs"));
+
+        ws.rank_definitions(&mut defs, Some(Path::new("/src/a.rs")), None);
+        assert_eq!(defs[0].file, PathBuf::from("/src/a.rs"));
+    }
+
+    #[test]
+    fn rank_definitions_qualifier_beats_same_file() {
+        let ws = Workspace::new();
+        // File a.rs has a "new" inside impl Mutex
+        ws.index_file(
+            PathBuf::from("/src/a.rs"),
+            "impl Mutex {\n    pub fn new() {}\n}".to_string(),
+        );
+        // File b.rs has a "new" inside impl Workspace
+        ws.index_file(
+            PathBuf::from("/src/b.rs"),
+            "impl Workspace {\n    pub fn new() {}\n}".to_string(),
+        );
+
+        let mut defs = ws.find_definitions("new");
+        assert_eq!(defs.len(), 2);
+
+        // Even though current_file is a.rs, qualifier "Workspace" should win
+        ws.rank_definitions(
+            &mut defs,
+            Some(Path::new("/src/a.rs")),
+            Some("Workspace"),
+        );
+        assert_eq!(defs[0].file, PathBuf::from("/src/b.rs"));
     }
 }

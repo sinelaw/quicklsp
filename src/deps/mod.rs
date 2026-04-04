@@ -168,7 +168,10 @@ impl DependencyIndex {
     ///
     /// Since the Workspace uses DashMap, queries against already-indexed
     /// symbols work concurrently while this method is still indexing.
-    pub fn index_pending(&self) {
+    ///
+    /// The optional `on_progress` callback is called after each package
+    /// with `(completed, total)` counts, allowing callers to report progress.
+    pub fn index_pending(&self, on_progress: Option<&dyn Fn(usize, usize)>) {
         // Prevent concurrent index passes
         if self
             .indexing_in_progress
@@ -183,8 +186,13 @@ impl DependencyIndex {
             std::mem::take(&mut *pending)
         };
 
-        for pkg in packages {
+        let total = packages.len();
+
+        for (i, pkg) in packages.into_iter().enumerate() {
             if self.indexed_packages.contains_key(&pkg.path) {
+                if let Some(cb) = &on_progress {
+                    cb(i + 1, total);
+                }
                 continue;
             }
 
@@ -211,23 +219,22 @@ impl DependencyIndex {
             }
 
             self.indexed_packages.insert(pkg.path, ());
+
+            if let Some(cb) = &on_progress {
+                cb(i + 1, total);
+            }
         }
 
         self.indexing_in_progress.store(false, Ordering::SeqCst);
     }
 
-    /// Try to find hover info for a symbol, triggering index if needed.
+    /// Try to find hover info for a symbol in already-indexed dependencies.
+    ///
+    /// Returns whatever is available immediately — never blocks on indexing.
+    /// Background indexing (kicked off during `initialized`) will populate
+    /// the index progressively; queries against not-yet-indexed packages
+    /// simply return `None` until the background pass reaches them.
     pub fn hover_info(&self, name: &str) -> Option<(Option<String>, Option<String>)> {
-        // Check already-indexed deps (works during concurrent indexing)
-        if let Some(info) = self.deps.hover_info(name) {
-            return Some(info);
-        }
-
-        // If there are pending packages, index them
-        self.refresh_if_stale();
-        self.index_pending();
-
-        // Try again after indexing
         self.deps.hover_info(name)
     }
 
@@ -336,7 +343,7 @@ mod tests {
         assert!(idx.deps.hover_info("dep_helper").is_none());
 
         // Index pending
-        idx.index_pending();
+        idx.index_pending(None);
 
         // Now it should be found
         let info = idx.deps.hover_info("dep_helper");

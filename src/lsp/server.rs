@@ -52,6 +52,53 @@ impl QuickLspServer {
         }
         Some(chars[start..end].iter().collect())
     }
+
+    /// Extract the qualifier before the word at cursor position.
+    ///
+    /// For `Workspace::new()` with cursor on `new`, returns `Some("Workspace")`.
+    /// For `self.workspace.scan_directory()` with cursor on `scan_directory`,
+    /// returns `Some("workspace")`.
+    /// Returns `None` if there is no qualifier (bare identifier).
+    fn qualifier_at_position(content: &str, position: Position) -> Option<String> {
+        let line = content.lines().nth(position.line as usize)?;
+        let col = position.character as usize;
+        let chars: Vec<char> = line.chars().collect();
+        if col > chars.len() {
+            return None;
+        }
+
+        // Find start of the current word
+        let mut word_start = col;
+        while word_start > 0 && is_ident_char(chars[word_start - 1]) {
+            word_start -= 1;
+        }
+
+        // Check for separator before the word: `::`, `.`, or `->`
+        let mut sep_end = word_start;
+        if sep_end >= 2 && chars[sep_end - 2] == ':' && chars[sep_end - 1] == ':' {
+            sep_end -= 2;
+        } else if sep_end >= 2 && chars[sep_end - 2] == '-' && chars[sep_end - 1] == '>' {
+            sep_end -= 2;
+        } else if sep_end >= 1 && chars[sep_end - 1] == '.' {
+            sep_end -= 1;
+        } else {
+            return None; // No separator — bare identifier
+        }
+
+        // Extract the qualifier identifier before the separator
+        let mut q_end = sep_end;
+        while q_end > 0 && chars[q_end - 1] == ' ' {
+            q_end -= 1;
+        }
+        let mut q_start = q_end;
+        while q_start > 0 && is_ident_char(chars[q_start - 1]) {
+            q_start -= 1;
+        }
+        if q_start == q_end {
+            return None;
+        }
+        Some(chars[q_start..q_end].iter().collect())
+    }
 }
 
 fn is_ident_char(ch: char) -> bool {
@@ -141,17 +188,63 @@ impl LanguageServer for QuickLspServer {
         let workspace = self.workspace.clone();
         let dep_index = self.dep_index.clone();
         let root = self.workspace_root.read().await.clone();
+        let client = self.client.clone();
         tokio::spawn(async move {
+            let Some(root) = root else { return };
+
+            // Phase 1: scan local workspace files (fast — only project sources)
+            let ws = workspace.clone();
+            let scan_root = root.clone();
             tokio::task::spawn_blocking(move || {
-                if let Some(root) = root {
-                    // Phase 1: scan local workspace files
-                    workspace.scan_directory(&root);
-                    // Phase 2: index dependency packages
-                    dep_index.index_pending();
-                }
+                ws.scan_directory(&scan_root);
             })
             .await
             .ok();
+
+            client
+                .log_message(MessageType::INFO, "Workspace scan complete")
+                .await;
+
+            // Phase 2: index dependency packages with progress reporting.
+            // Use a channel so the blocking indexer can report per-package
+            // progress back to this async task, which forwards it to the client.
+            let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<(usize, usize)>();
+
+            let dep = dep_index.clone();
+            let index_handle = tokio::task::spawn_blocking(move || {
+                dep.index_pending(Some(&|done, total| {
+                    let _ = progress_tx.send((done, total));
+                }));
+            });
+
+            // Forward progress messages to the client as log messages.
+            // We use log_message rather than workDoneProgress to avoid needing
+            // to negotiate progress token support with the client.
+            let progress_client = client.clone();
+            let progress_handle = tokio::spawn(async move {
+                while let Some((done, total)) = progress_rx.recv().await {
+                    progress_client
+                        .log_message(
+                            MessageType::INFO,
+                            format!("Indexing dependencies: {done}/{total} packages"),
+                        )
+                        .await;
+                }
+            });
+
+            index_handle.await.ok();
+            progress_handle.await.ok();
+
+            client
+                .log_message(
+                    MessageType::INFO,
+                    format!(
+                        "Dependency indexing complete: {} packages, {} definitions",
+                        dep_index.package_count(),
+                        dep_index.definition_count(),
+                    ),
+                )
+                .await;
         });
     }
 
@@ -189,10 +282,17 @@ impl LanguageServer for QuickLspServer {
             Some(s) => s,
             None => return Ok(None),
         };
+        let qualifier = Self::qualifier_at_position(&source, pos);
+        let current_file = uri.to_file_path().ok();
         let mut defs = self.workspace.find_definitions(&symbol);
         if defs.is_empty() {
             defs = self.dep_index.find_definitions(&symbol);
         }
+        self.workspace.rank_definitions(
+            &mut defs,
+            current_file.as_deref(),
+            qualifier.as_deref(),
+        );
         if let Some(loc) = defs.first().and_then(loc_to_lsp) {
             return Ok(Some(GotoDefinitionResponse::Scalar(loc)));
         }
@@ -328,14 +428,25 @@ impl LanguageServer for QuickLspServer {
             None => return Ok(None),
         };
 
-        let (sig, doc) = match self.workspace.hover_info(&symbol) {
-            Some(info) => info,
-            // Fallback to dependency index
-            None => match self.dep_index.hover_info(&symbol) {
-                Some(info) => info,
-                None => return Ok(None),
-            },
+        // Find definitions and rank them by context (qualifier + same-file)
+        let qualifier = Self::qualifier_at_position(&source, pos);
+        let current_file = uri.to_file_path().ok();
+        let mut defs = self.workspace.find_definitions(&symbol);
+        if defs.is_empty() {
+            defs = self.dep_index.find_definitions(&symbol);
+        }
+        self.workspace.rank_definitions(
+            &mut defs,
+            current_file.as_deref(),
+            qualifier.as_deref(),
+        );
+
+        let loc = match defs.first() {
+            Some(loc) => loc,
+            None => return Ok(None),
         };
+        let sig = loc.symbol.signature.clone();
+        let doc = loc.symbol.doc_comment.clone();
 
         // Build markdown hover content: signature as code block + doc as text
         let mut parts = Vec::new();
