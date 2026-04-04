@@ -16,11 +16,75 @@ use crate::deps::DependencyIndex;
 use crate::parsing::symbols::{self, SymbolKind as QuickSymbolKind};
 use crate::workspace::{SymbolLocation, Workspace};
 
+/// Negotiated position encoding for this session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PosEncoding {
+    Utf8,
+    Utf16,
+    Utf32,
+}
+
+/// Convert a byte offset within a line to the client's position encoding.
+/// For ASCII lines (the vast majority of code), all encodings produce the
+/// same value as the byte offset, so we fast-path that case.
+fn byte_col_to_encoding(line: &str, byte_col: usize, encoding: PosEncoding) -> u32 {
+    let byte_col = byte_col.min(line.len());
+    match encoding {
+        PosEncoding::Utf8 => byte_col as u32,
+        _ => {
+            let prefix = &line.as_bytes()[..byte_col];
+            if prefix.is_ascii() {
+                return byte_col as u32;
+            }
+            let prefix_str = &line[..byte_col];
+            match encoding {
+                PosEncoding::Utf32 => prefix_str.chars().count() as u32,
+                PosEncoding::Utf16 => prefix_str.encode_utf16().count() as u32,
+                PosEncoding::Utf8 => unreachable!(),
+            }
+        }
+    }
+}
+
+/// Convert a client position encoding column back to a byte offset within a line.
+/// Used for incoming positions from the client (e.g., cursor position).
+fn encoding_col_to_byte(line: &str, encoded_col: u32, encoding: PosEncoding) -> usize {
+    let encoded_col = encoded_col as usize;
+    match encoding {
+        PosEncoding::Utf8 => encoded_col.min(line.len()),
+        _ => {
+            if line.is_ascii() {
+                return encoded_col.min(line.len());
+            }
+            match encoding {
+                PosEncoding::Utf32 => {
+                    line.char_indices()
+                        .nth(encoded_col)
+                        .map(|(i, _)| i)
+                        .unwrap_or(line.len())
+                }
+                PosEncoding::Utf16 => {
+                    let mut utf16_offset = 0usize;
+                    for (i, ch) in line.char_indices() {
+                        if utf16_offset >= encoded_col {
+                            return i;
+                        }
+                        utf16_offset += ch.len_utf16();
+                    }
+                    line.len()
+                }
+                PosEncoding::Utf8 => unreachable!(),
+            }
+        }
+    }
+}
+
 pub struct QuickLspServer {
     client: Client,
     workspace: Arc<Workspace>,
     dep_index: Arc<DependencyIndex>,
     workspace_root: Arc<RwLock<Option<PathBuf>>>,
+    pos_encoding: RwLock<PosEncoding>,
 }
 
 impl QuickLspServer {
@@ -30,12 +94,23 @@ impl QuickLspServer {
             workspace: Arc::new(Workspace::new()),
             dep_index: Arc::new(DependencyIndex::new()),
             workspace_root: Arc::new(RwLock::new(None)),
+            pos_encoding: RwLock::new(PosEncoding::Utf16),
         }
     }
 
-    fn word_at_position(content: &str, position: Position) -> Option<String> {
-        let line = content.lines().nth(position.line as usize)?;
-        let col = position.character as usize;
+    /// Convert an incoming client position to a char index for the given line.
+    fn client_col_to_char_index(
+        line: &str,
+        encoded_col: u32,
+        encoding: PosEncoding,
+    ) -> usize {
+        let byte_offset = encoding_col_to_byte(line, encoded_col, encoding);
+        // Convert byte offset to char index
+        line[..byte_offset.min(line.len())].chars().count()
+    }
+
+    fn word_at_position(content: &str, line_idx: usize, col: usize) -> Option<String> {
+        let line = content.lines().nth(line_idx)?;
         let chars: Vec<char> = line.chars().collect();
         if col > chars.len() {
             return None;
@@ -60,9 +135,8 @@ impl QuickLspServer {
     /// For `self.workspace.scan_directory()` with cursor on `scan_directory`,
     /// returns `Some("workspace")`.
     /// Returns `None` if there is no qualifier (bare identifier).
-    fn qualifier_at_position(content: &str, position: Position) -> Option<String> {
-        let line = content.lines().nth(position.line as usize)?;
-        let col = position.character as usize;
+    fn qualifier_at_position(content: &str, line_idx: usize, col: usize) -> Option<String> {
+        let line = content.lines().nth(line_idx)?;
         let chars: Vec<char> = line.chars().collect();
         if col > chars.len() {
             return None;
@@ -133,18 +207,31 @@ fn aero_kind_to_lsp(kind: QuickSymbolKind) -> SymbolKind {
     }
 }
 
-fn loc_to_lsp(loc: &SymbolLocation) -> Option<Location> {
+/// Get the source line for a symbol location from the workspace.
+fn get_source_line(ws: &Workspace, loc: &SymbolLocation) -> Option<String> {
+    let source = ws.file_source(&loc.file)?;
+    source.lines().nth(loc.symbol.line).map(|s| s.to_string())
+}
+
+fn loc_to_lsp(loc: &SymbolLocation, source_line: Option<&str>, enc: PosEncoding) -> Option<Location> {
     let uri = Url::from_file_path(&loc.file).ok()?;
+    let (start_char, end_char) = match source_line {
+        Some(line) => (
+            byte_col_to_encoding(line, loc.symbol.col, enc),
+            byte_col_to_encoding(line, loc.symbol.col + loc.symbol.name.len(), enc),
+        ),
+        None => (loc.symbol.col as u32, (loc.symbol.col + loc.symbol.name.len()) as u32),
+    };
     Some(Location {
         uri,
         range: Range {
             start: Position {
                 line: loc.symbol.line as u32,
-                character: loc.symbol.col as u32,
+                character: start_char,
             },
             end: Position {
                 line: loc.symbol.line as u32,
-                character: (loc.symbol.col + loc.symbol.name.len()) as u32,
+                character: end_char,
             },
         },
     })
@@ -160,8 +247,30 @@ impl LanguageServer for QuickLspServer {
                 *self.workspace_root.write().await = Some(path);
             }
         }
+
+        // Negotiate position encoding: prefer UTF-8, then UTF-32, fall back to UTF-16
+        let client_encodings = params
+            .capabilities
+            .general
+            .as_ref()
+            .and_then(|g| g.position_encodings.as_ref());
+
+        let (negotiated, encoding_kind) = if let Some(encodings) = client_encodings {
+            if encodings.iter().any(|e| *e == PositionEncodingKind::UTF8) {
+                (PosEncoding::Utf8, Some(PositionEncodingKind::UTF8))
+            } else if encodings.iter().any(|e| *e == PositionEncodingKind::UTF32) {
+                (PosEncoding::Utf32, Some(PositionEncodingKind::UTF32))
+            } else {
+                (PosEncoding::Utf16, None)
+            }
+        } else {
+            (PosEncoding::Utf16, None)
+        };
+        *self.pos_encoding.write().await = negotiated;
+
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
+                position_encoding: encoding_kind,
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::FULL,
                 )),
@@ -339,17 +448,22 @@ impl LanguageServer for QuickLspServer {
         &self,
         params: GotoDefinitionParams,
     ) -> Result<Option<GotoDefinitionResponse>> {
+        let enc = *self.pos_encoding.read().await;
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
         let source = match self.workspace.file_source_from_uri(uri) {
             Some(s) => s,
             None => return Ok(None),
         };
-        let symbol = match Self::word_at_position(&source, pos) {
+        let line_str = source.lines().nth(pos.line as usize);
+        let char_col = line_str
+            .map(|l| Self::client_col_to_char_index(l, pos.character, enc))
+            .unwrap_or(0);
+        let symbol = match Self::word_at_position(&source, pos.line as usize, char_col) {
             Some(s) => s,
             None => return Ok(None),
         };
-        let qualifier = Self::qualifier_at_position(&source, pos);
+        let qualifier = Self::qualifier_at_position(&source, pos.line as usize, char_col);
         let current_file = uri.to_file_path().ok();
         let mut defs = self.workspace.find_definitions(&symbol);
         if defs.is_empty() {
@@ -357,20 +471,28 @@ impl LanguageServer for QuickLspServer {
         }
         self.workspace
             .rank_definitions(&mut defs, current_file.as_deref(), qualifier.as_deref());
-        if let Some(loc) = defs.first().and_then(loc_to_lsp) {
-            return Ok(Some(GotoDefinitionResponse::Scalar(loc)));
+        if let Some(def) = defs.first() {
+            let src_line = get_source_line(&self.workspace, def);
+            if let Some(loc) = loc_to_lsp(def, src_line.as_deref(), enc) {
+                return Ok(Some(GotoDefinitionResponse::Scalar(loc)));
+            }
         }
         Ok(None)
     }
 
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
+        let enc = *self.pos_encoding.read().await;
         let uri = &params.text_document_position.text_document.uri;
         let pos = params.text_document_position.position;
         let source = match self.workspace.file_source_from_uri(uri) {
             Some(s) => s,
             None => return Ok(None),
         };
-        let symbol = match Self::word_at_position(&source, pos) {
+        let line_str = source.lines().nth(pos.line as usize);
+        let char_col = line_str
+            .map(|l| Self::client_col_to_char_index(l, pos.character, enc))
+            .unwrap_or(0);
+        let symbol = match Self::word_at_position(&source, pos.line as usize, char_col) {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -382,16 +504,20 @@ impl LanguageServer for QuickLspServer {
             .iter()
             .filter_map(|r| {
                 let u = Url::from_file_path(&r.file).ok()?;
+                let ref_line = self.workspace.file_source(&r.file).and_then(|s| {
+                    s.lines().nth(r.line).map(|l| l.to_string())
+                });
+                let ref_line_str = ref_line.as_deref().unwrap_or("");
                 Some(Location {
                     uri: u,
                     range: Range {
                         start: Position {
                             line: r.line as u32,
-                            character: r.col as u32,
+                            character: byte_col_to_encoding(ref_line_str, r.col, enc),
                         },
                         end: Position {
                             line: r.line as u32,
-                            character: (r.col + r.len) as u32,
+                            character: byte_col_to_encoding(ref_line_str, r.col + r.len, enc),
                         },
                     },
                 })
@@ -408,6 +534,7 @@ impl LanguageServer for QuickLspServer {
         &self,
         params: DocumentSymbolParams,
     ) -> Result<Option<DocumentSymbolResponse>> {
+        let enc = *self.pos_encoding.read().await;
         let uri = &params.text_document.uri;
         let path = match uri.to_file_path() {
             Ok(p) => p,
@@ -417,9 +544,12 @@ impl LanguageServer for QuickLspServer {
         if syms.is_empty() {
             return Ok(None);
         }
+        let source = self.workspace.file_source(&path);
+        let lines: Vec<&str> = source.as_deref().map(|s| s.lines().collect()).unwrap_or_default();
         let lsp_syms: Vec<SymbolInformation> = syms
             .iter()
             .map(|s| {
+                let line_str = lines.get(s.line).copied().unwrap_or("");
                 #[allow(deprecated)]
                 SymbolInformation {
                     name: s.name.clone(),
@@ -431,11 +561,11 @@ impl LanguageServer for QuickLspServer {
                         range: Range {
                             start: Position {
                                 line: s.line as u32,
-                                character: s.col as u32,
+                                character: byte_col_to_encoding(line_str, s.col, enc),
                             },
                             end: Position {
                                 line: s.line as u32,
-                                character: (s.col + s.name.len()) as u32,
+                                character: byte_col_to_encoding(line_str, s.col + s.name.len(), enc),
                             },
                         },
                     },
@@ -450,6 +580,7 @@ impl LanguageServer for QuickLspServer {
         &self,
         params: WorkspaceSymbolParams,
     ) -> Result<Option<Vec<SymbolInformation>>> {
+        let enc = *self.pos_encoding.read().await;
         if params.query.is_empty() {
             return Ok(None);
         }
@@ -461,7 +592,8 @@ impl LanguageServer for QuickLspServer {
             .iter()
             .take(20)
             .filter_map(|loc| {
-                let location = loc_to_lsp(loc)?;
+                let src_line = get_source_line(&self.workspace, loc);
+                let location = loc_to_lsp(loc, src_line.as_deref(), enc)?;
                 #[allow(deprecated)]
                 Some(SymbolInformation {
                     name: loc.symbol.name.clone(),
@@ -481,19 +613,24 @@ impl LanguageServer for QuickLspServer {
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
+        let enc = *self.pos_encoding.read().await;
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
         let source = match self.workspace.file_source_from_uri(uri) {
             Some(s) => s,
             None => return Ok(None),
         };
-        let symbol = match Self::word_at_position(&source, pos) {
+        let line_str = source.lines().nth(pos.line as usize);
+        let char_col = line_str
+            .map(|l| Self::client_col_to_char_index(l, pos.character, enc))
+            .unwrap_or(0);
+        let symbol = match Self::word_at_position(&source, pos.line as usize, char_col) {
             Some(s) => s,
             None => return Ok(None),
         };
 
         // Find definitions and rank them by context (qualifier + same-file)
-        let qualifier = Self::qualifier_at_position(&source, pos);
+        let qualifier = Self::qualifier_at_position(&source, pos.line as usize, char_col);
         let current_file = uri.to_file_path().ok();
         let mut defs = self.workspace.find_definitions(&symbol);
         if defs.is_empty() {
@@ -532,6 +669,7 @@ impl LanguageServer for QuickLspServer {
     }
 
     async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {
+        let enc = *self.pos_encoding.read().await;
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
         let source = match self.workspace.file_source_from_uri(uri) {
@@ -539,17 +677,23 @@ impl LanguageServer for QuickLspServer {
             None => return Ok(None),
         };
 
+        // signature_help_at works on char indices internally
+        let line_str = source.lines().nth(pos.line as usize);
+        let char_col = line_str
+            .map(|l| Self::client_col_to_char_index(l, pos.character, enc))
+            .unwrap_or(0);
+
         let (loc, active_param) = match self.workspace.signature_help_at(
             &source,
             pos.line as usize,
-            pos.character as usize,
+            char_col,
         ) {
             Some(result) => result,
             // Fallback to dependency index
             None => match self.dep_index.signature_help_at(
                 &source,
                 pos.line as usize,
-                pos.character as usize,
+                char_col,
             ) {
                 Some(result) => result,
                 None => return Ok(None),
@@ -594,13 +738,18 @@ impl LanguageServer for QuickLspServer {
     }
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
+        let enc = *self.pos_encoding.read().await;
         let uri = &params.text_document_position.text_document.uri;
         let pos = params.text_document_position.position;
         let source = match self.workspace.file_source_from_uri(uri) {
             Some(s) => s,
             None => return Ok(None),
         };
-        let partial = match Self::word_at_position(&source, pos) {
+        let line_str = source.lines().nth(pos.line as usize);
+        let char_col = line_str
+            .map(|l| Self::client_col_to_char_index(l, pos.character, enc))
+            .unwrap_or(0);
+        let partial = match Self::word_at_position(&source, pos.line as usize, char_col) {
             Some(s) if !s.is_empty() => s,
             _ => return Ok(None),
         };

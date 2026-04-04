@@ -8,6 +8,7 @@ pub struct Symbol {
     pub name: String,
     pub kind: SymbolKind,
     pub line: usize,
+    /// Column as a byte offset from line start.
     pub col: usize,
     /// The keyword that introduced this symbol (e.g., "fn", "class").
     pub def_keyword: String,

@@ -221,7 +221,7 @@ pub fn scan(source: &str, lang: LangFamily) -> Vec<Token> {
         // Identifier or keyword
         if is_ident_start_byte(b) {
             let start = i;
-            let col = compute_col(source, line_start, i);
+            let col = i - line_start;
 
             // Consume the full identifier (Unicode-aware).
             // If the first byte is ASCII, the keyword fast-path can stay byte-level.
@@ -246,7 +246,7 @@ pub fn scan(source: &str, lang: LangFamily) -> Vec<Token> {
                 i = skip_to_ident(bytes, i, lang, &mut line, &mut line_start);
                 if i < len && is_ident_start_byte(bytes[i]) {
                     let name_start = i;
-                    let name_col = compute_col(source, line_start, i);
+                    let name_col = i - line_start;
                     i = consume_identifier(source, i);
                     let name = &source[name_start..i];
                     // Skip language noise identifiers (all noise words are ASCII)
@@ -309,20 +309,6 @@ fn consume_identifier(source: &str, start: usize) -> usize {
     }
 
     i
-}
-
-/// Compute the column as a character offset (not byte offset) for correct
-/// Unicode column reporting. Handles the case where `line_start` may not
-/// be on a char boundary (can happen when byte-level skipping traverses
-/// multi-byte characters in strings/comments).
-fn compute_col(source: &str, line_start: usize, byte_pos: usize) -> usize {
-    // Find the nearest valid char boundary at or before line_start
-    let mut start = line_start.min(source.len());
-    while start > 0 && !source.is_char_boundary(start) {
-        start -= 1;
-    }
-    let end = byte_pos.min(source.len());
-    source[start..end].chars().count()
 }
 
 /// Return the length of a UTF-8 character from its first byte.

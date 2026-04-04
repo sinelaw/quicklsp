@@ -6,7 +6,7 @@
 //! To prevent combinatorial explosion for long strings, we use truncated
 //! deletion neighborhoods — only indexing variants of a fixed-length prefix.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ahash::RandomState;
 
@@ -63,37 +63,25 @@ impl DeletionIndex {
     /// on the fly and checks each against the precomputed index.
     pub fn resolve(&self, query: &str) -> Vec<&str> {
         let mut results = Vec::new();
+        let mut seen: HashSet<*const str> = HashSet::new();
         let hasher = self.index.hasher().clone();
         let prefix: String = query.chars().take(MAX_PREFIX_LEN).collect();
 
-        // Exact match
-        let hash = hasher.hash_one(query);
-        if let Some(matches) = self.index.get(&hash) {
-            for m in matches {
-                if !results.contains(&m.as_str()) {
-                    results.push(m.as_str());
-                }
-            }
-        }
-
-        // k=1 deletion variants of the query
+        // Collect all hashes to probe: exact + k=1 + k=2 variants
+        let mut hashes = Vec::new();
+        hashes.push(hasher.hash_one(query));
         for variant in deletion_variants(&prefix, 1) {
-            let h = hasher.hash_one(variant.as_str());
-            if let Some(matches) = self.index.get(&h) {
-                for m in matches {
-                    if !results.contains(&m.as_str()) {
-                        results.push(m.as_str());
-                    }
-                }
-            }
+            hashes.push(hasher.hash_one(variant.as_str()));
+        }
+        for variant in deletion_variants(&prefix, 2) {
+            hashes.push(hasher.hash_one(variant.as_str()));
         }
 
-        // k=2 for more aggressive fuzzy matching
-        for variant in deletion_variants(&prefix, 2) {
-            let h = hasher.hash_one(variant.as_str());
+        for h in hashes {
             if let Some(matches) = self.index.get(&h) {
                 for m in matches {
-                    if !results.contains(&m.as_str()) {
+                    let ptr = m.as_str() as *const str;
+                    if seen.insert(ptr) {
                         results.push(m.as_str());
                     }
                 }
@@ -152,7 +140,9 @@ fn deletion_variants(s: &str, k: usize) -> Vec<String> {
             results.push(variant);
         }
     } else {
-        // k >= 2: recursively generate by removing one char and then k-1 more
+        // k >= 2: recursively generate by removing one char and then k-1 more.
+        // Use a HashSet for O(1) dedup instead of Vec::contains O(n).
+        let mut seen = HashSet::new();
         for i in 0..chars.len() {
             let reduced: String = chars
                 .iter()
@@ -161,7 +151,7 @@ fn deletion_variants(s: &str, k: usize) -> Vec<String> {
                 .map(|(_, &ch)| ch)
                 .collect();
             for variant in deletion_variants(&reduced, k - 1) {
-                if !results.contains(&variant) {
+                if seen.insert(variant.clone()) {
                     results.push(variant);
                 }
             }

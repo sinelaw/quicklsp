@@ -34,8 +34,9 @@ pub struct SymbolLocation {
 pub struct Reference {
     pub file: PathBuf,
     pub line: usize,
-    /// Column as a character offset (Unicode-aware).
+    /// Column as a byte offset from line start.
     pub col: usize,
+    /// Length in bytes.
     pub len: usize,
 }
 
@@ -201,17 +202,20 @@ impl Workspace {
 
     /// Remove all definition entries for a given file from the reverse index.
     fn remove_definitions_for_file(&self, path: &Path) {
-        // We need to iterate all definition entries and remove those pointing to this file.
-        // This is O(total definitions) in the worst case, but file updates are infrequent.
-        let mut empty_keys = Vec::new();
-        for mut entry in self.definitions.iter_mut() {
-            entry.value_mut().retain(|loc| loc.file != *path);
-            if entry.value().is_empty() {
-                empty_keys.push(entry.key().clone());
+        // Look up old symbols for this file to do targeted removal instead of
+        // scanning all definitions. Only touches DashMap entries we know about.
+        let old_names: Vec<String> = match self.files.get(path) {
+            Some(entry) => entry.symbols.iter().map(|s| s.name.clone()).collect(),
+            None => return,
+        };
+        for name in old_names {
+            if let Some(mut entry) = self.definitions.get_mut(&name) {
+                entry.value_mut().retain(|loc| loc.file != *path);
+                if entry.value().is_empty() {
+                    drop(entry);
+                    self.definitions.remove(&name);
+                }
             }
-        }
-        for key in empty_keys {
-            self.definitions.remove(&key);
         }
     }
 
@@ -596,12 +600,11 @@ fn find_word_occurrences(word: &str, source: &str, file: &Path, out: &mut Vec<Re
         let end_ok = end_pos >= source.len() || !is_ident_char_at(source, end_pos);
 
         if start_ok && end_ok {
-            let col = source[line_start_byte..abs_pos].chars().count();
             out.push(Reference {
                 file: file.to_path_buf(),
                 line,
-                col,
-                len: word.chars().count(),
+                col: abs_pos - line_start_byte,
+                len: word.len(),
             });
         }
 
