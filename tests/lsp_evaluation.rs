@@ -556,7 +556,7 @@ fn evaluate_dependency_indexing() {
 
     // Feed them into the dep index
     dep_index.enqueue_packages(to_index);
-    dep_index.index_pending();
+    dep_index.index_pending(None);
 
     println!(
         "  Result: {} packages, {} files, {} definitions",
