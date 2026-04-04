@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
+use tower_lsp::lsp_types::{notification, request};
 use tower_lsp::{Client, LanguageServer};
 
 use crate::deps::DependencyIndex;
@@ -105,6 +106,16 @@ fn is_ident_char(ch: char) -> bool {
     ch == '_' || ch.is_alphanumeric()
 }
 
+/// Send a `$/progress` notification to the client.
+async fn send_progress(client: &Client, token: &NumberOrString, value: WorkDoneProgress) {
+    client
+        .send_notification::<notification::Progress>(ProgressParams {
+            token: token.clone(),
+            value: ProgressParamsValue::WorkDone(value),
+        })
+        .await;
+}
+
 fn aero_kind_to_lsp(kind: QuickSymbolKind) -> SymbolKind {
     match kind {
         QuickSymbolKind::Function => SymbolKind::FUNCTION,
@@ -192,7 +203,32 @@ impl LanguageServer for QuickLspServer {
         tokio::spawn(async move {
             let Some(root) = root else { return };
 
+            let token = NumberOrString::String("quicklsp/indexing".to_string());
+
+            // Create a WorkDoneProgress token with the client.
+            // If the client doesn't support it, we fall through gracefully.
+            let progress_supported = client
+                .send_request::<request::WorkDoneProgressCreate>(WorkDoneProgressCreateParams {
+                    token: token.clone(),
+                })
+                .await
+                .is_ok();
+
             // Phase 1: scan local workspace files (fast — only project sources)
+            if progress_supported {
+                send_progress(
+                    &client,
+                    &token,
+                    WorkDoneProgress::Begin(WorkDoneProgressBegin {
+                        title: "Indexing".to_string(),
+                        message: Some("Scanning workspace files...".to_string()),
+                        cancellable: Some(false),
+                        percentage: Some(0),
+                    }),
+                )
+                .await;
+            }
+
             let ws = workspace.clone();
             let scan_root = root.clone();
             tokio::task::spawn_blocking(move || {
@@ -201,14 +237,24 @@ impl LanguageServer for QuickLspServer {
             .await
             .ok();
 
-            client
-                .log_message(MessageType::INFO, "Workspace scan complete")
-                .await;
-
             // Phase 2: index dependency packages with progress reporting.
             // Use a channel so the blocking indexer can report per-package
             // progress back to this async task, which forwards it to the client.
-            let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<(usize, usize)>();
+            if progress_supported {
+                send_progress(
+                    &client,
+                    &token,
+                    WorkDoneProgress::Report(WorkDoneProgressReport {
+                        message: Some("Indexing dependencies...".to_string()),
+                        cancellable: Some(false),
+                        percentage: Some(0),
+                    }),
+                )
+                .await;
+            }
+
+            let (progress_tx, mut progress_rx) =
+                tokio::sync::mpsc::unbounded_channel::<(usize, usize)>();
 
             let dep = dep_index.clone();
             let index_handle = tokio::task::spawn_blocking(move || {
@@ -217,34 +263,55 @@ impl LanguageServer for QuickLspServer {
                 }));
             });
 
-            // Forward progress messages to the client as log messages.
-            // We use log_message rather than workDoneProgress to avoid needing
-            // to negotiate progress token support with the client.
+            // Forward progress to the client via $/progress notifications.
             let progress_client = client.clone();
+            let progress_token = token.clone();
+            let fwd_supported = progress_supported;
             let progress_handle = tokio::spawn(async move {
                 while let Some((done, total)) = progress_rx.recv().await {
-                    progress_client
-                        .log_message(
-                            MessageType::INFO,
-                            format!("Indexing dependencies: {done}/{total} packages"),
+                    if fwd_supported {
+                        let pct = if total > 0 {
+                            ((done as u64 * 100) / total as u64) as u32
+                        } else {
+                            0
+                        };
+                        send_progress(
+                            &progress_client,
+                            &progress_token,
+                            WorkDoneProgress::Report(WorkDoneProgressReport {
+                                message: Some(format!(
+                                    "Indexing dependencies: {done}/{total} packages"
+                                )),
+                                cancellable: Some(false),
+                                percentage: Some(pct),
+                            }),
                         )
                         .await;
+                    }
                 }
             });
 
             index_handle.await.ok();
             progress_handle.await.ok();
 
-            client
-                .log_message(
-                    MessageType::INFO,
-                    format!(
-                        "Dependency indexing complete: {} packages, {} definitions",
-                        dep_index.package_count(),
-                        dep_index.definition_count(),
-                    ),
+            let done_msg = format!(
+                "Indexed {} packages, {} definitions",
+                dep_index.package_count(),
+                dep_index.definition_count(),
+            );
+
+            if progress_supported {
+                send_progress(
+                    &client,
+                    &token,
+                    WorkDoneProgress::End(WorkDoneProgressEnd {
+                        message: Some(done_msg),
+                    }),
                 )
                 .await;
+            } else {
+                client.log_message(MessageType::INFO, done_msg).await;
+            }
         });
     }
 
@@ -288,11 +355,8 @@ impl LanguageServer for QuickLspServer {
         if defs.is_empty() {
             defs = self.dep_index.find_definitions(&symbol);
         }
-        self.workspace.rank_definitions(
-            &mut defs,
-            current_file.as_deref(),
-            qualifier.as_deref(),
-        );
+        self.workspace
+            .rank_definitions(&mut defs, current_file.as_deref(), qualifier.as_deref());
         if let Some(loc) = defs.first().and_then(loc_to_lsp) {
             return Ok(Some(GotoDefinitionResponse::Scalar(loc)));
         }
@@ -435,11 +499,8 @@ impl LanguageServer for QuickLspServer {
         if defs.is_empty() {
             defs = self.dep_index.find_definitions(&symbol);
         }
-        self.workspace.rank_definitions(
-            &mut defs,
-            current_file.as_deref(),
-            qualifier.as_deref(),
-        );
+        self.workspace
+            .rank_definitions(&mut defs, current_file.as_deref(), qualifier.as_deref());
 
         let loc = match defs.first() {
             Some(loc) => loc,
