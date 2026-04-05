@@ -675,10 +675,11 @@ impl LanguageServer for QuickLspServer {
         self.workspace
             .rank_definitions(&mut defs, current_file.as_deref(), qualifier.as_deref());
 
-        let loc = match defs.first() {
+        let loc = match defs.first_mut() {
             Some(loc) => loc,
             None => return Ok(None),
         };
+        self.workspace.enrich_symbol_if_needed(loc);
         let sig = loc.symbol.signature.clone();
         let doc = loc.symbol.doc_comment.clone();
 

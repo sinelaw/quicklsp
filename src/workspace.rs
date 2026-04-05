@@ -1037,7 +1037,7 @@ impl Workspace {
     }
 
     /// Re-extract doc_comment and signature from source if they were stripped.
-    fn enrich_symbol_if_needed(&self, loc: &mut SymbolLocation) {
+    pub fn enrich_symbol_if_needed(&self, loc: &mut SymbolLocation) {
         if loc.symbol.signature.is_some() {
             return;
         }

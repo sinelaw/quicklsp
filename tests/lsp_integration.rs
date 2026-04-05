@@ -590,10 +590,18 @@ fn test_hover() {
         msg.get("id").and_then(|v| v.as_u64()) == Some(60)
     }).expect("Should receive hover response");
 
-    // Should have a result (may be null if no hover info, but no error)
     assert!(
         !response.get("error").is_some(),
         "Hover should not return an error, got: {response}"
+    );
+
+    // Should have actual hover content with signature
+    let result = &response["result"];
+    assert!(!result.is_null(), "Hover should return content for struct Config, got null");
+    let content = result["contents"]["value"].as_str().unwrap_or("");
+    assert!(
+        content.contains("Config"),
+        "Hover content should mention Config, got: {content}"
     );
 
     server.shutdown();
