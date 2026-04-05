@@ -1614,4 +1614,109 @@ mod tests {
             "Fuzzy search should find unique_0"
         );
     }
+
+    #[test]
+    fn word_index_references_correct_across_batches() {
+        // Verifies the word index (compact entry sort + write + read-back)
+        // produces correct find_references results when entries span
+        // multiple batches. Tests the full pipeline: tokenize → drain →
+        // compact intern → sort → write → disk read.
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create files that share identifiers across batch boundaries.
+        // File 0-499 (batch 0) and 500-509 (batch 1) all reference "cross_batch_name".
+        for i in 0..510 {
+            let name = format!("f_{i}.rs");
+            let content = format!(
+                "fn func_{i}() {{ cross_batch_name(); }}\nfn cross_batch_name() {{}}",
+                i = i,
+            );
+            std::fs::write(dir.path().join(&name), content).unwrap();
+        }
+
+        let ws = Workspace::new();
+        ws.scan_directory(dir.path());
+
+        // find_references reads from the on-disk word index built by scan_directory.
+        // This exercises the full compact entry pipeline.
+        let refs = ws.find_references("cross_batch_name");
+        // Each file has 2 occurrences of cross_batch_name (call + def)
+        assert_eq!(
+            refs.len(), 510 * 2,
+            "cross_batch_name should have {} references (2 per file), got {}",
+            510 * 2, refs.len()
+        );
+
+        // Verify a function that only exists in batch 1 (file 505)
+        let refs = ws.find_references("func_505");
+        assert_eq!(refs.len(), 1, "func_505 should have 1 reference, got {}", refs.len());
+
+        // Verify a function from batch 0 (file 10)
+        let refs = ws.find_references("func_10");
+        assert_eq!(refs.len(), 1, "func_10 should have 1 reference, got {}", refs.len());
+
+        // Verify definitions work across batches too
+        let defs = ws.find_definitions("func_505");
+        assert_eq!(defs.len(), 1);
+        let defs = ws.find_definitions("cross_batch_name");
+        assert_eq!(defs.len(), 510);
+    }
+
+    #[test]
+    fn word_index_sort_order_matches_lexicographic() {
+        // The compact entry builder uses intern IDs and a sort-rank mapping.
+        // Verify that the final on-disk order matches the expected lexicographic
+        // order by querying words that would sort differently by ID vs string.
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create files with identifiers that have a different insertion order
+        // than lexicographic order: "zebra" inserted before "alpha".
+        std::fs::write(
+            dir.path().join("first.rs"),
+            "fn zebra() {}\nfn alpha() {}",
+        ).unwrap();
+        std::fs::write(
+            dir.path().join("second.rs"),
+            "fn middle() {}\nfn alpha() {}",
+        ).unwrap();
+
+        let ws = Workspace::new();
+        ws.scan_directory(dir.path());
+
+        // All three words should be findable via the word index
+        let refs_alpha = ws.find_references("alpha");
+        assert!(refs_alpha.len() >= 2, "alpha should appear in both files");
+
+        let refs_middle = ws.find_references("middle");
+        assert_eq!(refs_middle.len(), 1);
+
+        let refs_zebra = ws.find_references("zebra");
+        assert_eq!(refs_zebra.len(), 1);
+
+        // Definitions should also work (these go through the SymbolRef path)
+        assert_eq!(ws.find_definitions("alpha").len(), 2);
+        assert_eq!(ws.find_definitions("middle").len(), 1);
+        assert_eq!(ws.find_definitions("zebra").len(), 1);
+    }
+
+    #[test]
+    fn single_file_scan_produces_correct_references() {
+        // Edge case: only 1 file (well under BATCH_SIZE).
+        // Ensures batching logic works when there's only one partial batch.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("only.rs"),
+            "fn sole_function() {}\nfn caller() { sole_function(); }",
+        ).unwrap();
+
+        let ws = Workspace::new();
+        let stats = ws.scan_directory(dir.path());
+        assert_eq!(stats.indexed, 1);
+
+        let defs = ws.find_definitions("sole_function");
+        assert_eq!(defs.len(), 1);
+
+        let refs = ws.find_references("sole_function");
+        assert_eq!(refs.len(), 2, "sole_function: 1 def + 1 call = 2 refs");
+    }
 }
