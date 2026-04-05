@@ -403,10 +403,12 @@ impl LanguageServer for QuickLspServer {
             index_handle.await.ok();
             progress_handle.await.ok();
 
+            let ws_defs = workspace.definition_count();
+            let ws_files = workspace.file_count();
+            let dep_pkgs = dep_index.package_count();
+            let dep_defs = dep_index.definition_count();
             let done_msg = format!(
-                "Indexed {} packages, {} definitions",
-                dep_index.package_count(),
-                dep_index.definition_count(),
+                "Indexed {ws_files} files ({ws_defs} definitions), {dep_pkgs} dependency packages ({dep_defs} definitions)",
             );
 
             if progress_supported {
