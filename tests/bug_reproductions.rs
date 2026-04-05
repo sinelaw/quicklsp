@@ -89,7 +89,6 @@ enum Status {
 /// C function definitions (void func, int func, etc.) should be indexed.
 /// BUG: They are not, because void/int/etc. are not in def_keywords for CLike.
 #[test]
-#[ignore = "Bug #1: C functions not indexed — void/int/etc not in CLike def_keywords"]
 fn bug1_c_function_definitions_not_indexed() {
     let ws = Workspace::new();
     ws.index_file(
@@ -143,7 +142,6 @@ char *sanitize_input(const char *input) {
 /// Go-to-definition from a call site should jump to the function definition
 /// in the same file. This is the exact scenario from the redis/redis test.
 #[test]
-#[ignore = "Bug #1: C functions not indexed — void/int/etc not in CLike def_keywords"]
 fn bug1_c_goto_definition_from_call_site() {
     let ws = Workspace::new();
     let source = r#"
@@ -233,7 +231,6 @@ static void server_run(struct Server *server) {
 
 /// Hover for C functions should return the function signature.
 #[test]
-#[ignore = "Bug #1: C functions not indexed — void/int/etc not in CLike def_keywords"]
 fn bug1_c_hover_missing_for_functions() {
     let ws = Workspace::new();
     ws.index_file(
@@ -256,7 +253,6 @@ void server_log(int level, const char *msg) {
 
 /// C completion should include function names, not just struct/enum names.
 #[test]
-#[ignore = "Bug #1: C functions not indexed — void/int/etc not in CLike def_keywords"]
 fn bug1_c_completion_missing_functions() {
     let ws = Workspace::new();
     ws.index_file(
@@ -295,7 +291,6 @@ void server_log(int level, const char *msg) {}
 
 /// Using the full sample_c.c fixture, verify the end-to-end workflow.
 #[test]
-#[ignore = "Bug #1: C functions not indexed — void/int/etc not in CLike def_keywords"]
 fn bug1_c_fixture_end_to_end() {
     let ws = Workspace::new();
     let fixture = fixtures_dir().join("sample_c.c");
@@ -680,7 +675,6 @@ fn cross_language_shared_concepts() {
 /// found by find_definitions. Currently the tokenizer only has struct/enum/
 /// typedef/union as CLike def_keywords, so functions are never indexed.
 #[test]
-#[ignore = "Bug: C function definitions not indexed — return types not in def_keywords"]
 fn c_function_go_to_definition() {
     let ws = Workspace::new();
     let fixture = fixtures_dir().join("sample_c.c");
@@ -711,7 +705,6 @@ fn c_function_go_to_definition() {
 /// C #define constants should be found by find_definitions.
 /// Currently #define is not a def_keyword so they're not indexed.
 #[test]
-#[ignore = "Bug: C #define constants not indexed"]
 fn c_define_go_to_definition() {
     let ws = Workspace::new();
     let fixture = fixtures_dir().join("sample_c.c");
@@ -732,7 +725,6 @@ fn c_define_go_to_definition() {
 /// The enum keyword is in def_keywords, but individual enum VALUES
 /// (STATUS_ACTIVE, etc.) are not indexed — only the enum name (Status) is.
 #[test]
-#[ignore = "Bug: C enum values not indexed as individual definitions"]
 fn c_enum_values_go_to_definition() {
     let ws = Workspace::new();
     let fixture = fixtures_dir().join("sample_c.c");
@@ -750,12 +742,8 @@ fn c_enum_values_go_to_definition() {
 }
 
 /// C typedef names should be found by find_definitions.
-/// typedef IS in def_keywords, but the tokenizer only grabs the
-/// NEXT identifier after the keyword. For `typedef unsigned int StatusCode`,
-/// it grabs `unsigned` not `StatusCode`. For `typedef struct Config ServerConfig`,
-/// it grabs `Config` not `ServerConfig`.
+/// Tree-sitter correctly identifies the alias name in typedefs.
 #[test]
-#[ignore = "Bug: typedef grabs wrong identifier — takes first token after keyword, not the alias name"]
 fn c_typedef_go_to_definition() {
     let ws = Workspace::new();
     let fixture = fixtures_dir().join("sample_c.c");
@@ -820,6 +808,275 @@ fn c_find_references_works_for_all_identifiers() {
     assert!(
         refs.len() >= 2,
         "MAX_RETRIES should appear at #define + usage, got {} refs",
+        refs.len()
+    );
+}
+
+// =========================================================================
+// Kernel-style C: definitions inside #ifdef / #if / #ifndef / #else blocks
+//
+// Root cause (fixed): collect_definitions() only walked root.children(),
+// missing definitions nested inside preproc_ifdef/preproc_if/etc nodes.
+// =========================================================================
+
+/// Definitions inside #ifdef CONFIG_* blocks should be indexed.
+#[test]
+fn kernel_ifdef_guarded_definitions_indexed() {
+    let ws = Workspace::new();
+    let fixture = fixtures_dir().join("sample_kernel.c");
+    let source = std::fs::read_to_string(&fixture).unwrap();
+    ws.index_file(fixture, source);
+
+    // Top-level definitions (always worked)
+    for name in &["CIA_VERSION", "CIA_MAX_OPS", "CIA_MIN", "cia_op_type",
+                   "CIA_READ", "CIA_WRITE", "CIA_EXEC", "cia_context",
+                   "cia_ctx_t", "cia_init", "cia_execute", "cia_main"] {
+        let defs = ws.find_definitions(name);
+        assert!(!defs.is_empty(), "Top-level symbol '{}' should be indexed", name);
+    }
+
+    // Definitions inside #ifdef CONFIG_CIA_SECURITY
+    for name in &["cia_security_ops", "cia_security_check", "cia_security_audit"] {
+        let defs = ws.find_definitions(name);
+        assert!(!defs.is_empty(),
+            "'{}' inside #ifdef CONFIG_CIA_SECURITY should be indexed", name);
+    }
+
+    // Definitions inside #ifndef CONFIG_CIA_MINIMAL
+    let defs = ws.find_definitions("cia_full_init");
+    assert!(!defs.is_empty(), "cia_full_init inside #ifndef should be indexed");
+
+    // Definitions inside #if defined(CONFIG_SMP)
+    for name in &["cia_spinlock_t", "cia_spin_lock"] {
+        let defs = ws.find_definitions(name);
+        assert!(!defs.is_empty(), "'{}' inside #if should be indexed", name);
+    }
+
+    // Definitions inside nested #ifdef (inside #if)
+    let defs = ws.find_definitions("cia_spin_dump");
+    assert!(!defs.is_empty(), "cia_spin_dump inside nested #ifdef should be indexed");
+
+    // Definitions inside #else
+    let defs = ws.find_definitions("cia_nosmp_fallback");
+    assert!(!defs.is_empty(), "cia_nosmp_fallback inside #else should be indexed");
+}
+
+// =========================================================================
+// Local variable go-to-definition / find-references / hover
+//
+// quicklsp does not index local variables (by design — they'd bloat the
+// symbol table). However, find_references works via word-boundary text
+// search, so usages of local variables are found in the current file.
+// go-to-definition and hover return nothing for locals since they're not
+// in the definitions map.
+// =========================================================================
+
+/// find_references should find local variable usages within the same file.
+#[test]
+fn local_variable_find_references() {
+    let ws = Workspace::new();
+    let fixture = fixtures_dir().join("sample_kernel.c");
+    let source = std::fs::read_to_string(&fixture).unwrap();
+    ws.index_file(fixture.clone(), source);
+
+    // "status" is a local variable in cia_execute, used multiple times
+    let refs = ws.find_references("status");
+    assert!(
+        refs.len() >= 2,
+        "Local variable 'status' should have references via word search, got {} refs",
+        refs.len()
+    );
+
+    // "prev_count" is a local variable in cia_execute
+    let refs = ws.find_references("prev_count");
+    assert!(
+        refs.len() >= 1,
+        "Local variable 'prev_count' should have at least 1 reference, got {} refs",
+        refs.len()
+    );
+
+    // "result" is a local in multiple functions
+    let refs = ws.find_references("result");
+    assert!(
+        refs.len() >= 2,
+        "Local variable 'result' should have references, got {} refs",
+        refs.len()
+    );
+}
+
+/// go-to-definition for local variables returns empty (they're not indexed).
+/// This documents the current behavior — locals are not definitions.
+#[test]
+fn local_variable_go_to_definition_returns_empty() {
+    let ws = Workspace::new();
+    let fixture = fixtures_dir().join("sample_kernel.c");
+    let source = std::fs::read_to_string(&fixture).unwrap();
+    ws.index_file(fixture, source);
+
+    // "status", "prev_count", "result" are local variables — not in definitions
+    for name in &["status", "prev_count"] {
+        let defs = ws.find_definitions(name);
+        assert!(
+            defs.is_empty(),
+            "Local variable '{}' should NOT be in definitions (got {} defs)",
+            name, defs.len()
+        );
+    }
+}
+
+/// hover for local variables returns None (they're not indexed).
+#[test]
+fn local_variable_hover_returns_none() {
+    let ws = Workspace::new();
+    let fixture = fixtures_dir().join("sample_kernel.c");
+    let source = std::fs::read_to_string(&fixture).unwrap();
+    ws.index_file(fixture, source);
+
+    let hover = ws.hover_info("prev_count");
+    assert!(
+        hover.is_none(),
+        "Hover for local variable 'prev_count' should return None"
+    );
+}
+
+// =========================================================================
+// printk: symbol defined in external headers (not in workspace)
+//
+// quicklsp doesn't follow #include directives or index header files
+// outside the workspace. Symbols like printk, defined in <linux/printk.h>,
+// won't have definitions. find_references still works via word search.
+// =========================================================================
+
+/// printk is not defined in the workspace, so go-to-definition returns empty.
+#[test]
+fn external_symbol_printk_no_definition() {
+    let ws = Workspace::new();
+    // Use a source that references printk
+    ws.index_file(
+        PathBuf::from("/src/core_cia.c"),
+        r#"
+#include <linux/printk.h>
+
+void cia_log(int level, const char *msg) {
+    printk(KERN_INFO "CIA: %s\n", msg);
+}
+
+void cia_warn(const char *msg) {
+    printk(KERN_WARNING "CIA warning: %s\n", msg);
+}
+"#.to_string(),
+    );
+
+    // printk is not defined in this file or workspace
+    let defs = ws.find_definitions("printk");
+    assert!(
+        defs.is_empty(),
+        "printk is defined in <linux/printk.h>, not in workspace — \
+         find_definitions should return empty, got {} defs",
+        defs.len()
+    );
+
+    // But find_references should find all usages in the file
+    let refs = ws.find_references("printk");
+    assert!(
+        refs.len() >= 2,
+        "printk should appear at least twice via word search, got {} refs",
+        refs.len()
+    );
+
+    // hover returns None since there's no definition
+    let hover = ws.hover_info("printk");
+    assert!(
+        hover.is_none(),
+        "Hover for printk should return None — not defined in workspace"
+    );
+}
+
+// =========================================================================
+// Cursor position: LSP features should work even when the cursor is in
+// the middle of a symbol, not just at the first character.
+//
+// word_at_position() expands outward from the cursor position to find
+// the full identifier word, so this should already work.
+// =========================================================================
+
+/// word_at_position should extract the full identifier regardless of cursor column.
+#[test]
+fn word_at_position_mid_symbol() {
+    use quicklsp::lsp::server::QuickLspServer;
+
+    let source = "void cia_security_check(struct cia_context *ctx) {\n    return;\n}\n";
+
+    // Cursor on 'c' of 'cia_security_check' (col=5, first char)
+    let word = QuickLspServer::word_at_position(source, 0, 5);
+    assert_eq!(word.as_deref(), Some("cia_security_check"),
+        "Cursor at start of symbol should extract full word");
+
+    // Cursor on 's' of 'security' (col=9, middle of symbol)
+    let word = QuickLspServer::word_at_position(source, 0, 9);
+    assert_eq!(word.as_deref(), Some("cia_security_check"),
+        "Cursor in middle of symbol should extract full word");
+
+    // Cursor on 'k' of 'check' (col=22, near end)
+    let word = QuickLspServer::word_at_position(source, 0, 22);
+    assert_eq!(word.as_deref(), Some("cia_security_check"),
+        "Cursor near end of symbol should extract full word");
+
+    // Cursor on 'c' of 'cia_context' (col=31)
+    let word = QuickLspServer::word_at_position(source, 0, 35);
+    assert_eq!(word.as_deref(), Some("cia_context"),
+        "Cursor on struct type name should extract full word");
+
+    // Cursor on 't' of 'ctx' (middle of param name)
+    let word = QuickLspServer::word_at_position(source, 0, 44);
+    assert_eq!(word.as_deref(), Some("ctx"),
+        "Cursor on parameter name should extract full word");
+}
+
+/// go-to-definition should work with cursor in the middle of a symbol name.
+#[test]
+fn go_to_definition_mid_cursor() {
+    let ws = Workspace::new();
+    ws.index_file(
+        PathBuf::from("/src/test.c"),
+        r#"
+void cia_security_check(void) {}
+
+void caller(void) {
+    cia_security_check();
+}
+"#.to_string(),
+    );
+
+    // The word extraction is tested above; here we verify the full pipeline:
+    // find_definitions should find it regardless of which character we'd cursor on
+    let defs = ws.find_definitions("cia_security_check");
+    assert!(
+        !defs.is_empty(),
+        "find_definitions for 'cia_security_check' should succeed"
+    );
+    assert_eq!(defs[0].symbol.line, 1, "Definition should be on line 1");
+}
+
+/// find_references should work with cursor anywhere in the symbol.
+#[test]
+fn find_references_mid_cursor() {
+    let ws = Workspace::new();
+    ws.index_file(
+        PathBuf::from("/src/test.c"),
+        r#"
+void cia_security_check(void) {}
+
+void caller(void) {
+    cia_security_check();
+}
+"#.to_string(),
+    );
+
+    let refs = ws.find_references("cia_security_check");
+    assert!(
+        refs.len() >= 2,
+        "Should find at least 2 references (def + call), got {}",
         refs.len()
     );
 }
