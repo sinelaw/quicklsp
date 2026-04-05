@@ -21,6 +21,7 @@ target
 #.idea/
 flamegraph.svg
 perf.data*
+massif.out.*
 
 # QuickLSP generated index
 .quicklsp/
