@@ -727,6 +727,93 @@ impl Workspace {
             .map(|e| e.key().clone())
             .collect()
     }
+
+    /// Compute a detailed memory breakdown of all in-memory data structures.
+    /// Returns a list of (component_name, bytes) pairs.
+    pub fn memory_breakdown(&self) -> Vec<(&'static str, usize)> {
+        let mut breakdown = Vec::new();
+
+        // 1. files DashMap: PathBuf keys + FileEntry values (symbols + occurrences)
+        let mut files_keys = 0usize;
+        let mut files_symbols = 0usize;
+        let mut files_occurrences = 0usize;
+        let mut total_symbols = 0usize;
+        let mut total_occurrences = 0usize;
+        for entry in self.files.iter() {
+            files_keys += entry.key().as_os_str().len() + std::mem::size_of::<PathBuf>();
+            for sym in &entry.value().symbols {
+                files_symbols += Self::symbol_deep_size(sym);
+                total_symbols += 1;
+            }
+            for occ in &entry.value().occurrences {
+                files_occurrences += std::mem::size_of::<crate::parsing::tokenizer::Occurrence>()
+                    + occ.word.len();
+                total_occurrences += 1;
+            }
+        }
+        breakdown.push(("files: path keys", files_keys));
+        breakdown.push(("files: symbols", files_symbols));
+        breakdown.push(("files: occurrences", files_occurrences));
+
+        // 2. definitions DashMap: String keys + Vec<SymbolLocation> values
+        let mut defs_keys = 0usize;
+        let mut defs_values = 0usize;
+        let mut total_defs = 0usize;
+        for entry in self.definitions.iter() {
+            defs_keys += std::mem::size_of::<String>() + entry.key().len();
+            for loc in entry.value().iter() {
+                defs_values += std::mem::size_of::<SymbolLocation>()
+                    + loc.file.as_os_str().len()
+                    + Self::symbol_deep_size(&loc.symbol);
+                total_defs += 1;
+            }
+        }
+        breakdown.push(("definitions: keys", defs_keys));
+        breakdown.push(("definitions: values", defs_values));
+
+        // 3. fuzzy index
+        let fuzzy_size = if let Ok(fuzzy) = self.fuzzy.read() {
+            let syms: usize = fuzzy.symbols().iter().map(|s| std::mem::size_of::<String>() + s.len()).sum();
+            let trigrams: usize = fuzzy.trigram_count() * (3 + std::mem::size_of::<Vec<u32>>())
+                + fuzzy.trigram_entry_count() * std::mem::size_of::<u32>();
+            syms + trigrams
+        } else {
+            0
+        };
+        breakdown.push(("fuzzy index", fuzzy_size));
+
+        // 4. word index directory
+        let word_index_size = if let Ok(guard) = self.word_index.read() {
+            guard.as_ref().map(|wi| wi.word_dir().memory_usage()).unwrap_or(0)
+        } else {
+            0
+        };
+        breakdown.push(("word index directory", word_index_size));
+
+        // 5. open_sources (should be 0 for scan_directory benchmarks)
+        let open_sources_size: usize = self.open_sources.iter()
+            .map(|e| e.key().as_os_str().len() + e.value().len())
+            .sum();
+        breakdown.push(("open sources", open_sources_size));
+
+        // Summary stats
+        breakdown.push(("(count) files", self.files.len()));
+        breakdown.push(("(count) symbols in files", total_symbols));
+        breakdown.push(("(count) occurrences in files", total_occurrences));
+        breakdown.push(("(count) definitions", total_defs));
+        breakdown.push(("(count) unique def names", self.definitions.len()));
+
+        breakdown
+    }
+
+    fn symbol_deep_size(sym: &Symbol) -> usize {
+        std::mem::size_of::<Symbol>()
+            + sym.name.len()
+            + sym.def_keyword.len()
+            + sym.doc_comment.as_ref().map_or(0, |s| s.len())
+            + sym.signature.as_ref().map_or(0, |s| s.len())
+            + sym.container.as_ref().map_or(0, |s| s.len())
+    }
 }
 
 impl Default for Workspace {
