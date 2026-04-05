@@ -286,20 +286,6 @@ impl LogWriter {
         })
     }
 
-    /// Write an entire word table upfront (TAG 0x01 for each word).
-    /// Used when word_ids were already resolved by a WordInterner during parallel scan.
-    pub fn write_word_table(&mut self, words: &[String]) -> io::Result<()> {
-        for word in words {
-            let id = self.word_table.len() as u32;
-            self.w.write_all(&[TAG_WORD])?;
-            self.w.write_all(&(word.len() as u16).to_le_bytes())?;
-            self.w.write_all(word.as_bytes())?;
-            self.word_lookup.insert(word.clone(), id);
-            self.word_table.push(word.clone());
-        }
-        Ok(())
-    }
-
     /// Intern a word, writing TAG 0x01 if it's new. Returns word_id.
     pub fn intern_word(&mut self, word: &str) -> io::Result<u32> {
         if let Some(&id) = self.word_lookup.get(word) {

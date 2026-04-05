@@ -66,52 +66,17 @@ struct FileEntry {
     /// Language family detected from file extension.
     #[allow(dead_code)]
     lang: Option<LangFamily>,
-    /// Pre-resolved occurrences with interned word_ids (ready for log writing).
-    occurrences: Vec<OccEntry>,
 }
 
-/// Thread-safe word interner. Assigns sequential u32 ids to unique word strings.
-/// Used during the parallel scan to resolve occurrence words while the source is
-/// still in scope, so that `write_full_log` doesn't need to re-read files.
-struct WordInterner {
-    lookup: DashMap<String, u32>,
-    table: std::sync::RwLock<Vec<String>>,
-}
-
-impl WordInterner {
-    fn new() -> Self {
-        Self {
-            lookup: DashMap::new(),
-            table: std::sync::RwLock::new(Vec::new()),
-        }
-    }
-
-    /// Intern a word, returning its id. Thread-safe.
-    fn intern(&self, word: &str) -> u32 {
-        if let Some(id) = self.lookup.get(word) {
-            return *id;
-        }
-        // Race: two threads may both miss and try to insert the same word.
-        // DashMap entry API ensures only one wins.
-        let mut table = self.table.write().unwrap();
-        // Double-check after acquiring write lock.
-        if let Some(id) = self.lookup.get(word) {
-            return *id;
-        }
-        let id = table.len() as u32;
-        table.push(word.to_string());
-        self.lookup.insert(word.to_string(), id);
-        id
-    }
-
-    /// Snapshot the word table for serialization.
-    fn word_table(&self) -> Vec<String> {
-        self.table.read().unwrap().clone()
-    }
-
-    fn word_count(&self) -> usize {
-        self.table.read().unwrap().len()
-    }
+/// Message sent from parallel scan threads to the log writer thread.
+/// Contains everything needed to write one file's data to the log.
+struct LogWriteMsg {
+    path: PathBuf,
+    source: String,
+    occurrences: Vec<crate::parsing::tokenizer::Occurrence>,
+    symbols: Vec<Symbol>,
+    lang: Option<LangFamily>,
+    mtime: u64,
 }
 
 /// Unified workspace index. One engine, one path, all operations.
@@ -143,9 +108,6 @@ pub struct Workspace {
     /// On-disk word index for memory-efficient reference lookups.
     /// None until the first scan_directory completes.
     word_index: std::sync::RwLock<Option<LogIndex>>,
-
-    /// Shared word interner for resolving occurrence words during parallel scan.
-    word_interner: WordInterner,
 }
 
 impl Workspace {
@@ -159,7 +121,6 @@ impl Workspace {
             fuzzy: std::sync::RwLock::new(DeletionIndex::new()),
             fuzzy_dirty: std::sync::atomic::AtomicBool::new(false),
             word_index: std::sync::RwLock::new(None),
-            word_interner: WordInterner::new(),
         }
     }
 
@@ -203,19 +164,25 @@ impl Workspace {
     /// Index a file from the editor: tokenize, extract symbols, store source text.
     pub fn index_file(&self, path: PathBuf, source: String) {
         self.open_sources.insert(path.clone(), source.clone());
-        self.index_file_core(path, &source, true);
+        let _ = self.index_file_core(path, &source, true);
     }
 
     /// Core indexing: tokenize, extract symbols, update definition index.
-    /// Optionally updates the fuzzy index (skipped during bulk parallel scans).
+    /// Parse a file and update symbols + definitions. Returns raw occurrences
+    /// for the caller to handle (e.g. send through a channel for log writing).
     /// Source text is NOT stored in FileEntry — only open_sources holds it.
-    fn index_file_core(&self, path: PathBuf, source: &str, update_fuzzy: bool) {
+    fn index_file_core(
+        &self,
+        path: PathBuf,
+        source: &str,
+        update_fuzzy: bool,
+    ) -> Vec<crate::parsing::tokenizer::Occurrence> {
         let lang = path
             .extension()
             .and_then(|e| e.to_str())
             .and_then(LangFamily::from_extension);
 
-        let (symbols, raw_occurrences) = match lang {
+        let (symbols, occurrences) = match lang {
             Some(LangFamily::CLike) => {
                 let result = tree_sitter_parse::c::CParser::parse(source);
                 let mut symbols = result.symbols;
@@ -231,24 +198,6 @@ impl Workspace {
             }
             None => (Vec::new(), Vec::new()),
         };
-
-        // Resolve raw occurrences → OccEntry with interned word_ids while source is in scope.
-        let mut occurrences = Vec::with_capacity(raw_occurrences.len());
-        for occ in &raw_occurrences {
-            let word = &source[occ.word_offset as usize
-                ..(occ.word_offset as usize + occ.word_len as usize)];
-            let word_id = self.word_interner.intern(word);
-            occurrences.push(OccEntry {
-                word_id,
-                line: occ.line as u32,
-                col: occ.col as u32,
-                len: occ.word_len,
-            });
-        }
-        // Sort by (word_id, line) for binary search during queries.
-        occurrences.sort_unstable_by(|a, b| {
-            a.word_id.cmp(&b.word_id).then_with(|| a.line.cmp(&b.line))
-        });
 
         // Remove old definitions for this file before inserting new ones
         self.remove_definitions_for_file(&path);
@@ -271,7 +220,8 @@ impl Workspace {
             self.fuzzy_dirty.store(true, std::sync::atomic::Ordering::Release);
         }
 
-        self.files.insert(path, FileEntry { symbols, lang, occurrences });
+        self.files.insert(path, FileEntry { symbols, lang });
+        occurrences
     }
 
     /// Rebuild the fuzzy index from all currently indexed symbols if it's dirty.
@@ -289,125 +239,6 @@ impl Workspace {
             fuzzy.insert(entry.key());
         }
         self.fuzzy_dirty.store(false, std::sync::atomic::Ordering::Release);
-    }
-
-    /// Write all indexed files to the append-only log and load the result.
-    fn finish_word_index(
-        &self,
-        root: &Path,
-        file_mtimes: &[(PathBuf, std::time::SystemTime)],
-    ) {
-        let index_dir = match index_dir_for_project(root) {
-            Some(d) => d,
-            None => {
-                tracing::warn!("Cannot determine cache directory for word index");
-                return;
-            }
-        };
-        if std::fs::create_dir_all(&index_dir).is_err() {
-            tracing::warn!("Failed to create index cache directory: {}", index_dir.display());
-            return;
-        }
-
-        // Build the mtime map for change detection.
-        let mtime_map: std::collections::HashMap<String, u64> = file_mtimes
-            .iter()
-            .map(|(p, mt)| {
-                let secs = mt.duration_since(std::time::SystemTime::UNIX_EPOCH)
-                    .map(|d| d.as_secs()).unwrap_or(0);
-                (p.to_string_lossy().into_owned(), secs)
-            })
-            .collect();
-
-        // Write the log: all words, paths, and per-file data.
-        match self.write_full_log(&index_dir, &mtime_map) {
-            Ok(index) => {
-                let meta = IndexMeta {
-                    version: crate::word_index::persistence::CURRENT_VERSION,
-                    file_count: index.file_count() as u64,
-                    entry_count: 0, // not tracked per-entry anymore
-                    word_count: index.word_count() as u64,
-                    built_at: std::time::SystemTime::now()
-                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                        .map(|d| d.as_secs()).unwrap_or(0),
-                    file_mtimes: IndexMeta::build_mtime_map(file_mtimes),
-                };
-                if let Err(e) = meta.save(&index_dir) {
-                    tracing::warn!("Failed to save index metadata: {e}");
-                }
-                tracing::info!(
-                    "Log index built: {} files, {} words, path: {}",
-                    index.file_count(), index.word_count(), index_dir.display(),
-                );
-                *self.word_index.write().unwrap() = Some(index);
-            }
-            Err(e) => {
-                tracing::warn!("Failed to write log index: {e}");
-            }
-        }
-    }
-
-    /// Write all files to index.log and reload.
-    ///
-    /// Occurrences are already resolved to `OccEntry` with interned word_ids
-    /// (done during the parallel scan via `word_interner`), so this method
-    /// just serializes — no file re-reading or re-tokenizing.
-    fn write_full_log(
-        &self,
-        index_dir: &Path,
-        mtime_map: &std::collections::HashMap<String, u64>,
-    ) -> std::io::Result<LogIndex> {
-        let t0 = std::time::Instant::now();
-        let mut w = LogWriter::create(index_dir)?;
-
-        // Write the global word table from the interner.
-        let word_table = self.word_interner.word_table();
-        w.write_word_table(&word_table)?;
-        tracing::info!(
-            "write_full_log: wrote {} words, {:.1}s",
-            word_table.len(), t0.elapsed().as_secs_f64(),
-        );
-
-        let total_files = self.files.len();
-        let mut files_written: usize = 0;
-        let mut total_occs: usize = 0;
-
-        for entry in self.files.iter() {
-            let path = entry.key();
-            let file_entry = entry.value();
-
-            let path_id = w.intern_path(path)?;
-            let mtime = mtime_map.get(&path.to_string_lossy().into_owned())
-                .copied().unwrap_or(0);
-
-            total_occs += file_entry.occurrences.len();
-            w.write_file_data(path_id, mtime, &file_entry.occurrences, &file_entry.symbols, file_entry.lang)?;
-
-            files_written += 1;
-            if files_written % 10000 == 0 {
-                tracing::info!(
-                    "write_full_log progress: {}/{} files, {} occs so far, elapsed={:.1}s",
-                    files_written, total_files, total_occs, t0.elapsed().as_secs_f64(),
-                );
-            }
-        }
-
-        tracing::info!(
-            "write_full_log loop done: {} files, {} occs, {:.1}s",
-            files_written, total_occs, t0.elapsed().as_secs_f64(),
-        );
-
-        let tf = std::time::Instant::now();
-        w.flush()?;
-        drop(w);
-        tracing::info!("write_full_log flush: {:.1}s", tf.elapsed().as_secs_f64());
-
-        // Reload the log we just wrote.
-        let tl = std::time::Instant::now();
-        let result = LogIndex::load(index_dir)?
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "log not found after write"));
-        tracing::info!("write_full_log reload: {:.1}s", tl.elapsed().as_secs_f64());
-        result
     }
 
     /// Try to load cached symbols from a persisted index.
@@ -490,7 +321,6 @@ impl Workspace {
             self.files.insert(path, FileEntry {
                 symbols: fd.symbols.clone(),
                 lang: fd.lang,
-                occurrences: Vec::new(),
             });
         }
     }
@@ -544,11 +374,84 @@ impl Workspace {
             WarmResult::FullyFresh => unreachable!(),
         };
 
-        // Cold path: collect paths, parallel tokenize, write full log.
+        // Cold path: parallel parse → stream occurrences to writer thread → log.
         let mut paths = Vec::new();
         let mut skipped = 0usize;
         Self::collect_paths(root, &self.files, &mut paths, &mut skipped, 0);
 
+        // Build mtime lookup for the writer.
+        let mtime_map: std::collections::HashMap<String, u64> = file_mtimes
+            .iter()
+            .map(|(p, mt)| {
+                let secs = mt.duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_secs()).unwrap_or(0);
+                (p.to_string_lossy().into_owned(), secs)
+            })
+            .collect();
+
+        // Set up channel: parallel producers → single writer consumer.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<LogWriteMsg>(128);
+
+        // Spawn writer thread.
+        let index_dir = index_dir_for_project(root);
+        let writer_handle = if let Some(ref idx_dir) = index_dir {
+            let _ = std::fs::create_dir_all(idx_dir);
+            let idx_dir = idx_dir.clone();
+            Some(std::thread::spawn(move || -> std::io::Result<()> {
+                let t0 = std::time::Instant::now();
+                let mut w = LogWriter::create(&idx_dir)?;
+                let mut files_written = 0usize;
+                let mut total_occs = 0usize;
+
+                for msg in rx {
+                    let path_id = w.intern_path(&msg.path)?;
+
+                    // Resolve raw occurrences → OccEntry while we have the source.
+                    let mut occ_entries = Vec::with_capacity(msg.occurrences.len());
+                    for occ in &msg.occurrences {
+                        let word = &msg.source[occ.word_offset as usize
+                            ..(occ.word_offset as usize + occ.word_len as usize)];
+                        let word_id = w.intern_word(word)?;
+                        occ_entries.push(OccEntry {
+                            word_id,
+                            line: occ.line as u32,
+                            col: occ.col as u32,
+                            len: occ.word_len,
+                        });
+                    }
+                    occ_entries.sort_unstable_by(|a, b| {
+                        a.word_id.cmp(&b.word_id).then_with(|| a.line.cmp(&b.line))
+                    });
+
+                    total_occs += occ_entries.len();
+                    w.write_file_data(path_id, msg.mtime, &occ_entries, &msg.symbols, msg.lang)?;
+                    // msg (source + occurrences) dropped here — memory freed immediately.
+
+                    files_written += 1;
+                    if files_written % 10000 == 0 {
+                        tracing::info!(
+                            "log writer progress: {}/{} files, {} occs, {:.1}s",
+                            files_written, "?", total_occs, t0.elapsed().as_secs_f64(),
+                        );
+                    }
+                }
+
+                w.flush()?;
+                tracing::info!(
+                    "log writer done: {} files, {} occs, {} words, {:.1}s",
+                    files_written, total_occs, w.word_count(), t0.elapsed().as_secs_f64(),
+                );
+                Ok(())
+            }))
+        } else {
+            // No index dir — just drain the channel.
+            Some(std::thread::spawn(move || -> std::io::Result<()> {
+                for _ in rx {}
+                Ok(())
+            }))
+        };
+
+        // Parallel scan: parse files, store symbols, send occurrences to writer.
         let indexed = AtomicUsize::new(0);
         let errors = AtomicUsize::new(0);
 
@@ -556,7 +459,21 @@ impl Workspace {
             for path in chunk {
                 match std::fs::read_to_string(path) {
                     Ok(source) => {
-                        self.index_file_core(path.clone(), &source, false);
+                        let occurrences = self.index_file_core(path.clone(), &source, false);
+                        let lang = path.extension()
+                            .and_then(|e| e.to_str())
+                            .and_then(LangFamily::from_extension);
+                        let mtime = mtime_map.get(&path.to_string_lossy().into_owned())
+                            .copied().unwrap_or(0);
+                        // Send to writer. If writer died, just drop silently.
+                        let _ = tx.send(LogWriteMsg {
+                            path: path.clone(),
+                            source,
+                            occurrences,
+                            symbols: self.files.get(path).map(|e| e.symbols.clone()).unwrap_or_default(),
+                            lang,
+                            mtime,
+                        });
                         indexed.fetch_add(1, Relaxed);
                     }
                     Err(_) => {
@@ -566,10 +483,49 @@ impl Workspace {
             }
         });
 
-        self.fuzzy_dirty.store(true, std::sync::atomic::Ordering::Release);
+        // Close the channel and wait for writer to finish.
+        drop(tx);
+        tracing::info!("Indexed {} files, waiting for log writer, {}", indexed.load(Relaxed), Self::rss_summary());
 
-        tracing::info!("Indexed {} files, writing log index, {}", indexed.load(Relaxed), Self::rss_summary());
-        self.finish_word_index(root, &file_mtimes);
+        if let Some(handle) = writer_handle {
+            match handle.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::warn!("Log writer failed: {e}"),
+                Err(_) => tracing::warn!("Log writer thread panicked"),
+            }
+        }
+
+        // Load the written log index.
+        if let Some(ref idx_dir) = index_dir {
+            let tl = std::time::Instant::now();
+            match LogIndex::load(idx_dir) {
+                Ok(Some(index)) => {
+                    let meta = IndexMeta {
+                        version: crate::word_index::persistence::CURRENT_VERSION,
+                        file_count: index.file_count() as u64,
+                        entry_count: 0,
+                        word_count: index.word_count() as u64,
+                        built_at: std::time::SystemTime::now()
+                            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                            .map(|d| d.as_secs()).unwrap_or(0),
+                        file_mtimes: IndexMeta::build_mtime_map(&file_mtimes),
+                    };
+                    if let Err(e) = meta.save(idx_dir) {
+                        tracing::warn!("Failed to save index metadata: {e}");
+                    }
+                    tracing::info!(
+                        "Log index loaded: {} files, {} words, {:.1}s, {}",
+                        index.file_count(), index.word_count(),
+                        tl.elapsed().as_secs_f64(), Self::rss_summary(),
+                    );
+                    *self.word_index.write().unwrap() = Some(index);
+                }
+                Ok(None) => tracing::warn!("Log not found after write"),
+                Err(e) => tracing::warn!("Failed to load log index: {e}"),
+            }
+        }
+
+        self.fuzzy_dirty.store(true, std::sync::atomic::Ordering::Release);
         tracing::info!("Log index written, {}", Self::rss_summary());
 
         // Strip doc_comment and signature from symbols to reduce resident memory.
@@ -1011,8 +967,8 @@ impl Workspace {
                 Err(_) => continue,
             };
 
-            // Re-parse for symbols + resolve occurrences via word_interner.
-            self.index_file_core(path.clone(), &source, false);
+            // Re-parse for symbols, get raw occurrences.
+            let raw_occs = self.index_file_core(path.clone(), &source, false);
 
             let path_id = match w.intern_path(path) {
                 Ok(id) => id,
@@ -1020,30 +976,28 @@ impl Workspace {
             };
             let mtime = mtime_map.get(&path.to_string_lossy().into_owned()).copied().unwrap_or(0);
 
-            // Get pre-resolved occurrences + symbols from FileEntry.
-            // Remap word_ids from interner space → LogWriter space.
-            let (occ_entries, symbols, lang) = match self.files.get(path) {
-                Some(entry) => {
-                    let interner_table = self.word_interner.word_table();
-                    let mut remapped = Vec::with_capacity(entry.occurrences.len());
-                    for occ in &entry.occurrences {
-                        let word = &interner_table[occ.word_id as usize];
-                        let writer_word_id = match w.intern_word(word) {
-                            Ok(id) => id,
-                            Err(e) => { tracing::warn!("intern_word failed: {e}"); continue; }
-                        };
-                        remapped.push(OccEntry {
-                            word_id: writer_word_id,
-                            line: occ.line,
-                            col: occ.col,
-                            len: occ.len,
-                        });
-                    }
-                    remapped.sort_unstable_by(|a, b| {
-                        a.word_id.cmp(&b.word_id).then_with(|| a.line.cmp(&b.line))
-                    });
-                    (remapped, entry.symbols.clone(), entry.lang)
-                }
+            // Resolve raw occurrences → OccEntry using LogWriter's intern table.
+            let mut occ_entries = Vec::with_capacity(raw_occs.len());
+            for occ in &raw_occs {
+                let word = &source[occ.word_offset as usize
+                    ..(occ.word_offset as usize + occ.word_len as usize)];
+                let word_id = match w.intern_word(word) {
+                    Ok(id) => id,
+                    Err(e) => { tracing::warn!("intern_word failed: {e}"); continue; }
+                };
+                occ_entries.push(OccEntry {
+                    word_id,
+                    line: occ.line as u32,
+                    col: occ.col as u32,
+                    len: occ.word_len,
+                });
+            }
+            occ_entries.sort_unstable_by(|a, b| {
+                a.word_id.cmp(&b.word_id).then_with(|| a.line.cmp(&b.line))
+            });
+
+            let (symbols, lang) = match self.files.get(path) {
+                Some(entry) => (entry.symbols.clone(), entry.lang),
                 None => continue,
             };
 
@@ -1200,26 +1154,19 @@ impl Workspace {
     pub fn memory_breakdown(&self) -> Vec<(&'static str, usize)> {
         let mut breakdown = Vec::new();
 
-        // 1. files DashMap: PathBuf keys + FileEntry values (symbols + occurrences)
+        // 1. files DashMap: PathBuf keys + FileEntry values (symbols only, no occurrences)
         let mut files_keys = 0usize;
         let mut files_symbols = 0usize;
-        let mut files_occurrences = 0usize;
         let mut total_symbols = 0usize;
-        let mut total_occurrences = 0usize;
         for entry in self.files.iter() {
             files_keys += entry.key().as_os_str().len() + std::mem::size_of::<PathBuf>();
             for sym in &entry.value().symbols {
                 files_symbols += Self::symbol_deep_size(sym);
                 total_symbols += 1;
             }
-            for _occ in &entry.value().occurrences {
-                files_occurrences += std::mem::size_of::<OccEntry>();
-                total_occurrences += 1;
-            }
         }
         breakdown.push(("files: path keys", files_keys));
         breakdown.push(("files: symbols", files_symbols));
-        breakdown.push(("files: occurrences", files_occurrences));
 
         // 2. definitions DashMap: String keys + Vec<SymbolRef> values
         let mut defs_keys = 0usize;
@@ -1274,20 +1221,11 @@ impl Workspace {
             .sum();
         breakdown.push(("open sources", open_sources_size));
 
-        // 6. word_interner
-        let interner_table = self.word_interner.word_table();
-        let interner_size: usize = interner_table.iter()
-            .map(|w| std::mem::size_of::<String>() + w.len())
-            .sum();
-        breakdown.push(("word interner", interner_size));
-
         // Summary stats
         breakdown.push(("(count) files", self.files.len()));
         breakdown.push(("(count) symbols in files", total_symbols));
-        breakdown.push(("(count) occurrences in files", total_occurrences));
         breakdown.push(("(count) definitions", total_defs));
         breakdown.push(("(count) unique def names", self.definitions.len()));
-        breakdown.push(("(count) interned words", interner_table.len()));
 
         breakdown
     }
@@ -1518,7 +1456,6 @@ fn load_symbols(
         files.insert(file_path, FileEntry {
             symbols,
             lang,
-            occurrences: Vec::new(),
         });
     }
 
