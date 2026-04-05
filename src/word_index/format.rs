@@ -161,10 +161,11 @@ pub struct WordIndexBuilder {
     runs: Vec<SortedRun>,
     /// Total entries across all flushed runs (not counting self.entries).
     flushed_entry_count: usize,
-    /// Interned paths: id → PathBuf.
-    path_table: Vec<PathBuf>,
-    /// Reverse lookup: PathBuf → id.
-    path_lookup: std::collections::HashMap<PathBuf, u32>,
+    /// Interned paths: id → String (String comparison is memcmp;
+    /// PathBuf::cmp does expensive component-by-component iteration).
+    path_table: Vec<String>,
+    /// Reverse lookup: path string → id.
+    path_lookup: std::collections::HashMap<String, u32>,
     /// Interned words: id → String.
     word_table: Vec<String>,
     /// Reverse lookup: word → id.
@@ -186,11 +187,12 @@ impl WordIndexBuilder {
 
     /// Intern a path, returning its table index.
     fn intern_path(&mut self, path: &Path) -> u32 {
-        if let Some(&idx) = self.path_lookup.get(path) {
+        let path_str = path.to_string_lossy();
+        if let Some(&idx) = self.path_lookup.get(path_str.as_ref()) {
             idx
         } else {
             let idx = self.path_table.len() as u32;
-            let owned = path.to_path_buf();
+            let owned = path_str.into_owned();
             self.path_lookup.insert(owned.clone(), idx);
             self.path_table.push(owned);
             idx
@@ -340,26 +342,55 @@ impl WordIndexBuilder {
         }
     }
 
-    /// In-memory sort and write — single sort over all accumulated entries.
+    /// Bucket entries by word, sort each bucket, and write the index file.
+    ///
+    /// Instead of sorting all N entries globally (O(N log N) on gigabytes,
+    /// terrible cache behavior), we bucket by word_id in O(N), then sort
+    /// each word's ~180 entries (fits in L1 cache).
     fn build_in_memory(mut self, path: &Path) -> io::Result<WordDirectory> {
-        // Free lookup HashMaps before sort — only needed during accumulation.
+        // Free lookup HashMaps — only needed during accumulation.
         self.word_lookup = std::collections::HashMap::new();
         self.path_lookup = std::collections::HashMap::new();
 
-        let word_sort_order = Self::build_sort_order(&self.word_table);
-        let path_sort_order = Self::build_sort_order_path(&self.path_table);
+        let total_entries = self.entries.len();
 
-        self.entries.sort_unstable_by(|a, b| {
-            Self::compare_entries(a, b, &word_sort_order, &path_sort_order)
+        // Bucket entries by word_id.
+        let word_count = self.word_table.len();
+        let mut buckets: Vec<Vec<CompactEntry>> = Vec::with_capacity(word_count);
+        buckets.resize_with(word_count, Vec::new);
+        for entry in self.entries.drain(..) {
+            buckets[entry.word_id as usize].push(entry);
+        }
+        self.entries = Vec::new(); // free allocation
+
+        // Build path sort order once (O(P log P) for ~55K paths).
+        let path_sort_order = Self::build_sort_order(&self.path_table);
+
+        // Sort word_ids by word string to get lexicographic word order.
+        let mut word_ids: Vec<u32> = (0..word_count as u32).collect();
+        word_ids.sort_unstable_by(|&a, &b| {
+            self.word_table[a as usize].cmp(&self.word_table[b as usize])
         });
 
-        let total_entries = self.entries.len();
         let mut index_writer = IndexFileWriter::new(path)?;
 
-        for entry in &self.entries {
-            let word = &self.word_table[entry.word_id as usize];
-            let path_str = &self.path_table[entry.path_id as usize];
-            index_writer.write_entry(word, path_str, entry)?;
+        for &word_id in &word_ids {
+            let bucket = &mut buckets[word_id as usize];
+            if bucket.is_empty() {
+                continue;
+            }
+            // Sort within bucket by (path_rank, line) — typically ~180 entries.
+            bucket.sort_unstable_by(|a, b| {
+                path_sort_order[a.path_id as usize]
+                    .cmp(&path_sort_order[b.path_id as usize])
+                    .then_with(|| a.line.cmp(&b.line))
+            });
+
+            let word = &self.word_table[word_id as usize];
+            for entry in bucket.iter() {
+                let path_str = &self.path_table[entry.path_id as usize];
+                index_writer.write_entry(word, path_str, entry)?;
+            }
         }
 
         index_writer.finish(total_entries)
@@ -439,15 +470,9 @@ impl WordIndexBuilder {
         order
     }
 
-    /// Build a sort-order mapping for PathBuf table.
-    fn build_sort_order_path(table: &[PathBuf]) -> Vec<u32> {
-        let mut indices: Vec<u32> = (0..table.len() as u32).collect();
-        indices.sort_unstable_by(|&a, &b| table[a as usize].cmp(&table[b as usize]));
-        let mut order = vec![0u32; table.len()];
-        for (rank, &idx) in indices.iter().enumerate() {
-            order[idx as usize] = rank as u32;
-        }
-        order
+    /// Build a sort-order mapping for path table (both are String now).
+    fn build_sort_order_path(table: &[String]) -> Vec<u32> {
+        Self::build_sort_order(table)
     }
 }
 
@@ -525,7 +550,7 @@ impl IndexFileWriter {
     fn write_entry(
         &mut self,
         word: &str,
-        path: &Path,
+        path: &str,
         entry: &CompactEntry,
     ) -> io::Result<()> {
         if self.current_word.as_deref() != Some(word) {
@@ -589,12 +614,11 @@ impl IndexFileWriter {
 fn write_resolved_entry<W: Write>(
     writer: &mut W,
     word: &str,
-    path: &Path,
+    path: &str,
     entry: &CompactEntry,
 ) -> io::Result<usize> {
     let word_bytes = word.as_bytes();
-    let path_bytes = path.to_string_lossy();
-    let path_bytes = path_bytes.as_bytes();
+    let path_bytes = path.as_bytes();
 
     let mut written = 0;
     writer.write_all(&(word_bytes.len() as u16).to_le_bytes())?;

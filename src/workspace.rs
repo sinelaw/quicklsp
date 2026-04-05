@@ -16,7 +16,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 use dashmap::DashMap;
-use rayon::iter::{IntoParallelRefIterator, ParallelBridge, ParallelIterator};
+use rayon::iter::{ParallelBridge, ParallelIterator};
+use rayon::slice::ParallelSlice;
 
 use tower_lsp::lsp_types::Url;
 
@@ -351,13 +352,11 @@ impl Workspace {
         let mut skipped = 0usize;
         Self::collect_paths(root, &self.files, &mut paths, &mut skipped, 0);
 
-        // Phase 2+4: single parallel sweep — read, tokenize, and drain
-        // occurrences into the word index builder in one pass.
+        // Phase 2+4: parallel read, tokenize, and drain in chunks.
         //
-        // Each rayon task: read file → tokenize → store symbols → lock builder →
-        // drain occurrences into CompactEntries → unlock → drop source.
-        // The lock is held briefly per file (~1000 intern+push ops ≈ 10μs).
-        // Sorted runs are flushed periodically to bound peak entry memory.
+        // Each rayon task processes a chunk of files: reads + tokenizes them,
+        // then locks the shared builder once to drain all occurrences.
+        // Sources stay alive per-chunk so byte-offset occurrences can be resolved.
         let indexed = AtomicUsize::new(0);
         let errors = AtomicUsize::new(0);
 
@@ -367,38 +366,41 @@ impl Workspace {
             None
         };
 
-        // Flush sorted run every ~1M entries (~20 MB) to bound peak memory.
-        const FLUSH_THRESHOLD: usize = 1_000_000;
+        const CHUNK_SIZE: usize = 100;
 
-        paths.par_iter().for_each(|path| {
-            let source = match std::fs::read_to_string(path) {
-                Ok(s) => s,
-                Err(_) => {
-                    errors.fetch_add(1, Relaxed);
-                    return;
-                }
-            };
-            self.index_file_core(path.clone(), &source, false);
-            indexed.fetch_add(1, Relaxed);
-
-            // Drain occurrences into compact entries while source is alive.
-            if let Some(ref mtx) = builder {
-                if let Some(mut entry) = self.files.get_mut(path) {
-                    let occurrences = std::mem::take(&mut entry.value_mut().occurrences);
-                    if !occurrences.is_empty() {
-                        let mut b = mtx.lock().unwrap();
-                        b.drain_file_occurrences(path, occurrences, &source);
-                        if b.entries_in_buffer() >= FLUSH_THRESHOLD {
-                            if let Err(e) = b.flush_sorted_run() {
-                                tracing::warn!("flush sorted run error: {e}");
-                            }
+        paths.par_chunks(CHUNK_SIZE).for_each(|chunk| {
+            // Read + tokenize all files in this chunk, keep sources alive.
+            let chunk_data: Vec<_> = chunk
+                .iter()
+                .filter_map(|path| {
+                    match std::fs::read_to_string(path) {
+                        Ok(source) => {
+                            self.index_file_core(path.clone(), &source, false);
+                            indexed.fetch_add(1, Relaxed);
+                            Some((path, source))
                         }
+                        Err(_) => {
+                            errors.fetch_add(1, Relaxed);
+                            None
+                        }
+                    }
+                })
+                .collect();
+
+            // Lock builder once for the entire chunk.
+            if let Some(ref mtx) = builder {
+                let mut b = mtx.lock().unwrap();
+                for (path, source) in &chunk_data {
+                    if let Some(mut entry) = self.files.get_mut(*path) {
+                        let occurrences = std::mem::take(&mut entry.value_mut().occurrences);
+                        b.drain_file_occurrences(path, occurrences, source);
                     }
                 }
             } else {
-                // Warm startup: discard occurrences
-                if let Some(mut entry) = self.files.get_mut(path) {
-                    entry.value_mut().occurrences = Vec::new();
+                for (path, _) in &chunk_data {
+                    if let Some(mut entry) = self.files.get_mut(*path) {
+                        entry.value_mut().occurrences = Vec::new();
+                    }
                 }
             }
 
