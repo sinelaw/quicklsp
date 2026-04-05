@@ -183,12 +183,16 @@ pub enum OccurrenceRole {
 }
 
 /// A single identifier occurrence found during scanning.
+///
+/// Stores byte offsets into the source string instead of an owned String
+/// to avoid a heap allocation per occurrence (~50M for the Linux kernel).
+/// Resolve the word via `&source[word_offset as usize..(word_offset + word_len) as usize]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Occurrence {
-    pub word: String,
+    pub word_offset: u32,
+    pub word_len: u16,
     pub line: usize,
     pub col: usize,
-    pub len: usize,
     pub role: OccurrenceRole,
 }
 
@@ -659,10 +663,10 @@ pub fn scan_full(source: &str, lang: LangFamily) -> (ScanResult, Vec<DefContext>
 
                         // Emit definition occurrence
                         occurrences.push(Occurrence {
-                            word: name.to_string(),
+                            word_offset: name_start as u32,
+                            word_len: name.len() as u16,
                             line,
                             col: name_col,
-                            len: name.len(),
                             role: OccurrenceRole::Definition,
                         });
                     } else {
@@ -675,10 +679,10 @@ pub fn scan_full(source: &str, lang: LangFamily) -> (ScanResult, Vec<DefContext>
                 // Not a definition keyword — emit as reference occurrence
                 pending_visibility = None;
                 occurrences.push(Occurrence {
-                    word: word.to_string(),
+                    word_offset: start as u32,
+                    word_len: word.len() as u16,
                     line,
                     col,
-                    len: word.len(),
                     role: OccurrenceRole::Reference,
                 });
             }

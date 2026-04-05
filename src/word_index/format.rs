@@ -228,33 +228,38 @@ impl WordIndexBuilder {
         self.entries.push(CompactEntry::new(word_id, path_id, entry.line, entry.col, entry.len));
     }
 
-    /// Add entries from a file's occurrences (borrowed — clones strings).
+    /// Add entries from a file's occurrences, resolving byte offsets against `source`.
     pub fn add_file_occurrences(
         &mut self,
         path: &Path,
         occurrences: &[crate::parsing::tokenizer::Occurrence],
+        source: &str,
     ) {
         let path_id = self.intern_path(path);
         for occ in occurrences {
-            let word_id = self.intern_word(&occ.word);
+            let word = &source[occ.word_offset as usize..(occ.word_offset + occ.word_len as u32) as usize];
+            let word_id = self.intern_word(word);
             self.entries.push(CompactEntry::new(
-                word_id, path_id, occ.line as u32, occ.col as u32, occ.len as u16,
+                word_id, path_id, occ.line as u32, occ.col as u32, occ.word_len,
             ));
         }
     }
 
-    /// Drain entries from a file's occurrences (takes ownership — moves strings).
+    /// Drain entries from a file's occurrences, resolving byte offsets against `source`.
+    /// The occurrence Vec is consumed to free its memory.
     pub fn drain_file_occurrences(
         &mut self,
         path: &Path,
         occurrences: Vec<crate::parsing::tokenizer::Occurrence>,
+        source: &str,
     ) {
         let path_id = self.intern_path(path);
         self.entries.reserve(occurrences.len());
         for occ in occurrences {
-            let word_id = self.intern_word_owned(occ.word);
+            let word = &source[occ.word_offset as usize..(occ.word_offset + occ.word_len as u32) as usize];
+            let word_id = self.intern_word(word);
             self.entries.push(CompactEntry::new(
-                word_id, path_id, occ.line as u32, occ.col as u32, occ.len as u16,
+                word_id, path_id, occ.line as u32, occ.col as u32, occ.word_len,
             ));
         }
     }
@@ -262,6 +267,11 @@ impl WordIndexBuilder {
     /// Total number of entries across all runs and the current buffer.
     pub fn entry_count(&self) -> usize {
         self.flushed_entry_count + self.entries.len()
+    }
+
+    /// Number of entries currently in the in-memory buffer (not yet flushed).
+    pub fn entries_in_buffer(&self) -> usize {
+        self.entries.len()
     }
 
     /// Sort the current in-memory entries and flush them to a temp file.
@@ -274,11 +284,19 @@ impl WordIndexBuilder {
             return Ok(());
         }
 
-        let word_sort_order = Self::build_sort_order(&self.word_table);
-        let path_sort_order = Self::build_sort_order_path(&self.path_table);
-
+        // Compare strings directly instead of building sort-order maps over
+        // the entire (and ever-growing) intern tables.  The sort-order
+        // approach is O(W log W) setup where W = total accumulated words,
+        // which dominates when W >> batch size.
+        let word_table = &self.word_table;
+        let path_table = &self.path_table;
         self.entries.sort_unstable_by(|a, b| {
-            Self::compare_entries(a, b, &word_sort_order, &path_sort_order)
+            word_table[a.word_id as usize]
+                .cmp(&word_table[b.word_id as usize])
+                .then_with(|| {
+                    path_table[a.path_id as usize].cmp(&path_table[b.path_id as usize])
+                })
+                .then_with(|| a.line.cmp(&b.line))
         });
 
         let mut temp = tempfile::NamedTempFile::new()?;
@@ -309,7 +327,8 @@ impl WordIndexBuilder {
         }
 
         if self.runs.is_empty() {
-            // Small index path: sort in memory (tests, single-file, etc.)
+            // In-memory path: single sort + sequential write. Used when
+            // entries were accumulated without flushing sorted runs.
             self.build_in_memory(path)
         } else {
             // Large index path: K-way merge from sorted runs
@@ -321,8 +340,12 @@ impl WordIndexBuilder {
         }
     }
 
-    /// In-memory sort and write (original path for small indexes).
+    /// In-memory sort and write — single sort over all accumulated entries.
     fn build_in_memory(mut self, path: &Path) -> io::Result<WordDirectory> {
+        // Free lookup HashMaps before sort — only needed during accumulation.
+        self.word_lookup = std::collections::HashMap::new();
+        self.path_lookup = std::collections::HashMap::new();
+
         let word_sort_order = Self::build_sort_order(&self.word_table);
         let path_sort_order = Self::build_sort_order_path(&self.path_table);
 

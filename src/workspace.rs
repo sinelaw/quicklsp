@@ -149,13 +149,13 @@ impl Workspace {
     /// Index a file from the editor: tokenize, extract symbols, store source text.
     pub fn index_file(&self, path: PathBuf, source: String) {
         self.open_sources.insert(path.clone(), source.clone());
-        self.index_file_core(path, source, true);
+        self.index_file_core(path, &source, true);
     }
 
     /// Core indexing: tokenize, extract symbols, update definition index.
     /// Optionally updates the fuzzy index (skipped during bulk parallel scans).
     /// Source text is NOT stored in FileEntry — only open_sources holds it.
-    fn index_file_core(&self, path: PathBuf, source: String, update_fuzzy: bool) {
+    fn index_file_core(&self, path: PathBuf, source: &str, update_fuzzy: bool) {
         let lang = path
             .extension()
             .and_then(|e| e.to_str())
@@ -351,70 +351,66 @@ impl Workspace {
         let mut skipped = 0usize;
         Self::collect_paths(root, &self.files, &mut paths, &mut skipped, 0);
 
-        // Phase 2+4: parallel read + index in batches, draining occurrences
-        // after each batch to bound peak memory. Without batching, all 6K files'
-        // occurrences (~620 MB) sit in memory until the word index is built.
-        // With batches of 500, only ~50 MB of occurrences are live at any time.
+        // Phase 2+4: single parallel sweep — read, tokenize, and drain
+        // occurrences into the word index builder in one pass.
+        //
+        // Each rayon task: read file → tokenize → store symbols → lock builder →
+        // drain occurrences into CompactEntries → unlock → drop source.
+        // The lock is held briefly per file (~1000 intern+push ops ≈ 10μs).
+        // Sorted runs are flushed periodically to bound peak entry memory.
         let indexed = AtomicUsize::new(0);
         let errors = AtomicUsize::new(0);
 
-        // Prepare the word index builder outside the batch loop (accumulates
-        // compact entries across all batches, but occurrence Strings are moved
-        // in and the source Vecs freed each iteration).
-        let mut builder = if !warm {
-            Some(WordIndexBuilder::new())
+        let builder: Option<std::sync::Mutex<WordIndexBuilder>> = if !warm {
+            Some(std::sync::Mutex::new(WordIndexBuilder::new()))
         } else {
             None
         };
 
-        const BATCH_SIZE: usize = 500;
+        // Flush sorted run every ~1M entries (~20 MB) to bound peak memory.
+        const FLUSH_THRESHOLD: usize = 1_000_000;
 
-        for (batch_idx, batch) in paths.chunks(BATCH_SIZE).enumerate() {
-            // Parallel read + tokenize + index this batch
-            batch.par_iter().for_each(|path| {
-                match std::fs::read_to_string(path) {
-                    Ok(source) => {
-                        self.index_file_core(path.clone(), source, false);
-                        indexed.fetch_add(1, Relaxed);
-                    }
-                    Err(_) => {
-                        errors.fetch_add(1, Relaxed);
-                    }
+        paths.par_iter().for_each(|path| {
+            let source = match std::fs::read_to_string(path) {
+                Ok(s) => s,
+                Err(_) => {
+                    errors.fetch_add(1, Relaxed);
+                    return;
                 }
-                crate::parsing::tokenizer::stats::flush();
-            });
+            };
+            self.index_file_core(path.clone(), &source, false);
+            indexed.fetch_add(1, Relaxed);
 
-            // Drain this batch's occurrences and flush a sorted run to disk.
-            // This keeps peak memory bounded to one batch instead of all files.
-            if let Some(ref mut b) = builder {
-                for path in batch {
-                    if let Some(mut entry) = self.files.get_mut(path) {
-                        let occurrences = std::mem::take(&mut entry.value_mut().occurrences);
-                        b.drain_file_occurrences(path, occurrences);
+            // Drain occurrences into compact entries while source is alive.
+            if let Some(ref mtx) = builder {
+                if let Some(mut entry) = self.files.get_mut(path) {
+                    let occurrences = std::mem::take(&mut entry.value_mut().occurrences);
+                    if !occurrences.is_empty() {
+                        let mut b = mtx.lock().unwrap();
+                        b.drain_file_occurrences(path, occurrences, &source);
+                        if b.entries_in_buffer() >= FLUSH_THRESHOLD {
+                            if let Err(e) = b.flush_sorted_run() {
+                                tracing::warn!("flush sorted run error: {e}");
+                            }
+                        }
                     }
                 }
-                if let Err(e) = b.flush_sorted_run() {
-                    tracing::warn!("Failed to flush sorted run for batch {}: {e}", batch_idx);
-                }
-                tracing::info!(
-                    "batch {}: indexed {} files, {} entries flushed, {}",
-                    batch_idx, batch.len(), b.entry_count(), Self::rss_summary()
-                );
             } else {
-                // Warm startup: just drop occurrences
-                for path in batch {
-                    if let Some(mut entry) = self.files.get_mut(path) {
-                        entry.value_mut().occurrences = Vec::new();
-                    }
+                // Warm startup: discard occurrences
+                if let Some(mut entry) = self.files.get_mut(path) {
+                    entry.value_mut().occurrences = Vec::new();
                 }
             }
-        }
+
+            crate::parsing::tokenizer::stats::flush();
+        });
 
         // Phase 3: rebuild fuzzy index once from all symbols
         self.rebuild_fuzzy();
 
         // Phase 4: write the accumulated word index to disk
-        if let Some(b) = builder {
+        if let Some(mtx) = builder {
+            let b = mtx.into_inner().unwrap();
             tracing::info!(
                 "Word index builder ready: {} entries, {}",
                 b.entry_count(), Self::rss_summary()
@@ -873,9 +869,8 @@ impl Workspace {
                 files_symbols += Self::symbol_deep_size(sym);
                 total_symbols += 1;
             }
-            for occ in &entry.value().occurrences {
-                files_occurrences += std::mem::size_of::<crate::parsing::tokenizer::Occurrence>()
-                    + occ.word.len();
+            for _occ in &entry.value().occurrences {
+                files_occurrences += std::mem::size_of::<crate::parsing::tokenizer::Occurrence>();
                 total_occurrences += 1;
             }
         }
