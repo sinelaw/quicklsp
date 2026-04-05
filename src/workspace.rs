@@ -404,6 +404,16 @@ impl Workspace {
             tracing::info!("Word index written, {}", Self::rss_summary());
         }
 
+        // Strip doc_comment and signature from symbols to reduce resident memory.
+        // These are only needed for hover_info, which re-extracts them from source
+        // on demand (see hover_info_from_source).
+        for mut entry in self.files.iter_mut() {
+            for sym in &mut entry.value_mut().symbols {
+                sym.doc_comment = None;
+                sym.signature = None;
+            }
+        }
+
         // Return freed pages to the OS. glibc malloc retains freed arenas
         // indefinitely; this reclaims the ~1 GB freed by draining occurrences
         // and dropping the word index builder.
@@ -746,10 +756,52 @@ impl Workspace {
 
     /// Get hover information for a symbol: signature + doc comment.
     /// Returns (signature, doc_comment) if found.
+    ///
+    /// After bulk scan, doc_comment and signature are stripped from in-memory
+    /// symbols to save RAM. This method re-extracts them from source on demand.
     pub fn hover_info(&self, name: &str) -> Option<(Option<String>, Option<String>)> {
         let defs = self.find_definitions(name);
         let loc = defs.first()?;
-        Some((loc.symbol.signature.clone(), loc.symbol.doc_comment.clone()))
+
+        // Fast path: if fields are already populated (e.g. single-file re-index),
+        // return them directly.
+        if loc.symbol.signature.is_some() || loc.symbol.doc_comment.is_some() {
+            return Some((loc.symbol.signature.clone(), loc.symbol.doc_comment.clone()));
+        }
+
+        // Re-extract from source file.
+        let source = std::fs::read_to_string(&loc.file).ok()?;
+        let lang = loc.file.extension()
+            .and_then(|e| e.to_str())
+            .and_then(LangFamily::from_extension)?;
+
+        let lines: Vec<&str> = source.lines().collect();
+        let doc = crate::parsing::symbols::extract_doc_comment(&lines, loc.symbol.line, lang);
+        let sig = crate::parsing::symbols::extract_signature(
+            &lines, loc.symbol.line, loc.symbol.col, lang,
+        );
+        Some((sig, doc))
+    }
+
+    /// Re-extract doc_comment and signature from source if they were stripped.
+    fn enrich_symbol_if_needed(&self, loc: &mut SymbolLocation) {
+        if loc.symbol.signature.is_some() {
+            return;
+        }
+        if let Ok(source) = std::fs::read_to_string(&loc.file) {
+            let lang = loc.file.extension()
+                .and_then(|e| e.to_str())
+                .and_then(LangFamily::from_extension);
+            if let Some(lang) = lang {
+                let lines: Vec<&str> = source.lines().collect();
+                loc.symbol.doc_comment = crate::parsing::symbols::extract_doc_comment(
+                    &lines, loc.symbol.line, lang,
+                );
+                loc.symbol.signature = crate::parsing::symbols::extract_signature(
+                    &lines, loc.symbol.line, loc.symbol.col, lang,
+                );
+            }
+        }
     }
 
     /// Find the function symbol being called at a given position.
@@ -798,7 +850,8 @@ impl Workspace {
                             // (e.g., "Workspace" from "Workspace::new(")
                             let qualifier = extract_qualifier_before(&chars, name_start);
                             self.rank_definitions(&mut defs, None, qualifier.as_deref());
-                            if let Some(loc) = defs.into_iter().next() {
+                            if let Some(mut loc) = defs.into_iter().next() {
+                                self.enrich_symbol_if_needed(&mut loc);
                                 return Some((loc, comma_count));
                             }
                         }

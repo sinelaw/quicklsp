@@ -126,7 +126,7 @@ impl Symbol {
 ///
 /// Walks backwards from the line before the definition, collecting contiguous
 /// comment lines. Supports `///`, `//!`, `//`, `#`, and `/** ... */` blocks.
-fn extract_doc_comment(lines: &[&str], def_line: usize, lang: LangFamily) -> Option<String> {
+pub fn extract_doc_comment(lines: &[&str], def_line: usize, lang: LangFamily) -> Option<String> {
     let mut doc_lines: Vec<String> = Vec::new();
 
     // Scan backwards for comment lines above the definition
@@ -240,7 +240,7 @@ fn extract_doc_comment(lines: &[&str], def_line: usize, lang: LangFamily) -> Opt
 ///
 /// Collects from the definition keyword through the end of parameters/return type,
 /// stopping at `{`, `:` (Python), or a reasonable line limit.
-fn extract_signature(
+pub fn extract_signature(
     lines: &[&str],
     def_line: usize,
     _def_col: usize,
