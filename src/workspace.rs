@@ -46,6 +46,18 @@ pub struct Reference {
     pub len: usize,
 }
 
+/// Compact file identifier used internally to avoid cloning PathBuf.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct FileId(u32);
+
+/// Lightweight reference into the `files` table, stored in the definitions index.
+/// Resolves to a full `SymbolLocation` on demand via `files[path].symbols[idx]`.
+#[derive(Debug, Clone, Copy)]
+struct SymbolRef {
+    file_id: FileId,
+    symbol_idx: u32,
+}
+
 /// Per-file state stored in the workspace.
 struct FileEntry {
     symbols: Vec<Symbol>,
@@ -65,9 +77,16 @@ pub struct Workspace {
     /// Populated by did_open, updated by did_change, removed by did_close.
     open_sources: DashMap<PathBuf, String>,
 
-    /// Reverse index: symbol name → list of (file, symbol) defining it.
+    /// Reverse index: symbol name → list of (file_id, symbol_index) refs.
     /// This is the primary lookup structure for go-to-definition.
-    definitions: DashMap<String, Vec<SymbolLocation>>,
+    /// Refs are resolved on demand via `files` to avoid duplicating Symbol data.
+    definitions: DashMap<String, Vec<SymbolRef>>,
+
+    /// Maps PathBuf → FileId for O(1) lookup.
+    file_ids: DashMap<PathBuf, FileId>,
+
+    /// Maps FileId → PathBuf for reverse lookup. Protected by RwLock for append.
+    id_to_path: std::sync::RwLock<Vec<PathBuf>>,
 
     /// Fuzzy index for typo-tolerant workspace symbol search and completion.
     fuzzy: std::sync::RwLock<DeletionIndex>,
@@ -83,9 +102,46 @@ impl Workspace {
             files: DashMap::new(),
             open_sources: DashMap::new(),
             definitions: DashMap::new(),
+            file_ids: DashMap::new(),
+            id_to_path: std::sync::RwLock::new(Vec::new()),
             fuzzy: std::sync::RwLock::new(DeletionIndex::new()),
             word_index: std::sync::RwLock::new(None),
         }
+    }
+
+    /// Get or create a FileId for a path. Thread-safe.
+    fn get_or_create_file_id(&self, path: &Path) -> FileId {
+        if let Some(id) = self.file_ids.get(path) {
+            return *id;
+        }
+        let mut table = self.id_to_path.write().unwrap();
+        // Double-check after acquiring write lock
+        if let Some(id) = self.file_ids.get(path) {
+            return *id;
+        }
+        let id = FileId(table.len() as u32);
+        table.push(path.to_path_buf());
+        self.file_ids.insert(path.to_path_buf(), id);
+        id
+    }
+
+    /// Resolve a list of SymbolRefs into SymbolLocations by looking up
+    /// the actual Symbol data from the `files` table.
+    fn resolve_refs(&self, refs: &[SymbolRef]) -> Vec<SymbolLocation> {
+        let id_table = self.id_to_path.read().unwrap();
+        let mut result = Vec::with_capacity(refs.len());
+        for r in refs {
+            let path = &id_table[r.file_id.0 as usize];
+            if let Some(entry) = self.files.get(path) {
+                if let Some(sym) = entry.symbols.get(r.symbol_idx as usize) {
+                    result.push(SymbolLocation {
+                        file: path.clone(),
+                        symbol: sym.clone(),
+                    });
+                }
+            }
+        }
+        result
     }
 
     // ── Indexing ─────────────────────────────────────────────────────────
@@ -127,16 +183,17 @@ impl Workspace {
         // Remove old definitions for this file before inserting new ones
         self.remove_definitions_for_file(&path);
 
-        // Insert into reverse definition index
-        for sym in &symbols {
-            let loc = SymbolLocation {
-                file: path.clone(),
-                symbol: sym.clone(),
+        // Insert into reverse definition index using compact SymbolRefs
+        let file_id = self.get_or_create_file_id(&path);
+        for (idx, sym) in symbols.iter().enumerate() {
+            let sym_ref = SymbolRef {
+                file_id,
+                symbol_idx: idx as u32,
             };
             self.definitions
                 .entry(sym.name.clone())
                 .or_default()
-                .push(loc);
+                .push(sym_ref);
         }
 
         // Update fuzzy index (skipped during parallel bulk scans)
@@ -403,9 +460,13 @@ impl Workspace {
             Some(entry) => entry.symbols.iter().map(|s| s.name.clone()).collect(),
             None => return,
         };
+        let file_id = match self.file_ids.get(path) {
+            Some(id) => *id,
+            None => return,
+        };
         for name in old_names {
             if let Some(mut entry) = self.definitions.get_mut(&name) {
-                entry.value_mut().retain(|loc| loc.file != *path);
+                entry.value_mut().retain(|r| r.file_id != file_id);
                 if entry.value().is_empty() {
                     drop(entry);
                     self.definitions.remove(&name);
@@ -420,7 +481,7 @@ impl Workspace {
     pub fn find_definitions(&self, name: &str) -> Vec<SymbolLocation> {
         self.definitions
             .get(name)
-            .map(|v| v.value().clone())
+            .map(|v| self.resolve_refs(v.value()))
             .unwrap_or_default()
     }
 
@@ -616,8 +677,8 @@ impl Workspace {
 
         let mut results = Vec::new();
         for name in names {
-            if let Some(locs) = self.definitions.get(&name) {
-                results.extend(locs.value().iter().cloned());
+            if let Some(refs) = self.definitions.get(&name) {
+                results.extend(self.resolve_refs(refs.value()));
             }
         }
         results
@@ -633,7 +694,7 @@ impl Workspace {
         let mut results = Vec::new();
         for entry in self.definitions.iter() {
             if entry.key().to_ascii_lowercase().starts_with(&lower) {
-                results.extend(entry.value().iter().cloned());
+                results.extend(self.resolve_refs(entry.value()));
             }
         }
         if results.is_empty() {
@@ -718,7 +779,7 @@ impl Workspace {
         self.files.len()
     }
 
-    /// Total number of definitions across all files.
+    /// Total number of definition refs across all files.
     pub fn definition_count(&self) -> usize {
         self.definitions.iter().map(|e| e.value().len()).sum()
     }
@@ -764,21 +825,33 @@ impl Workspace {
         breakdown.push(("files: symbols", files_symbols));
         breakdown.push(("files: occurrences", files_occurrences));
 
-        // 2. definitions DashMap: String keys + Vec<SymbolLocation> values
+        // 2. definitions DashMap: String keys + Vec<SymbolRef> values
         let mut defs_keys = 0usize;
         let mut defs_values = 0usize;
         let mut total_defs = 0usize;
         for entry in self.definitions.iter() {
             defs_keys += std::mem::size_of::<String>() + entry.key().len();
-            for loc in entry.value().iter() {
-                defs_values += std::mem::size_of::<SymbolLocation>()
-                    + loc.file.as_os_str().len()
-                    + Self::symbol_deep_size(&loc.symbol);
-                total_defs += 1;
-            }
+            defs_values += std::mem::size_of::<Vec<SymbolRef>>()
+                + entry.value().len() * std::mem::size_of::<SymbolRef>();
+            total_defs += entry.value().len();
         }
         breakdown.push(("definitions: keys", defs_keys));
         breakdown.push(("definitions: values", defs_values));
+
+        // 2b. file_ids + id_to_path overhead
+        let mut file_id_overhead = 0usize;
+        for entry in self.file_ids.iter() {
+            file_id_overhead += entry.key().as_os_str().len()
+                + std::mem::size_of::<PathBuf>()
+                + std::mem::size_of::<FileId>();
+        }
+        if let Ok(table) = self.id_to_path.read() {
+            file_id_overhead += table.len() * std::mem::size_of::<PathBuf>();
+            for p in table.iter() {
+                file_id_overhead += p.as_os_str().len();
+            }
+        }
+        breakdown.push(("file id tables", file_id_overhead));
 
         // 3. fuzzy index
         let fuzzy_size = if let Ok(fuzzy) = self.fuzzy.read() {
