@@ -614,10 +614,24 @@ impl Workspace {
         results
     }
 
-    /// Get completion candidates matching a partial name.
+    /// Get completion candidates matching a prefix.
+    ///
+    /// Uses case-insensitive prefix matching against all definitions, then
+    /// falls back to fuzzy search if no prefix matches are found (handles
+    /// typos in nearly-complete names).
     pub fn completions(&self, prefix: &str) -> Vec<SymbolLocation> {
-        // Fuzzy resolve includes exact prefix matches via deletion neighborhoods
-        self.search_symbols(prefix)
+        let lower = prefix.to_ascii_lowercase();
+        let mut results = Vec::new();
+        for entry in self.definitions.iter() {
+            if entry.key().to_ascii_lowercase().starts_with(&lower) {
+                results.extend(entry.value().iter().cloned());
+            }
+        }
+        if results.is_empty() {
+            // Fall back to fuzzy search for typo tolerance on near-complete names
+            return self.search_symbols(prefix);
+        }
+        results
     }
 
     /// Get hover information for a symbol: signature + doc comment.
