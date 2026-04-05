@@ -278,38 +278,33 @@ impl Workspace {
         }
     }
 
-    /// Try to load a persisted word index if it's still fresh.
-    /// Returns true if warm startup succeeded.
+    /// Try to load cached symbols from a persisted index.
+    ///
+    /// Returns:
+    /// - `WarmResult::FullyFresh` if all files match and nothing needs re-indexing.
+    /// - `WarmResult::PartiallyStale(changed)` if symbols were loaded but some files
+    ///   changed and need re-indexing (the word index must be rebuilt).
+    /// - `WarmResult::Cold` if no usable cache exists.
     fn try_warm_startup(
         &self,
         root: &Path,
         file_mtimes: &[(PathBuf, std::time::SystemTime)],
-    ) -> bool {
+    ) -> WarmResult {
         let index_dir = match index_dir_for_project(root) {
             Some(d) => d,
-            None => return false,
+            None => return WarmResult::Cold,
         };
 
         let meta = match IndexMeta::load(&index_dir) {
             Ok(m) => m,
-            Err(_) => return false,
+            Err(_) => return WarmResult::Cold,
         };
 
-        if !meta.is_fresh(file_mtimes) {
-            tracing::info!("Index stale, will re-index");
-            return false;
+        if meta.version != crate::word_index::persistence::CURRENT_VERSION {
+            return WarmResult::Cold;
         }
 
-        // Load word index.
-        let index = match WordIndex::load(&index_dir) {
-            Ok(idx) => idx,
-            Err(e) => {
-                tracing::warn!("Failed to load word index: {e}");
-                return false;
-            }
-        };
-
-        // Load symbols + definitions from disk (avoids re-parsing all files).
+        // Load symbols from cache.
         if let Err(e) = load_symbols(
             &self.files,
             &self.definitions,
@@ -318,20 +313,49 @@ impl Workspace {
             &index_dir,
         ) {
             tracing::warn!("Failed to load symbols: {e}");
-            return false;
+            // Clear any partially loaded data.
+            self.files.clear();
+            self.definitions.clear();
+            self.file_ids.clear();
+            self.id_to_path.write().unwrap().clear();
+            return WarmResult::Cold;
         }
 
         self.fuzzy_dirty.store(true, std::sync::atomic::Ordering::Release);
 
-        tracing::info!(
-            "Warm startup: loaded index with {} words, {} files, {} definitions from {}",
-            index.word_dir().len(),
-            self.files.len(),
-            self.definitions.len(),
-            index_dir.display(),
-        );
-        *self.word_index.write().unwrap() = Some(index);
-        true
+        // Check which files changed.
+        let changed = changed_files(&meta, file_mtimes);
+
+        if changed.is_empty() {
+            // Fully fresh — also load the word index.
+            match WordIndex::load(&index_dir) {
+                Ok(index) => {
+                    tracing::info!(
+                        "Warm startup: loaded {} words, {} files, {} definitions from {}",
+                        index.word_dir().len(),
+                        self.files.len(),
+                        self.definitions.len(),
+                        index_dir.display(),
+                    );
+                    *self.word_index.write().unwrap() = Some(index);
+                    WarmResult::FullyFresh
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to load word index: {e}");
+                    // Symbols are loaded, but word index is broken.
+                    // Re-index all files but keep the loaded symbols for unchanged files.
+                    let all: Vec<PathBuf> = file_mtimes.iter().map(|(p, _)| p.clone()).collect();
+                    WarmResult::PartiallyStale(all)
+                }
+            }
+        } else {
+            tracing::info!(
+                "Warm startup: {} cached files loaded, {} files changed",
+                self.files.len(),
+                changed.len(),
+            );
+            WarmResult::PartiallyStale(changed)
+        }
     }
 
     /// Scan a directory tree and index all files with supported extensions.
@@ -346,10 +370,9 @@ impl Workspace {
     pub fn scan_directory(&self, root: &Path) -> ScanStats {
         // Phase 0: collect file mtimes and try warm startup
         let file_mtimes = collect_file_mtimes(root, &should_skip_dir);
-        let warm = self.try_warm_startup(root, &file_mtimes);
+        let warm_result = self.try_warm_startup(root, &file_mtimes);
 
-        if warm {
-            // Everything loaded from disk — no need to re-parse any files.
+        if matches!(warm_result, WarmResult::FullyFresh) {
             let stats = ScanStats {
                 indexed: self.files.len(),
                 skipped: 0,
@@ -362,10 +385,42 @@ impl Workspace {
             return stats;
         }
 
-        // Phase 1: collect file paths (sequential — just readdir syscalls)
-        let mut paths = Vec::new();
+        // Determine which files to index.
         let mut skipped = 0usize;
-        Self::collect_paths(root, &self.files, &mut paths, &mut skipped, 0);
+        let paths = match warm_result {
+            WarmResult::PartiallyStale(changed) => {
+                // Symbols for unchanged files already loaded from cache.
+                // Re-parse changed files for their symbols, then do a full
+                // word index rebuild (all files need tokenizing for occurrences).
+                let changed_set: std::collections::HashSet<PathBuf> = changed.into_iter().collect();
+
+                // Re-parse changed files to update their symbols.
+                for path in &changed_set {
+                    if let Ok(source) = std::fs::read_to_string(path) {
+                        self.index_file_core(path.clone(), &source, false);
+                    }
+                }
+                tracing::info!("Incremental: re-parsed {} changed files", changed_set.len());
+
+                // Collect all paths for the word index rebuild.
+                // Skip editor-opened files (they may have unsaved changes).
+                let editor_files: DashMap<PathBuf, FileEntry> = DashMap::new();
+                for entry in self.open_sources.iter() {
+                    editor_files.insert(entry.key().clone(), FileEntry {
+                        symbols: Vec::new(), lang: None, occurrences: Vec::new(),
+                    });
+                }
+                let mut all_paths = Vec::new();
+                Self::collect_paths(root, &editor_files, &mut all_paths, &mut skipped, 0);
+                all_paths
+            }
+            WarmResult::Cold => {
+                let mut paths = Vec::new();
+                Self::collect_paths(root, &self.files, &mut paths, &mut skipped, 0);
+                paths
+            }
+            WarmResult::FullyFresh => unreachable!(),
+        };
 
         // Phase 2+4: parallel read, tokenize, and drain in chunks.
         //
@@ -458,7 +513,7 @@ impl Workspace {
             stats.indexed,
             stats.skipped,
             stats.errors,
-            if warm { " (warm startup: word index loaded from disk)" } else { "" },
+            "",
         );
         stats
     }
@@ -1037,6 +1092,52 @@ impl Default for Workspace {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ── Warm startup types ────────────────────────────────────────────────
+
+enum WarmResult {
+    /// All files match — no re-indexing needed.
+    FullyFresh,
+    /// Some files changed — these need re-parsing + word index rebuild.
+    PartiallyStale(Vec<PathBuf>),
+    /// No usable cache — full cold index.
+    Cold,
+}
+
+/// Compare current file mtimes against the cached meta to find changed files.
+/// Returns paths of files that were added, modified, or removed.
+fn changed_files(
+    meta: &IndexMeta,
+    current_mtimes: &[(PathBuf, std::time::SystemTime)],
+) -> Vec<PathBuf> {
+    let mut changed = Vec::new();
+
+    // Check for new or modified files.
+    for (path, mtime) in current_mtimes {
+        let secs = mtime
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let path_str = path.to_string_lossy();
+        match meta.file_mtimes.get(path_str.as_ref()) {
+            Some(&stored) if stored == secs => {} // unchanged
+            _ => changed.push(path.clone()),       // new or modified
+        }
+    }
+
+    // Check for removed files (in meta but not in current).
+    let current_set: std::collections::HashSet<String> = current_mtimes
+        .iter()
+        .map(|(p, _)| p.to_string_lossy().into_owned())
+        .collect();
+    for path_str in meta.file_mtimes.keys() {
+        if !current_set.contains(path_str) {
+            changed.push(PathBuf::from(path_str));
+        }
+    }
+
+    changed
 }
 
 // ── Symbol persistence for warm startup ───────────────────────────────
