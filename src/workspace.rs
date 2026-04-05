@@ -163,19 +163,14 @@ impl Workspace {
     /// Index a file from the editor: tokenize, extract symbols, store source text.
     pub fn index_file(&self, path: PathBuf, source: String) {
         self.open_sources.insert(path.clone(), source.clone());
-        let _ = self.index_file_core(path, &source, true);
+        self.index_file_core(path, &source, true);
     }
 
     /// Core indexing: tokenize, extract symbols, update definition index.
-    /// Parse a file and update symbols + definitions. Returns unique sorted
-    /// word hashes for the caller to send to the log writer.
-    /// Source text is NOT stored in FileEntry — only open_sources holds it.
-    fn index_file_core(
-        &self,
-        path: PathBuf,
-        source: &str,
-        update_fuzzy: bool,
-    ) -> Vec<u32> {
+    /// Parse a file: extract symbols + word hashes. Pure function — does not
+    /// modify workspace state. Used during cold scan to produce data for the
+    /// log writer without accumulating anything in memory.
+    fn parse_file(path: &Path, source: &str) -> (Vec<Symbol>, Vec<u32>, Option<LangFamily>) {
         let lang = path
             .extension()
             .and_then(|e| e.to_str())
@@ -198,7 +193,6 @@ impl Workspace {
             None => (Vec::new(), Vec::new()),
         };
 
-        // Compute unique word hashes from occurrences while we have the source.
         let mut hashes: Vec<u32> = occurrences.iter()
             .map(|occ| {
                 let word = &source[occ.word_offset as usize
@@ -209,10 +203,26 @@ impl Workspace {
         hashes.sort_unstable();
         hashes.dedup();
 
-        // Remove old definitions for this file before inserting new ones
+        (symbols, hashes, lang)
+    }
+
+    /// Parse a file and update workspace state (symbols, definitions, fuzzy).
+    /// Used for editor-driven indexing (did_open/did_change).
+    fn index_file_core(&self, path: PathBuf, source: &str, update_fuzzy: bool) {
+        let (symbols, _hashes, lang) = Self::parse_file(&path, source);
+        self.insert_file_entry(path, symbols, lang, update_fuzzy);
+    }
+
+    /// Insert pre-parsed symbols into workspace state.
+    fn insert_file_entry(
+        &self,
+        path: PathBuf,
+        symbols: Vec<Symbol>,
+        lang: Option<LangFamily>,
+        update_fuzzy: bool,
+    ) {
         self.remove_definitions_for_file(&path);
 
-        // Insert into reverse definition index using compact SymbolRefs
         let file_id = self.get_or_create_file_id(&path);
         for (idx, sym) in symbols.iter().enumerate() {
             let sym_ref = SymbolRef {
@@ -225,13 +235,11 @@ impl Workspace {
                 .push(sym_ref);
         }
 
-        // Mark fuzzy index dirty for lazy rebuild on next query.
         if update_fuzzy {
             self.fuzzy_dirty.store(true, std::sync::atomic::Ordering::Release);
         }
 
         self.files.insert(path, FileEntry { symbols, lang });
-        hashes
     }
 
     /// Rebuild the fuzzy index from all currently indexed symbols if it's dirty.
@@ -452,17 +460,14 @@ impl Workspace {
             for path in chunk {
                 match std::fs::read_to_string(path) {
                     Ok(source) => {
-                        let word_hashes = self.index_file_core(path.clone(), &source, false);
-                        let lang = path.extension()
-                            .and_then(|e| e.to_str())
-                            .and_then(LangFamily::from_extension);
+                        let (symbols, word_hashes, lang) = Self::parse_file(path, &source);
                         let mtime = mtime_map.get(&path.to_string_lossy().into_owned())
                             .copied().unwrap_or(0);
-                        // Send to writer. If writer died, just drop silently.
+                        // Move symbols + hashes to writer — nothing stored in workspace.
                         let _ = tx.send(LogWriteMsg {
                             path: path.clone(),
                             word_hashes,
-                            symbols: self.files.get(path).map(|e| e.symbols.clone()).unwrap_or_default(),
+                            symbols,
                             lang,
                             mtime,
                         });
@@ -512,6 +517,8 @@ impl Workspace {
                     if let Err(e) = meta.save(idx_dir) {
                         tracing::warn!("Failed to save index metadata: {e}");
                     }
+                    // Populate workspace files/definitions from the log.
+                    self.populate_from_log_index(&index);
                     tracing::info!(
                         "Log index loaded: {} files, {} hashes, {:.1}s, {}",
                         index.file_count(), index.unique_hash_count(),
@@ -961,19 +968,15 @@ impl Workspace {
                 Err(_) => continue,
             };
 
-            // Re-parse for symbols, get word hashes.
-            let word_hashes = self.index_file_core(path.clone(), &source, false);
+            // Parse file: get symbols + hashes, update workspace state.
+            let (symbols, word_hashes, lang) = Self::parse_file(path, &source);
+            self.insert_file_entry(path.clone(), symbols.clone(), lang, false);
 
             let path_id = match w.intern_path(path) {
                 Ok(id) => id,
                 Err(e) => { tracing::warn!("intern_path failed: {e}"); continue; }
             };
             let mtime = mtime_map.get(&path.to_string_lossy().into_owned()).copied().unwrap_or(0);
-
-            let (symbols, lang) = match self.files.get(path) {
-                Some(entry) => (entry.symbols.clone(), entry.lang),
-                None => continue,
-            };
 
             if let Err(e) = w.write_file_data(path_id, mtime, &word_hashes, &symbols, lang) {
                 tracing::warn!("Failed to write file data: {e}");
