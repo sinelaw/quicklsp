@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 const MAGIC: [u8; 8] = *b"QLSP\x01\x00\x00\x00";
 const HEADER_SIZE: u64 = 32;
 
-/// A single entry in the word index.
+/// A single entry in the word index (used for reading / public API).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct IndexEntry {
     pub word: String,
@@ -43,6 +43,18 @@ pub struct IndexEntry {
     pub line: u32,
     pub col: u32,
     pub len: u16,
+}
+
+/// Compact in-memory entry used during index building.
+/// Stores intern-table IDs instead of full strings.
+/// 20 bytes vs ~88 bytes for IndexEntry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct CompactEntry {
+    word_id: u32,
+    path_id: u32,
+    line: u32,
+    col: u32,
+    len: u16,
 }
 
 /// In-memory word directory: maps word → (file_offset, entry_count).
@@ -83,11 +95,20 @@ impl WordDirectory {
 }
 
 /// Builder for constructing a word index file.
+///
+/// Uses compact interned entries internally to minimize memory:
+/// words and paths are stored once in lookup tables, and each entry
+/// is a 20-byte struct with table indices instead of heap Strings.
 pub struct WordIndexBuilder {
-    entries: Vec<IndexEntry>,
-    /// Interned paths: map from path to index, and the reverse list.
+    entries: Vec<CompactEntry>,
+    /// Interned paths: id → PathBuf.
     path_table: Vec<PathBuf>,
+    /// Reverse lookup: PathBuf → id.
     path_lookup: std::collections::HashMap<PathBuf, u32>,
+    /// Interned words: id → String.
+    word_table: Vec<String>,
+    /// Reverse lookup: word → id.
+    word_lookup: std::collections::HashMap<String, u32>,
 }
 
 impl WordIndexBuilder {
@@ -96,25 +117,59 @@ impl WordIndexBuilder {
             entries: Vec::new(),
             path_table: Vec::new(),
             path_lookup: std::collections::HashMap::new(),
+            word_table: Vec::new(),
+            word_lookup: std::collections::HashMap::new(),
         }
     }
 
-    /// Intern a path, returning a cheap-to-clone PathBuf (shared via the table).
-    fn intern_path(&mut self, path: &Path) -> PathBuf {
+    /// Intern a path, returning its table index.
+    fn intern_path(&mut self, path: &Path) -> u32 {
         if let Some(&idx) = self.path_lookup.get(path) {
-            self.path_table[idx as usize].clone()
+            idx
         } else {
             let idx = self.path_table.len() as u32;
             let owned = path.to_path_buf();
             self.path_lookup.insert(owned.clone(), idx);
-            self.path_table.push(owned.clone());
-            owned
+            self.path_table.push(owned);
+            idx
+        }
+    }
+
+    /// Intern a word string, returning its table index.
+    fn intern_word(&mut self, word: &str) -> u32 {
+        if let Some(&idx) = self.word_lookup.get(word) {
+            idx
+        } else {
+            let idx = self.word_table.len() as u32;
+            self.word_lookup.insert(word.to_string(), idx);
+            self.word_table.push(word.to_string());
+            idx
+        }
+    }
+
+    /// Intern a word by moving the String, returning its table index.
+    fn intern_word_owned(&mut self, word: String) -> u32 {
+        if let Some(&idx) = self.word_lookup.get(&word) {
+            idx
+        } else {
+            let idx = self.word_table.len() as u32;
+            self.word_lookup.insert(word.clone(), idx);
+            self.word_table.push(word);
+            idx
         }
     }
 
     /// Add an entry to the builder.
     pub fn add(&mut self, entry: IndexEntry) {
-        self.entries.push(entry);
+        let word_id = self.intern_word_owned(entry.word);
+        let path_id = self.intern_path(&entry.path);
+        self.entries.push(CompactEntry {
+            word_id,
+            path_id,
+            line: entry.line,
+            col: entry.col,
+            len: entry.len,
+        });
     }
 
     /// Add entries from a file's occurrences (borrowed — clones strings).
@@ -123,11 +178,12 @@ impl WordIndexBuilder {
         path: &Path,
         occurrences: &[crate::parsing::tokenizer::Occurrence],
     ) {
-        let interned = self.intern_path(path);
+        let path_id = self.intern_path(path);
         for occ in occurrences {
-            self.entries.push(IndexEntry {
-                word: occ.word.clone(),
-                path: interned.clone(),
+            let word_id = self.intern_word(&occ.word);
+            self.entries.push(CompactEntry {
+                word_id,
+                path_id,
                 line: occ.line as u32,
                 col: occ.col as u32,
                 len: occ.len as u16,
@@ -141,12 +197,13 @@ impl WordIndexBuilder {
         path: &Path,
         occurrences: Vec<crate::parsing::tokenizer::Occurrence>,
     ) {
-        let interned = self.intern_path(path);
+        let path_id = self.intern_path(path);
         self.entries.reserve(occurrences.len());
         for occ in occurrences {
-            self.entries.push(IndexEntry {
-                word: occ.word, // moved, not cloned
-                path: interned.clone(),
+            let word_id = self.intern_word_owned(occ.word);
+            self.entries.push(CompactEntry {
+                word_id,
+                path_id,
                 line: occ.line as u32,
                 col: occ.col as u32,
                 len: occ.len as u16,
@@ -159,10 +216,29 @@ impl WordIndexBuilder {
         self.entries.len()
     }
 
+    /// Pre-allocate capacity for the expected number of entries.
+    /// Call before draining to avoid Vec reallocation doubling.
+    pub fn reserve(&mut self, additional: usize) {
+        self.entries.reserve(additional);
+    }
+
     /// Sort entries and write the index file. Returns the word directory.
     pub fn build(mut self, path: &Path) -> io::Result<WordDirectory> {
-        // Sort by (word, path, line)
-        self.entries.sort();
+        // Sort by (word, path, line) via the intern IDs.
+        // word_id and path_id are assigned in insertion order, not sorted order.
+        // We need to sort by the actual string values, so build sort-key mappings.
+        let word_sort_order = Self::build_sort_order(&self.word_table);
+        let path_sort_order = Self::build_sort_order_path(&self.path_table);
+
+        self.entries.sort_unstable_by(|a, b| {
+            word_sort_order[a.word_id as usize]
+                .cmp(&word_sort_order[b.word_id as usize])
+                .then_with(|| {
+                    path_sort_order[a.path_id as usize]
+                        .cmp(&path_sort_order[b.path_id as usize])
+                })
+                .then_with(|| a.line.cmp(&b.line))
+        });
 
         let file = File::create(path)?;
         let mut writer = BufWriter::new(file);
@@ -173,32 +249,38 @@ impl WordIndexBuilder {
 
         // Write entries section, tracking word boundaries for the directory
         let mut dir = WordDirectory::new();
-        let mut current_word: Option<String> = None;
+        let mut current_word_id: Option<u32> = None;
         let mut word_start_offset = HEADER_SIZE;
         let mut word_entry_count = 0u32;
         let mut offset = HEADER_SIZE;
 
         for entry in &self.entries {
-            if current_word.as_deref() != Some(&entry.word) {
+            if current_word_id != Some(entry.word_id) {
                 // Flush previous word
-                if let Some(ref prev_word) = current_word {
-                    dir.entries
-                        .insert(prev_word.clone(), (word_start_offset, word_entry_count));
+                if let Some(prev_id) = current_word_id {
+                    dir.entries.insert(
+                        self.word_table[prev_id as usize].clone(),
+                        (word_start_offset, word_entry_count),
+                    );
                 }
-                current_word = Some(entry.word.clone());
+                current_word_id = Some(entry.word_id);
                 word_start_offset = offset;
                 word_entry_count = 0;
             }
 
-            let entry_size = write_entry(&mut writer, entry)?;
+            let word = &self.word_table[entry.word_id as usize];
+            let path = &self.path_table[entry.path_id as usize];
+            let entry_size = write_resolved_entry(&mut writer, word, path, entry)?;
             offset += entry_size as u64;
             word_entry_count += 1;
         }
 
         // Flush last word
-        if let Some(ref prev_word) = current_word {
-            dir.entries
-                .insert(prev_word.clone(), (word_start_offset, word_entry_count));
+        if let Some(prev_id) = current_word_id {
+            dir.entries.insert(
+                self.word_table[prev_id as usize].clone(),
+                (word_start_offset, word_entry_count),
+            );
         }
 
         let dir_offset = offset;
@@ -226,6 +308,28 @@ impl WordIndexBuilder {
 
         Ok(dir)
     }
+
+    /// Build a sort-order mapping: table_index → sort_rank.
+    fn build_sort_order(table: &[String]) -> Vec<u32> {
+        let mut indices: Vec<u32> = (0..table.len() as u32).collect();
+        indices.sort_unstable_by(|&a, &b| table[a as usize].cmp(&table[b as usize]));
+        let mut order = vec![0u32; table.len()];
+        for (rank, &idx) in indices.iter().enumerate() {
+            order[idx as usize] = rank as u32;
+        }
+        order
+    }
+
+    /// Build a sort-order mapping for PathBuf table.
+    fn build_sort_order_path(table: &[PathBuf]) -> Vec<u32> {
+        let mut indices: Vec<u32> = (0..table.len() as u32).collect();
+        indices.sort_unstable_by(|&a, &b| table[a as usize].cmp(&table[b as usize]));
+        let mut order = vec![0u32; table.len()];
+        for (rank, &idx) in indices.iter().enumerate() {
+            order[idx as usize] = rank as u32;
+        }
+        order
+    }
 }
 
 impl Default for WordIndexBuilder {
@@ -234,10 +338,15 @@ impl Default for WordIndexBuilder {
     }
 }
 
-/// Write a single entry to the writer, returning bytes written.
-fn write_entry<W: Write>(writer: &mut W, entry: &IndexEntry) -> io::Result<usize> {
-    let word_bytes = entry.word.as_bytes();
-    let path_bytes = entry.path.to_string_lossy();
+/// Write a resolved compact entry to the writer, returning bytes written.
+fn write_resolved_entry<W: Write>(
+    writer: &mut W,
+    word: &str,
+    path: &Path,
+    entry: &CompactEntry,
+) -> io::Result<usize> {
+    let word_bytes = word.as_bytes();
+    let path_bytes = path.to_string_lossy();
     let path_bytes = path_bytes.as_bytes();
 
     let mut written = 0;
