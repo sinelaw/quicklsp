@@ -430,16 +430,18 @@ impl Workspace {
                     files_written += 1;
                     if files_written % 10000 == 0 {
                         tracing::info!(
-                            "log writer progress: {}/{} files, {} occs, {:.1}s",
+                            "log writer progress: {}/{} files, {} occs, {:.1}s, {}",
                             files_written, "?", total_occs, t0.elapsed().as_secs_f64(),
+                            rss_summary(),
                         );
                     }
                 }
 
                 w.flush()?;
                 tracing::info!(
-                    "log writer done: {} files, {} occs, {} words, {:.1}s",
+                    "log writer done: {} files, {} occs, {} words, {:.1}s, {}",
                     files_written, total_occs, w.word_count(), t0.elapsed().as_secs_f64(),
+                    rss_summary(),
                 );
                 Ok(())
             }))
@@ -1230,22 +1232,7 @@ impl Workspace {
         breakdown
     }
 
-    /// Read current RSS and VM size from /proc/self/statm.
-    /// Returns a human-readable summary string, or "N/A" on non-Linux.
-    fn rss_summary() -> String {
-        let Ok(statm) = std::fs::read_to_string("/proc/self/statm") else {
-            return "rss=N/A".to_string();
-        };
-        let mut fields = statm.split_whitespace();
-        let vm_pages: usize = fields.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-        let rss_pages: usize = fields.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-        let page_size = 4096;
-        format!(
-            "rss={:.0} MB, vm={:.0} MB",
-            (rss_pages * page_size) as f64 / (1024.0 * 1024.0),
-            (vm_pages * page_size) as f64 / (1024.0 * 1024.0),
-        )
-    }
+    fn rss_summary() -> String { rss_summary() }
 
     fn symbol_deep_size(sym: &Symbol) -> usize {
         std::mem::size_of::<Symbol>()
@@ -1272,6 +1259,22 @@ enum WarmResult {
     PartiallyStale(Vec<PathBuf>),
     /// No usable cache — full cold index.
     Cold,
+}
+
+/// Read RSS and VM from /proc/self/statm.
+fn rss_summary() -> String {
+    let Ok(statm) = std::fs::read_to_string("/proc/self/statm") else {
+        return "rss=N/A".to_string();
+    };
+    let mut fields = statm.split_whitespace();
+    let vm_pages: usize = fields.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let rss_pages: usize = fields.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let page_size = 4096;
+    format!(
+        "rss={:.0} MB, vm={:.0} MB",
+        (rss_pages * page_size) as f64 / (1024.0 * 1024.0),
+        (vm_pages * page_size) as f64 / (1024.0 * 1024.0),
+    )
 }
 
 /// Compare current file mtimes against the cached meta to find changed files.

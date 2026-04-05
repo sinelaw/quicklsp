@@ -154,9 +154,10 @@ impl LogIndex {
         let scan_elapsed = t0.elapsed();
         tracing::info!(
             "LogIndex::load scan done: {} words, {} paths, {} files, {} occs, \
-             log_size={:.1} MB, {:.1}s",
+             log_size={:.1} MB, {:.1}s, {}",
             word_table.len(), path_table.len(), files.len(), total_occs,
             file_size as f64 / (1024.0 * 1024.0), scan_elapsed.as_secs_f64(),
+            rss_summary(),
         );
 
         // Build posting lists from file_occs.
@@ -173,8 +174,8 @@ impl LogIndex {
             }
         }
         tracing::info!(
-            "LogIndex::load postings built: {} words, {:.1}s",
-            word_count, tp.elapsed().as_secs_f64(),
+            "LogIndex::load postings built: {} words, {:.1}s, {}",
+            word_count, tp.elapsed().as_secs_f64(), rss_summary(),
         );
 
         Ok(Some(LogIndex {
@@ -553,6 +554,22 @@ fn u8_to_lang(b: u8) -> Option<LangFamily> {
         5 => Some(LangFamily::Go), 6 => Some(LangFamily::JavaCSharp),
         7 => Some(LangFamily::Ruby), _ => None,
     }
+}
+
+/// Read RSS from /proc/self/statm (Linux only).
+fn rss_summary() -> String {
+    let Ok(statm) = std::fs::read_to_string("/proc/self/statm") else {
+        return "rss=N/A".to_string();
+    };
+    let mut fields = statm.split_whitespace();
+    let vm_pages: usize = fields.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let rss_pages: usize = fields.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let page_size = 4096usize;
+    format!(
+        "rss={} MB, vm={} MB",
+        rss_pages * page_size / (1024 * 1024),
+        vm_pages * page_size / (1024 * 1024),
+    )
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
