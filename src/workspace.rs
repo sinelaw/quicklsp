@@ -285,8 +285,8 @@ impl Workspace {
             return WarmResult::Cold;
         }
 
-        // Load the log index (contains words, paths, occurrences, symbols).
-        let index = match LogIndex::load(&index_dir) {
+        // Load the log index (contains paths, word hashes, symbols).
+        let mut index = match LogIndex::load(&index_dir) {
             Ok(Some(idx)) => idx,
             Ok(None) => return WarmResult::Cold,
             Err(e) => {
@@ -296,7 +296,7 @@ impl Workspace {
         };
 
         // Populate workspace files/definitions/file_ids from the loaded log.
-        self.populate_from_log_index(&index);
+        self.populate_from_log_index(&mut index);
         self.fuzzy_dirty.store(true, std::sync::atomic::Ordering::Release);
 
         let changed = changed_files(&meta, file_mtimes);
@@ -319,11 +319,13 @@ impl Workspace {
         }
     }
 
-    /// Populate workspace data structures from a loaded LogIndex.
-    fn populate_from_log_index(&self, index: &LogIndex) {
+    /// Populate workspace data structures by moving data out of a LogIndex.
+    /// Consumes the `files` from the index to avoid cloning symbols.
+    fn populate_from_log_index(&self, index: &mut LogIndex) {
         let mut id_table = self.id_to_path.write().unwrap();
-        for (path_id, fd) in &index.files {
-            let path_str = &index.path_table[*path_id as usize];
+        let files = std::mem::take(&mut index.files);
+        for (path_id, fd) in files {
+            let path_str = &index.path_table[path_id as usize];
             let path = PathBuf::from(path_str);
 
             let fid = FileId(id_table.len() as u32);
@@ -337,7 +339,7 @@ impl Workspace {
             }
 
             self.files.insert(path, FileEntry {
-                symbols: fd.symbols.clone(),
+                symbols: fd.symbols,
                 lang: fd.lang,
             });
         }
@@ -503,7 +505,7 @@ impl Workspace {
         if let Some(ref idx_dir) = index_dir {
             let tl = std::time::Instant::now();
             match LogIndex::load(idx_dir) {
-                Ok(Some(index)) => {
+                Ok(Some(mut index)) => {
                     let meta = IndexMeta {
                         version: crate::word_index::persistence::CURRENT_VERSION,
                         file_count: index.file_count() as u64,
@@ -518,7 +520,7 @@ impl Workspace {
                         tracing::warn!("Failed to save index metadata: {e}");
                     }
                     // Populate workspace files/definitions from the log.
-                    self.populate_from_log_index(&index);
+                    self.populate_from_log_index(&mut index);
                     tracing::info!(
                         "Log index loaded: {} files, {} hashes, {:.1}s, {}",
                         index.file_count(), index.unique_hash_count(),
