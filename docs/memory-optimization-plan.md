@@ -337,34 +337,30 @@ modified in-place — only appended to, or replaced during compaction.
     path_bytes(len)
     — assigns path_id sequentially (0, 1, 2, ...)
 
-  TAG 0x03 — file occurrences (replaces any earlier entry for this path_id)
+  TAG 0x03 — file data (replaces everything for this path_id)
     tag(u8) = 0x03
     path_id(u32)
-    mtime(u64)                 — unix seconds, for freshness checks
+    mtime(u64)
     occ_count(u32)
-    occ_count × 14 bytes       — (word_id(4) + line(4) + col(4) + len(2))
-    — occurrences sorted by (word_id, line), same layout as files.v2.bin
-    — logically replaces any earlier patch for this path_id
+    occ_count × 14 bytes       — word_id(4) + line(4) + col(4) + len(2)
+    symbol_count(u32)
+    symbol_count × symbol_data — same binary layout as symbols.bin
+    — one atomic entry: both occurrences and symbols for the file
+    — last entry per path_id wins; earlier entries are dead
 
   TAG 0x04 — file removed
     tag(u8) = 0x04
     path_id(u32)
-    — removes this file's occurrences, symbols, and definitions
-    — logically removes this file from the index
-
-  TAG 0x05 — symbol update (for a single file)
-    tag(u8) = 0x05
-    path_id(u32)
-    symbol_count(u32)
-    symbol_count × symbol_data  — same binary layout as symbols.bin per-file
-    — replaces cached symbols for this file
+    — drops everything for this path_id (occurrences, symbols, defs)
 ```
+
+Only four tags. A file update is always one TAG 0x03 append with
+everything for that file. No partial updates, no ordering dependencies
+between occurrence and symbol entries.
 
 **Append on file change**: tokenize the changed file, then append
 TAG 0x01 entries for any new words, TAG 0x02 if it's a new file,
-TAG 0x03 with the new occurrences, TAG 0x05 with updated symbols.
-Total I/O: one sequential write of a few KB. No fsync needed — the
-log is reconstructable from source files.
+TAG 0x03 with occurrences + symbols. One sequential write, a few KB.
 
 **Multiple edits to the same file**: just append another TAG 0x03.
 When loading, last entry for each path_id wins. Dead entries before
@@ -384,11 +380,10 @@ scan is fast.
 
 Read the log sequentially from start to end:
 
-1. For each TAG 0x01: append word to `word_table`.
-2. For each TAG 0x02: append path to `path_table`.
-3. For each TAG 0x03: insert/replace in `file_occs[path_id]`.
-4. For each TAG 0x04: delete from `file_occs` and `symbols`, add to `removed`.
-5. For each TAG 0x05: insert/replace in `symbols[path_id]`.
+1. For each TAG 0x01: append to `word_table`.
+2. For each TAG 0x02: append to `path_table`.
+3. For each TAG 0x03: replace `file_occs[path_id]` and `symbols[path_id]`.
+4. For each TAG 0x04: delete from `file_occs`, `symbols`, and `removed` set.
 
 Then build query structures from `file_occs`:
 - Posting lists: for each live file, collect unique word_ids → file_id.
@@ -434,14 +429,11 @@ mtime):
 
 3. **Append TAG 0x02** if it's a brand-new file.
 
-4. **Append TAG 0x03** with the file's occurrences.
+4. **Append TAG 0x03** with occurrences + symbols (one entry).
 
-5. **Append TAG 0x05** with the file's updated symbols.
-
-6. **Update in-memory structures**: replace `file_occs[path_id]`,
-   update posting lists (remove old word→file mappings, add new).
-   Replace symbols for this file. Remove old definitions from the
-   definitions DashMap, insert new ones.
+5. **Update in-memory structures**: replace `file_occs[path_id]`
+   and `symbols[path_id]`, update posting lists (remove old
+   word→file mappings, add new), replace definitions.
 
 Cost: O(entries in changed file). One sequential append. No reading
 or rewriting of any other data.
