@@ -381,6 +381,10 @@ impl WordIndexBuilder {
     /// terrible cache behavior), we bucket by word_id in O(N), then sort
     /// each word's ~180 entries (fits in L1 cache).
     fn build_in_memory(mut self, path: &Path) -> io::Result<WordDirectory> {
+        use std::time::Instant;
+
+        let t0 = Instant::now();
+
         // Free lookup HashMaps — only needed during accumulation.
         self.word_lookup = std::collections::HashMap::new();
         self.path_lookup = std::collections::HashMap::new();
@@ -396,6 +400,9 @@ impl WordIndexBuilder {
         }
         self.entries = Vec::new(); // free allocation
 
+        let t1 = Instant::now();
+        tracing::info!("build_in_memory: bucketing {} entries into {} words: {:.2?}", total_entries, word_count, t1 - t0);
+
         // Build path sort order once (O(P log P) for ~55K paths).
         let path_sort_order = Self::build_sort_order(&self.path_table);
 
@@ -405,28 +412,76 @@ impl WordIndexBuilder {
             self.word_table[a as usize].cmp(&self.word_table[b as usize])
         });
 
+        let t2 = Instant::now();
+        tracing::info!("build_in_memory: sort orders + word_ids sort: {:.2?}", t2 - t1);
+
         let mut index_writer = IndexFileWriter::new(path)?;
+
+        let mut sort_ns: u64 = 0;
+        let mut serialize_ns: u64 = 0;
+        let mut io_ns: u64 = 0;
+        let mut total_bytes: u64 = 0;
+        let mut entry_buf = Vec::with_capacity(256);
 
         for &word_id in &word_ids {
             let bucket = &mut buckets[word_id as usize];
             if bucket.is_empty() {
                 continue;
             }
-            // Sort within bucket by (path_rank, line) — typically ~180 entries.
+
+            let ts0 = Instant::now();
             bucket.sort_unstable_by(|a, b| {
                 path_sort_order[a.path_id as usize]
                     .cmp(&path_sort_order[b.path_id as usize])
                     .then_with(|| a.line.cmp(&b.line))
             });
+            let ts1 = Instant::now();
+            sort_ns += (ts1 - ts0).as_nanos() as u64;
 
             let word = &self.word_table[word_id as usize];
             for entry in bucket.iter() {
                 let path_str = &self.path_table[entry.path_id as usize];
+
+                // Serialize to buffer (no I/O)
+                entry_buf.clear();
+                let wb = word.as_bytes();
+                let pb = path_str.as_bytes();
+                entry_buf.extend_from_slice(&(wb.len() as u16).to_le_bytes());
+                entry_buf.extend_from_slice(wb);
+                entry_buf.extend_from_slice(&(pb.len() as u16).to_le_bytes());
+                entry_buf.extend_from_slice(pb);
+                entry_buf.extend_from_slice(&entry.line.to_le_bytes());
+                entry_buf.extend_from_slice(&entry.col.to_le_bytes());
+                entry_buf.extend_from_slice(&entry.len.to_le_bytes());
+                total_bytes += entry_buf.len() as u64;
+            }
+            let ts2 = Instant::now();
+            serialize_ns += (ts2 - ts1).as_nanos() as u64;
+
+            // Write all entries for this word via IndexFileWriter
+            for entry in bucket.iter() {
+                let path_str = &self.path_table[entry.path_id as usize];
                 index_writer.write_entry(word, path_str, entry)?;
             }
+            io_ns += (Instant::now() - ts2).as_nanos() as u64;
         }
 
-        index_writer.finish(total_entries)
+        let t3 = Instant::now();
+        tracing::info!(
+            "build_in_memory: per-word loop: {:.2?} (sort: {:.2?}, serialize: {:.2?}, write: {:.2?}, {:.1} GB)",
+            t3 - t2,
+            std::time::Duration::from_nanos(sort_ns),
+            std::time::Duration::from_nanos(serialize_ns),
+            std::time::Duration::from_nanos(io_ns),
+            total_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        );
+
+        let result = index_writer.finish(total_entries);
+
+        let t4 = Instant::now();
+        tracing::info!("build_in_memory: finish (dir write + header): {:.2?}", t4 - t3);
+
+        result
     }
 
     /// K-way merge from sorted run files.
