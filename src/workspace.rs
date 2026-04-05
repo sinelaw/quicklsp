@@ -91,7 +91,10 @@ pub struct Workspace {
     id_to_path: std::sync::RwLock<Vec<PathBuf>>,
 
     /// Fuzzy index for typo-tolerant workspace symbol search and completion.
+    /// Built lazily on first query to avoid holding memory during scan.
     fuzzy: std::sync::RwLock<DeletionIndex>,
+    /// Set to true when definitions change; cleared when fuzzy index is rebuilt.
+    fuzzy_dirty: std::sync::atomic::AtomicBool,
 
     /// On-disk word index for memory-efficient reference lookups.
     /// None until the first scan_directory completes.
@@ -107,6 +110,7 @@ impl Workspace {
             file_ids: DashMap::new(),
             id_to_path: std::sync::RwLock::new(Vec::new()),
             fuzzy: std::sync::RwLock::new(DeletionIndex::new()),
+            fuzzy_dirty: std::sync::atomic::AtomicBool::new(false),
             word_index: std::sync::RwLock::new(None),
         }
     }
@@ -196,25 +200,29 @@ impl Workspace {
                 .push(sym_ref);
         }
 
-        // Update fuzzy index (skipped during parallel bulk scans)
+        // Mark fuzzy index dirty for lazy rebuild on next query.
         if update_fuzzy {
-            if let Ok(mut fuzzy) = self.fuzzy.write() {
-                for sym in &symbols {
-                    fuzzy.insert(&sym.name);
-                }
-            }
+            self.fuzzy_dirty.store(true, std::sync::atomic::Ordering::Release);
         }
 
         self.files.insert(path, FileEntry { symbols, lang, occurrences });
     }
 
-    /// Rebuild the fuzzy index from all currently indexed symbols.
-    fn rebuild_fuzzy(&self) {
+    /// Rebuild the fuzzy index from all currently indexed symbols if it's dirty.
+    fn ensure_fuzzy_built(&self) {
+        if !self.fuzzy_dirty.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
         let mut fuzzy = self.fuzzy.write().unwrap();
+        // Double-check after acquiring write lock.
+        if !self.fuzzy_dirty.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
         fuzzy.clear();
         for entry in self.definitions.iter() {
             fuzzy.insert(entry.key());
         }
+        self.fuzzy_dirty.store(false, std::sync::atomic::Ordering::Release);
     }
 
     /// Write a pre-populated word index builder to disk and store the result.
@@ -382,8 +390,8 @@ impl Workspace {
             crate::parsing::tokenizer::stats::flush();
         });
 
-        // Phase 3: rebuild fuzzy index once from all symbols
-        self.rebuild_fuzzy();
+        // Phase 3: mark fuzzy index as needing rebuild (built lazily on first query)
+        self.fuzzy_dirty.store(true, std::sync::atomic::Ordering::Release);
 
         // Phase 4: write the accumulated word index to disk
         if let Some(mtx) = builder {
@@ -696,6 +704,7 @@ impl Workspace {
     /// Search for symbols by name, with fuzzy/typo tolerance.
     /// Returns (symbol_name, locations) pairs.
     pub fn search_symbols(&self, query: &str) -> Vec<SymbolLocation> {
+        self.ensure_fuzzy_built();
         let names = if let Ok(fuzzy) = self.fuzzy.read() {
             fuzzy
                 .resolve(query)
