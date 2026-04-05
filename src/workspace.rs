@@ -349,7 +349,7 @@ impl Workspace {
 
         const BATCH_SIZE: usize = 500;
 
-        for batch in paths.chunks(BATCH_SIZE) {
+        for (batch_idx, batch) in paths.chunks(BATCH_SIZE).enumerate() {
             // Parallel read + tokenize + index this batch
             batch.par_iter().for_each(|path| {
                 match std::fs::read_to_string(path) {
@@ -372,6 +372,10 @@ impl Workspace {
                         b.drain_file_occurrences(path, occurrences);
                     }
                 }
+                tracing::info!(
+                    "batch {}: indexed {} files, builder has {} entries, {}",
+                    batch_idx, batch.len(), b.entry_count(), Self::rss_summary()
+                );
             } else {
                 // Warm startup: just drop occurrences
                 for path in batch {
@@ -387,7 +391,12 @@ impl Workspace {
 
         // Phase 4: write the accumulated word index to disk
         if let Some(b) = builder {
+            tracing::info!(
+                "Word index builder ready: {} entries, {}",
+                b.entry_count(), Self::rss_summary()
+            );
             self.finish_word_index(root, content_hash, b);
+            tracing::info!("Word index written, {}", Self::rss_summary());
         }
 
         // Return freed pages to the OS. glibc malloc retains freed arenas
@@ -911,6 +920,23 @@ impl Workspace {
         breakdown.push(("(count) unique def names", self.definitions.len()));
 
         breakdown
+    }
+
+    /// Read current RSS and VM size from /proc/self/statm.
+    /// Returns a human-readable summary string, or "N/A" on non-Linux.
+    fn rss_summary() -> String {
+        let Ok(statm) = std::fs::read_to_string("/proc/self/statm") else {
+            return "rss=N/A".to_string();
+        };
+        let mut fields = statm.split_whitespace();
+        let vm_pages: usize = fields.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let rss_pages: usize = fields.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let page_size = 4096;
+        format!(
+            "rss={:.0} MB, vm={:.0} MB",
+            (rss_pages * page_size) as f64 / (1024.0 * 1024.0),
+            (vm_pages * page_size) as f64 / (1024.0 * 1024.0),
+        )
     }
 
     fn symbol_deep_size(sym: &Symbol) -> usize {
@@ -1528,5 +1554,64 @@ mod tests {
         // Even though current_file is a.rs, qualifier "Workspace" should win
         ws.rank_definitions(&mut defs, Some(Path::new("/src/a.rs")), Some("Workspace"));
         assert_eq!(defs[0].file, PathBuf::from("/src/b.rs"));
+    }
+
+    #[test]
+    fn scan_multi_batch_correctness() {
+        // Create enough files to span multiple batches (BATCH_SIZE=500).
+        // Verifies that definitions, references, and the word index are
+        // correct when occurrences are drained across batch boundaries.
+        let dir = tempfile::tempdir().unwrap();
+        let file_count = 600; // > 500 = at least 2 batches
+
+        for i in 0..file_count {
+            let name = format!("mod_{i}.rs");
+            // Each file defines a unique fn and references a shared name
+            let content = format!(
+                "fn unique_{i}() {{}}\nfn shared_func() {{ unique_{i}(); }}",
+                i = i
+            );
+            std::fs::write(dir.path().join(&name), content).unwrap();
+        }
+
+        let ws = Workspace::new();
+        let stats = ws.scan_directory(dir.path());
+
+        assert_eq!(stats.indexed, file_count);
+        assert_eq!(stats.errors, 0);
+
+        // Every unique_N should have exactly 1 definition
+        for i in 0..file_count {
+            let name = format!("unique_{i}");
+            let defs = ws.find_definitions(&name);
+            assert_eq!(
+                defs.len(), 1,
+                "unique_{i} should have exactly 1 definition, got {}",
+                defs.len()
+            );
+        }
+
+        // shared_func defined in every file
+        let shared_defs = ws.find_definitions("shared_func");
+        assert_eq!(
+            shared_defs.len(), file_count,
+            "shared_func should have {} definitions, got {}",
+            file_count, shared_defs.len()
+        );
+
+        // References should find shared_func across files via word index
+        let refs = ws.find_references("shared_func");
+        assert!(
+            refs.len() >= file_count,
+            "shared_func should have >= {} references, got {}",
+            file_count, refs.len()
+        );
+
+        // Fuzzy search should still work
+        let results = ws.search_symbols("unique_0");
+        assert!(
+            results.iter().any(|r| r.symbol.name == "unique_0"),
+            "Fuzzy search should find unique_0"
+        );
     }
 }
