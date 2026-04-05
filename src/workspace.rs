@@ -225,14 +225,22 @@ impl Workspace {
 
         let file_id = self.get_or_create_file_id(&path);
         for (idx, sym) in symbols.iter().enumerate() {
-            let sym_ref = SymbolRef {
-                file_id,
-                symbol_idx: idx as u32,
-            };
-            self.definitions
-                .entry(sym.name.clone())
-                .or_default()
-                .push(sym_ref);
+            // Skip local variables, function parameters, and struct fields from the
+            // global definitions map. These are kept in the per-file symbol list and
+            // looked up via find_local_definitions(). We check both depth and keyword
+            // to avoid filtering out Rust methods in impl blocks (depth > 0, keyword "fn").
+            let is_local = sym.depth > 0
+                && matches!(sym.def_keyword.as_str(), "variable" | "parameter" | "field");
+            if !is_local {
+                let sym_ref = SymbolRef {
+                    file_id,
+                    symbol_idx: idx as u32,
+                };
+                self.definitions
+                    .entry(sym.name.clone())
+                    .or_default()
+                    .push(sym_ref);
+            }
         }
 
         if update_fuzzy {
@@ -674,6 +682,26 @@ impl Workspace {
         self.definitions
             .get(name)
             .map(|v| self.resolve_refs(v.value()))
+            .unwrap_or_default()
+    }
+
+    /// Find local definitions (depth > 0) of a symbol name within a specific file.
+    ///
+    /// Searches the file's symbol list for local variables, parameters, and struct
+    /// fields that match the given name. These are not in the global definitions map
+    /// to avoid bloating it with common names like `i`, `result`, etc.
+    pub fn find_local_definitions(&self, name: &str, file: &Path) -> Vec<SymbolLocation> {
+        self.files
+            .get(file)
+            .map(|entry| {
+                entry.symbols.iter()
+                    .filter(|s| s.depth > 0 && s.name == name)
+                    .map(|s| SymbolLocation {
+                        file: file.to_path_buf(),
+                        symbol: s.clone(),
+                    })
+                    .collect()
+            })
             .unwrap_or_default()
     }
 

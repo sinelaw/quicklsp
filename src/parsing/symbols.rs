@@ -116,7 +116,11 @@ impl Symbol {
     pub fn enrich_from_source(symbols: &mut [Symbol], source: &str, lang: LangFamily) {
         let lines: Vec<&str> = source.lines().collect();
         for sym in symbols.iter_mut() {
-            sym.doc_comment = extract_doc_comment(&lines, sym.line, lang);
+            // For local symbols (depth > 0), preserve doc_comment if it contains
+            // type information set by the parser (e.g., "int" for `int status`).
+            if sym.depth == 0 {
+                sym.doc_comment = extract_doc_comment(&lines, sym.line, lang);
+            }
             sym.signature = extract_signature(&lines, sym.line, sym.col, lang);
         }
     }

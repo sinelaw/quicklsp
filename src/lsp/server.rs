@@ -495,6 +495,12 @@ impl LanguageServer for QuickLspServer {
         if defs.is_empty() {
             defs = self.dep_index.find_definitions(&symbol);
         }
+        // Fall back to file-local definitions (locals, params, struct fields)
+        if defs.is_empty() {
+            if let Some(ref path) = current_file {
+                defs = self.workspace.find_local_definitions(&symbol, path);
+            }
+        }
         self.workspace
             .rank_definitions(&mut defs, current_file.as_deref(), qualifier.as_deref());
         if let Some(def) = defs.first() {
@@ -672,6 +678,12 @@ impl LanguageServer for QuickLspServer {
         if defs.is_empty() {
             defs = self.dep_index.find_definitions(&symbol);
         }
+        // Fall back to file-local definitions (locals, params, struct fields)
+        if defs.is_empty() {
+            if let Some(ref path) = current_file {
+                defs = self.workspace.find_local_definitions(&symbol, path);
+            }
+        }
         self.workspace
             .rank_definitions(&mut defs, current_file.as_deref(), qualifier.as_deref());
 
@@ -679,9 +691,21 @@ impl LanguageServer for QuickLspServer {
             Some(loc) => loc,
             None => return Ok(None),
         };
+        // For local variables/params/fields (depth > 0), the doc_comment
+        // holds the type name from the parser. Preserve it before enrichment.
+        let local_type = if loc.symbol.depth > 0 {
+            loc.symbol.doc_comment.clone()
+        } else {
+            None
+        };
         self.workspace.enrich_symbol_if_needed(loc);
         let sig = loc.symbol.signature.clone();
-        let doc = loc.symbol.doc_comment.clone();
+        let doc = if loc.symbol.depth > 0 {
+            // For locals, show the type as the doc info
+            local_type.map(|t| format!("Type: `{t}`"))
+        } else {
+            loc.symbol.doc_comment.clone()
+        };
 
         // Build markdown hover content: signature as code block + doc as text
         let mut parts = Vec::new();

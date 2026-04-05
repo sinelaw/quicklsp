@@ -904,38 +904,113 @@ fn local_variable_find_references() {
     );
 }
 
-/// go-to-definition for local variables returns empty (they're not indexed).
-/// This documents the current behavior — locals are not definitions.
+/// go-to-definition for local variables: not in global definitions map,
+/// but found via find_local_definitions() in the same file.
 #[test]
-fn local_variable_go_to_definition_returns_empty() {
+fn local_variable_go_to_definition() {
     let ws = Workspace::new();
     let fixture = fixtures_dir().join("sample_kernel.c");
     let source = std::fs::read_to_string(&fixture).unwrap();
-    ws.index_file(fixture, source);
+    ws.index_file(fixture.clone(), source);
 
-    // "status", "prev_count", "result" are local variables — not in definitions
+    // Local variables should NOT be in the global definitions map
     for name in &["status", "prev_count"] {
         let defs = ws.find_definitions(name);
         assert!(
             defs.is_empty(),
-            "Local variable '{}' should NOT be in definitions (got {} defs)",
+            "Local variable '{}' should NOT be in global definitions (got {} defs)",
             name, defs.len()
         );
     }
+
+    // But they SHOULD be found via find_local_definitions()
+    let local_defs = ws.find_local_definitions("status", &fixture);
+    assert!(
+        !local_defs.is_empty(),
+        "Local variable 'status' should be found via find_local_definitions"
+    );
+    assert_eq!(local_defs[0].symbol.kind, quicklsp::parsing::symbols::SymbolKind::Variable);
+    assert!(local_defs[0].symbol.depth > 0, "Local should have depth > 0");
+    assert_eq!(local_defs[0].symbol.container.as_deref(), Some("cia_execute"),
+        "Local 'status' should have container = 'cia_execute'");
+
+    let local_defs = ws.find_local_definitions("prev_count", &fixture);
+    assert!(
+        !local_defs.is_empty(),
+        "Local variable 'prev_count' should be found via find_local_definitions"
+    );
 }
 
-/// hover for local variables returns None (they're not indexed).
+/// Hover for local variables shows type information.
 #[test]
-fn local_variable_hover_returns_none() {
+fn local_variable_hover_shows_type() {
     let ws = Workspace::new();
     let fixture = fixtures_dir().join("sample_kernel.c");
     let source = std::fs::read_to_string(&fixture).unwrap();
-    ws.index_file(fixture, source);
+    ws.index_file(fixture.clone(), source);
 
-    let hover = ws.hover_info("prev_count");
+    // Local variables have their type stored in doc_comment by the C parser
+    let local_defs = ws.find_local_definitions("status", &fixture);
+    assert!(!local_defs.is_empty(), "Should find local 'status'");
+    assert_eq!(local_defs[0].symbol.doc_comment.as_deref(), Some("int"),
+        "Local 'status' should have type 'int' in doc_comment");
+}
+
+/// Function parameters should be found via find_local_definitions.
+#[test]
+fn function_parameter_go_to_definition() {
+    let ws = Workspace::new();
+    let fixture = fixtures_dir().join("sample_kernel.c");
+    let source = std::fs::read_to_string(&fixture).unwrap();
+    ws.index_file(fixture.clone(), source);
+
+    // 'ctx' is a parameter of cia_init, cia_execute, etc.
+    let local_defs = ws.find_local_definitions("ctx", &fixture);
     assert!(
-        hover.is_none(),
-        "Hover for local variable 'prev_count' should return None"
+        !local_defs.is_empty(),
+        "Parameter 'ctx' should be found via find_local_definitions"
+    );
+    assert_eq!(local_defs[0].symbol.def_keyword, "parameter");
+    assert!(local_defs[0].symbol.depth > 0);
+
+    // 'op' is a parameter of cia_execute
+    let local_defs = ws.find_local_definitions("op", &fixture);
+    assert!(
+        !local_defs.is_empty(),
+        "Parameter 'op' should be found via find_local_definitions"
+    );
+}
+
+/// Struct fields should be found via find_local_definitions.
+#[test]
+fn struct_field_go_to_definition() {
+    let ws = Workspace::new();
+    let fixture = fixtures_dir().join("sample_kernel.c");
+    let source = std::fs::read_to_string(&fixture).unwrap();
+    ws.index_file(fixture.clone(), source);
+
+    // 'op_count' is a field of struct cia_context
+    let local_defs = ws.find_local_definitions("op_count", &fixture);
+    assert!(
+        !local_defs.is_empty(),
+        "Struct field 'op_count' should be found via find_local_definitions"
+    );
+    assert_eq!(local_defs[0].symbol.def_keyword, "field");
+    assert_eq!(local_defs[0].symbol.container.as_deref(), Some("cia_context"),
+        "Field 'op_count' should have container = 'cia_context'");
+
+    // 'last_op' is a field of struct cia_context
+    let local_defs = ws.find_local_definitions("last_op", &fixture);
+    assert!(
+        !local_defs.is_empty(),
+        "Struct field 'last_op' should be found via find_local_definitions"
+    );
+
+    // 'name' is a field of struct cia_context
+    let local_defs = ws.find_local_definitions("name", &fixture);
+    assert!(
+        !local_defs.is_empty(),
+        "Struct field 'name' should be found via find_local_definitions"
     );
 }
 

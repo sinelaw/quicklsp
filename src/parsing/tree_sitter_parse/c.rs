@@ -65,8 +65,9 @@ fn collect_definitions_recursive(node: Node, source: &str, symbols: &mut Vec<Sym
 fn extract_definition(node: Node, source: &str, symbols: &mut Vec<Symbol>, inside_enum: bool) {
     match node.kind() {
         "function_definition" => {
-            if let Some((name, line, col)) = extract_function_name(node, source) {
+            let func_name = if let Some((name, line, col)) = extract_function_name(node, source) {
                 let is_static = has_storage_class(node, source, "static");
+                let n = name.clone();
                 symbols.push(Symbol {
                     name,
                     kind: SymbolKind::Function,
@@ -79,6 +80,17 @@ fn extract_definition(node: Node, source: &str, symbols: &mut Vec<Symbol>, insid
                     container: None,
                     depth: 0,
                 });
+                Some(n)
+            } else {
+                None
+            };
+            // Extract function parameters
+            if let Some(ref fname) = func_name {
+                extract_function_params(node, source, symbols, fname);
+            }
+            // Extract local variable declarations from the function body
+            if let Some(body) = node.child_by_field_name("body") {
+                extract_locals_from_compound(body, source, symbols, func_name.as_deref(), 1);
             }
         }
         "declaration" => {
@@ -89,6 +101,8 @@ fn extract_definition(node: Node, source: &str, symbols: &mut Vec<Symbol>, insid
             }
         }
         "struct_specifier" | "union_specifier" => {
+            let struct_name = node.child_by_field_name("name")
+                .map(|n| node_text(n, source).to_string());
             // Only index if it has a body (field_declaration_list) — it's a definition, not just a reference
             if node.child_by_field_name("body").is_some() {
                 if let Some(name_node) = node.child_by_field_name("name") {
@@ -110,6 +124,10 @@ fn extract_definition(node: Node, source: &str, symbols: &mut Vec<Symbol>, insid
                         container: None,
                         depth: 0,
                     });
+                }
+                // Extract struct/union fields
+                if let Some(body) = node.child_by_field_name("body") {
+                    extract_struct_fields(body, source, symbols, struct_name.as_deref());
                 }
             }
         }
@@ -227,14 +245,8 @@ fn extract_function_name(node: Node, source: &str) -> Option<(String, usize, usi
 fn innermost_declarator_name(mut node: Node) -> Node {
     loop {
         match node.kind() {
-            "function_declarator" | "array_declarator" | "parenthesized_declarator" => {
-                if let Some(decl) = node.child_by_field_name("declarator") {
-                    node = decl;
-                } else {
-                    break;
-                }
-            }
-            "pointer_declarator" => {
+            "function_declarator" | "array_declarator" | "parenthesized_declarator"
+            | "pointer_declarator" | "init_declarator" => {
                 if let Some(decl) = node.child_by_field_name("declarator") {
                     node = decl;
                 } else {
@@ -288,6 +300,200 @@ fn extract_file_scope_declaration(node: Node, source: &str, symbols: &mut Vec<Sy
             depth: 0,
         });
     }
+}
+
+/// Extract function parameters from a function_definition node.
+fn extract_function_params(func_node: Node, source: &str, symbols: &mut Vec<Symbol>, func_name: &str) {
+    let declarator = match func_node.child_by_field_name("declarator") {
+        Some(d) => d,
+        None => return,
+    };
+    // Find the function_declarator (may be nested under pointer_declarator)
+    let func_decl = find_function_declarator(declarator);
+    let func_decl = match func_decl {
+        Some(d) => d,
+        None => return,
+    };
+    if let Some(params) = func_decl.child_by_field_name("parameters") {
+        let mut cursor = params.walk();
+        for child in params.children(&mut cursor) {
+            if child.kind() == "parameter_declaration" {
+                if let Some(decl) = child.child_by_field_name("declarator") {
+                    let name_node = innermost_declarator_name(decl);
+                    if name_node.kind() == "identifier" {
+                        let name = node_text(name_node, source).to_string();
+                        // Get the type from the node text before the declarator
+                        let type_text = child.child_by_field_name("type")
+                            .map(|t| node_text(t, source).to_string());
+                        symbols.push(Symbol {
+                            name,
+                            kind: SymbolKind::Variable,
+                            line: name_node.start_position().row,
+                            col: name_node.start_position().column,
+                            def_keyword: "parameter".to_string(),
+                            doc_comment: type_text,
+                            signature: None,
+                            visibility: Visibility::Private,
+                            container: Some(func_name.to_string()),
+                            depth: 1,
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Find the function_declarator node, drilling through pointer_declarator etc.
+fn find_function_declarator(mut node: Node) -> Option<Node> {
+    loop {
+        match node.kind() {
+            "function_declarator" => return Some(node),
+            "pointer_declarator" | "parenthesized_declarator" => {
+                node = node.child_by_field_name("declarator")?;
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Extract local variable declarations from a compound_statement (function body).
+/// Recurses into nested blocks (if/for/while bodies).
+fn extract_locals_from_compound(
+    node: Node,
+    source: &str,
+    symbols: &mut Vec<Symbol>,
+    func_name: Option<&str>,
+    depth: usize,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "declaration" => {
+                extract_local_declaration(child, source, symbols, func_name, depth);
+            }
+            // Recurse into nested blocks
+            "compound_statement" | "if_statement" | "for_statement" | "while_statement"
+            | "do_statement" | "switch_statement" | "case_statement" => {
+                extract_locals_from_compound(child, source, symbols, func_name, depth + 1);
+            }
+            _ => {
+                // Recurse into any other compound children (e.g., else clauses)
+                if child.child_count() > 0 {
+                    let has_compound = has_nested_declarations(child);
+                    if has_compound {
+                        extract_locals_from_compound(child, source, symbols, func_name, depth);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Extract a local variable declaration (inside a function body).
+/// Handles plain declarations (`int x;`), initialized declarations (`int x = 5;`),
+/// and comma-separated declarations (`int a, b = 3, c;`).
+fn extract_local_declaration(
+    node: Node,
+    source: &str,
+    symbols: &mut Vec<Symbol>,
+    func_name: Option<&str>,
+    depth: usize,
+) {
+    let type_text = node.child_by_field_name("type")
+        .map(|t| node_text(t, source).to_string());
+
+    // Try direct declarator field first (plain: `int x;`)
+    if let Some(declarator) = node.child_by_field_name("declarator") {
+        if !is_function_prototype(&declarator) {
+            extract_local_var_from_declarator(declarator, source, symbols, func_name, depth, type_text.as_deref());
+            return;
+        }
+    }
+
+    // Walk children to find init_declarator nodes (`int x = 5;` or `int a, b;`)
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "init_declarator" {
+            if let Some(decl) = child.child_by_field_name("declarator") {
+                if !is_function_prototype(&decl) {
+                    extract_local_var_from_declarator(decl, source, symbols, func_name, depth, type_text.as_deref());
+                }
+            }
+        }
+    }
+}
+
+fn extract_local_var_from_declarator(
+    declarator: Node,
+    source: &str,
+    symbols: &mut Vec<Symbol>,
+    func_name: Option<&str>,
+    depth: usize,
+    type_text: Option<&str>,
+) {
+    let name_node = innermost_declarator_name(declarator);
+    if name_node.kind() == "identifier" || name_node.kind() == "type_identifier" {
+        let name = node_text(name_node, source).to_string();
+        symbols.push(Symbol {
+            name,
+            kind: SymbolKind::Variable,
+            line: name_node.start_position().row,
+            col: name_node.start_position().column,
+            def_keyword: "variable".to_string(),
+            doc_comment: type_text.map(|s| s.to_string()),
+            signature: None,
+            visibility: Visibility::Private,
+            container: func_name.map(|s| s.to_string()),
+            depth,
+        });
+    }
+}
+
+/// Extract struct/union field declarations.
+fn extract_struct_fields(
+    body: Node,
+    source: &str,
+    symbols: &mut Vec<Symbol>,
+    struct_name: Option<&str>,
+) {
+    let mut cursor = body.walk();
+    for child in body.children(&mut cursor) {
+        if child.kind() == "field_declaration" {
+            if let Some(decl) = child.child_by_field_name("declarator") {
+                let name_node = innermost_declarator_name(decl);
+                if name_node.kind() == "field_identifier" || name_node.kind() == "identifier" {
+                    let name = node_text(name_node, source).to_string();
+                    let type_text = child.child_by_field_name("type")
+                        .map(|t| node_text(t, source).to_string());
+                    symbols.push(Symbol {
+                        name,
+                        kind: SymbolKind::Variable,
+                        line: name_node.start_position().row,
+                        col: name_node.start_position().column,
+                        def_keyword: "field".to_string(),
+                        doc_comment: type_text,
+                        signature: None,
+                        visibility: Visibility::Unknown,
+                        container: struct_name.map(|s| s.to_string()),
+                        depth: 1,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Check if a node has any nested declaration or compound_statement children.
+fn has_nested_declarations(node: Node) -> bool {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "compound_statement" | "declaration" => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 fn is_function_prototype(node: &Node) -> bool {
@@ -413,8 +619,11 @@ int main() {
         assert!(names.contains(&"helper"), "should find static function helper, got: {:?}", names);
         assert!(names.contains(&"main"), "should find function main, got: {:?}", names);
 
-        // Local variable should NOT be indexed
-        assert!(!names.contains(&"local"), "local variables should not be indexed, got: {:?}", names);
+        // Local variable SHOULD now be indexed (with depth > 0)
+        assert!(names.contains(&"local"), "local variables should be indexed, got: {:?}", names);
+        let local_sym = result.symbols.iter().find(|s| s.name == "local").unwrap();
+        assert!(local_sym.depth > 0, "local variable should have depth > 0");
+        assert_eq!(local_sym.container.as_deref(), Some("hello"), "local should have container = function name");
 
         // Check visibility
         let helper_sym = result.symbols.iter().find(|s| s.name == "helper").unwrap();
