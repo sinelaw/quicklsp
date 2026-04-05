@@ -285,63 +285,101 @@ This is the same principle as LSM-trees (LevelDB, RocksDB, Lucene).
   meta.json          ← base metadata + per-file mtimes
   symbols.bin        ← base symbol cache
 
-  overlay.bin        ← NEW: incremental delta
-  overlay_meta.json  ← NEW: overlay metadata
+  overlay.log        ← NEW: append-only change log
 ```
 
-#### overlay.bin format
+#### overlay.log format (append-only)
+
+The overlay is a sequential log of tagged entries. Each file change
+appends one or more entries to the end. No seeking, no rewriting of
+earlier data. The file is never modified in-place — only appended to
+or replaced wholesale during compaction.
 
 ```
-[header: 16 bytes]
-  magic(8)
-  overlay_count(u32)    — number of file patches in this overlay
-  new_word_count(u32)   — number of words added beyond base word table
+[header: 12 bytes]
+  magic(8) = "QLSO\x01\x00\x00\x00"
+  base_word_count(u32)         — word_table.len() when base was built
 
-[new words section]
-  new_word_count × (len: u16, word_bytes)
-  — words with IDs = base_word_count + 0, +1, +2, ...
+[repeated entries, append-only]:
 
-[new paths section]
-  new_path_count(u32)
-  new_path_count × (len: u32, path_bytes)
-  — paths with IDs = base_path_count + 0, +1, +2, ...
+  TAG 0x01 — new word
+    tag(u8) = 0x01
+    len(u16)
+    word_bytes(len)
+    — assigns word_id = base_word_count + (sequential counter)
 
-[file patches]
-  overlay_count × file_patch:
+  TAG 0x02 — new path
+    tag(u8) = 0x02
+    len(u32)
+    path_bytes(len)
+    — assigns path_id = base_path_count + (sequential counter)
+
+  TAG 0x03 — file patch (replaces all occurrences for a file)
+    tag(u8) = 0x03
     path_id(u32)
-    action(u8)           — 0 = removed, 1 = replaced
-    if replaced:
-      occ_count(u32)
-      occ_count × (word_id(u32) + line(u32) + col(u32) + len(u16))
-      — sorted by (word_id, line), same format as files.v2.bin
+    mtime(u64)                 — unix seconds, for freshness checks
+    occ_count(u32)
+    occ_count × 14 bytes       — (word_id(4) + line(4) + col(4) + len(2))
+    — occurrences sorted by (word_id, line), same layout as files.v2.bin
+    — logically replaces any earlier patch for this path_id
+
+  TAG 0x04 — file removed
+    tag(u8) = 0x04
+    path_id(u32)
+    — logically removes this file from the index
+
+  TAG 0x05 — symbol update (for a single file)
+    tag(u8) = 0x05
+    path_id(u32)
+    symbol_count(u32)
+    symbol_count × symbol_data  — same binary layout as symbols.bin per-file
+    — replaces cached symbols for this file
 ```
 
-When a file is modified: its old data in the base is logically
-invalidated, and the overlay contains the new occurrences. When a
-file is deleted: the overlay records action=removed. When a file is
-added: the overlay assigns a new path_id and records its occurrences.
+**Append on file change**: tokenize the changed file, then append
+TAG 0x01 entries for any new words, TAG 0x02 if it's a new file,
+TAG 0x03 with the new occurrences, TAG 0x05 with updated symbols.
+Total I/O: one sequential write of a few KB. No fsync needed — the
+log is reconstructable from source files.
 
-#### overlay_meta.json
+**Multiple edits to the same file**: just append another TAG 0x03.
+When loading, last entry for each path_id wins. Dead entries before
+it are ignored (reclaimed at compaction).
 
-```json
-{
-  "base_version": 2,
-  "overlay_count": 3,
-  "patched_files": { "src/foo.c": 1234567890 },
-  "removed_files": ["src/old.c"],
-  "new_files": { "src/new.c": 1234567891 }
-}
-```
+**Crash safety**: a truncated final entry is detected by validating
+entry size against remaining bytes. The reader discards any
+incomplete trailing entry. No data corruption — at worst the last
+edit is lost, and the next save re-appends it.
 
-Merged with the base meta.json to get the full current mtime map.
+**No separate overlay_meta.json needed**: the log itself contains
+mtimes (in TAG 0x03) and removed files (TAG 0x04). On load, scan
+the log to reconstruct the overlay state. The log is small, so this
+scan is fast.
+
+#### Loading the overlay (startup)
+
+Read overlay.log sequentially from start to end:
+
+1. For each TAG 0x01: append word to `new_words` vec.
+2. For each TAG 0x02: append path to `new_paths` vec.
+3. For each TAG 0x03: insert/replace in `patched_files[path_id]`.
+   Record mtime.
+4. For each TAG 0x04: insert into `removed_files` set.
+5. For each TAG 0x05: update cached symbols for the file.
+
+Build the in-memory `word_to_files` reverse index from patched
+files' occurrences.
+
+Cost: O(log size). The log is bounded by compaction threshold, so
+this is fast — typically under 1 MB even after hundreds of edits.
 
 #### Query path: merge base + overlay
 
 **find_references(word):**
 
 1. Look up `word` in base `word_dir` → `(posting_offset, posting_count)`.
-   Also check if word is in the overlay's new words (linear scan or
-   small hash — overlay is tiny).
+   Also check if word is in the overlay's new words (small hash map
+   lookup — overlay is tiny).
 
 2. Read base posting list: file_ids that contain this word.
 
@@ -350,7 +388,8 @@ Merged with the base meta.json to get the full current mtime map.
 4. For surviving base file_ids: read occurrences from base
    `files.v2.bin` (existing code path, unchanged).
 
-5. For patched file_ids: read occurrences from `overlay.bin` instead.
+5. For patched file_ids: read occurrences from in-memory overlay
+   (loaded at startup from overlay.log).
 
 6. For new file_ids (added files in overlay): scan their overlay
    occurrences for the word.
@@ -363,7 +402,7 @@ Cost: O(base postings for word + overlay size). The overlay is small
 **Per-file occurrences (for files.v2.bin reads):**
 
 - If file_id is NOT in overlay → read from base files.v2.bin (unchanged)
-- If file_id IS in overlay → read from overlay.bin
+- If file_id IS in overlay → read from in-memory overlay
 - This is a simple branch before the existing seek+read logic.
 
 #### Update path: O(changed file's entries)
@@ -373,35 +412,35 @@ When a file changes:
 1. **Tokenize** the changed file → occurrences.
 
 2. **Intern new words**: Check each word against the base word table
-   (loaded in memory). Words not found get new IDs appended to the
-   overlay's new words section. The base word table is read-only.
+   + existing overlay words (both in memory). Words not found get new
+   IDs. Append TAG 0x01 entries to the log for each new word.
 
-3. **Write file patch** to overlay.bin: the file's path_id + new
-   occurrences.
+3. **Append TAG 0x03** to overlay.log: path_id + mtime + occurrences.
 
-4. **Update overlay_meta.json**: record the file's new mtime.
+4. **Append TAG 0x05** to overlay.log: updated symbols for this file.
 
-5. **Update symbols.bin**: re-save symbols for this file.
+5. **Update in-memory overlay**: replace entry in `patched_files`,
+   rebuild `word_to_files` for this file.
 
-6. **Rebuild in-memory overlay index**: a small in-memory structure
-   mapping path_id → overlay offset, and a set of invalidated
-   file_ids. This is O(overlay file count), not O(total files).
-
-Cost: O(entries in changed file). No reading or writing of unchanged
-files. No merge. No rewrite of base index.
+Cost: O(entries in changed file). One append write. No reading or
+rewriting of base index or other overlay entries.
 
 #### Compaction: amortized O(total)
 
 When the overlay grows beyond a threshold (e.g., >5% of base size
-or >1000 patched files), compact by merging overlay into base:
+or >1000 patched files), compact by rebuilding the full base index:
 
-1. Read base files.v2.bin + overlay patches.
-2. Build merged word/path tables (base + overlay new words/paths).
-3. Write new files.v2.bin, index.v2.bin, words.v2.bin.
-4. Delete overlay.bin and overlay_meta.json.
+1. The current cold-index path already produces fresh base files.
+2. Delete overlay.log.
+3. The new base incorporates all overlay changes.
 
 This is the current full rebuild, but it happens infrequently.
 Amortized cost per update: O(1) average, O(total) worst case.
+
+Compaction can be triggered:
+- At startup if overlay is large.
+- In background during idle periods.
+- Never during active editing (to avoid blocking).
 
 #### In-memory structures
 
@@ -448,35 +487,46 @@ Negligible.
 
 ### Implementation order
 
-**5a. Overlay data structures + write path**
+**5a. Overlay data structures + append-only writer**
 
-Add `Overlay` struct. When a file changes in the PartiallyStale path,
-write overlay.bin + overlay_meta.json instead of rebuilding the full
-index. Tokenize only the changed files. Cost: O(changed).
+Add `Overlay` struct and `OverlayWriter`. The writer opens overlay.log
+in append mode and provides methods: `append_new_word(word)`,
+`append_file_patch(path_id, mtime, occurrences)`,
+`append_file_removed(path_id)`, `append_symbol_update(path_id, symbols)`.
+Each method does a single buffered write. No seeking.
 
-**5b. Query path: merge base + overlay**
+**5b. Overlay reader + in-memory index**
+
+Add `Overlay::load(path)` that reads overlay.log sequentially and
+builds the in-memory `patched_files` / `removed_files` / `new_words`
+maps. Handle truncated entries gracefully (discard incomplete tail).
+
+**5c. Query path: merge base + overlay**
 
 Modify `find_references()` to filter invalidated file_ids and include
 overlay entries. Modify per-file occurrence reads to check overlay
-first. This is a small code change.
+first. This is a small code change in the existing `find_references`.
 
-**5c. Load overlay on warm startup**
+**5d. PartiallyStale write path**
 
-When loading index, also load overlay.bin if it exists. Populate the
-in-memory Overlay structure. Merge overlay_meta's mtimes with base
-meta's mtimes for freshness checks.
+When `scan_directory` detects changed files and a base index exists:
+instead of rebuilding the full index, tokenize only the changed files
+and append their patches to overlay.log. Skip the par_chunks loop
+for all other files. This is the key performance win.
 
-**5d. Compaction**
+**5e. Compaction**
 
-When overlay exceeds threshold, trigger a full rebuild (current cold
-path) that produces a fresh base index with no overlay. This can
-happen during an idle period or at startup.
+When overlay exceeds threshold on startup (e.g., file size > 10% of
+base files.v2.bin, or >1000 patched files), trigger a full rebuild.
+The cold path already does this — just delete overlay.log afterward.
 
-**5e. Multi-edit accumulation**
+**5f. did_change / did_save integration**
 
-Multiple files can change before compaction. The overlay accumulates
-patches. Each new change to a file replaces its previous overlay
-entry (last writer wins).
+When the LSP server receives `textDocument/didChange` or `didSave`,
+tokenize the single changed file and append to overlay.log. This
+makes single-file edits O(1 file) instead of triggering a full
+re-index. The existing `index_file` / `update_file` methods become
+the entry point for this.
 
 ### Performance at 100K file scale
 
@@ -495,15 +545,24 @@ For a 100K-file codebase, that's 3-4 orders of magnitude faster.
 ### Tradeoffs
 
 - **Query overhead**: Each query must check the overlay. The overlay
-  is small (in memory, hash lookups), so overhead is <0.1ms per query.
+  is in memory (hash lookup), so overhead is <0.1ms per query.
   Negligible compared to disk I/O for base posting lists.
 - **Complexity**: Two-level index with merge-on-read. More code paths
-  to test. But the overlay is simple (just a list of file patches).
-- **Stale overlay**: If quicklsp crashes before compaction, the overlay
-  is still valid — it's written atomically (write + rename). Next
-  startup loads it and continues.
+  to test. But the overlay is simple (append-only log, no random
+  access writes, no rewriting).
+- **Crash safety**: Append-only design means partial writes only affect
+  the last entry. Reader validates entry sizes and discards truncated
+  trailing data. No corruption of earlier entries. At worst, the last
+  edit is lost and re-appended on next save.
+- **Dead entries**: Editing the same file 100 times appends 100 patches
+  but only the last one matters. The dead space is reclaimed at
+  compaction. Between compactions, log size = sum of all patches ever
+  written (not just live ones). This is bounded by the compaction
+  threshold.
 - **Disk space**: Overlay duplicates data for patched files. At most
   ~5% of base size (compaction threshold). Negligible.
+- **Startup cost**: Loading the overlay requires a sequential scan of
+  the log. At 1 MB/ms for cached I/O, a 5 MB overlay loads in ~5ms.
 
 ### Verification
 
