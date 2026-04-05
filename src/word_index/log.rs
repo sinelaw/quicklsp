@@ -78,6 +78,8 @@ impl LogIndex {
             return Ok(None);
         }
 
+        let t0 = std::time::Instant::now();
+        let file_size = std::fs::metadata(&log_path)?.len();
         let mut r = BufReader::with_capacity(1 << 20, File::open(&log_path)?);
 
         let mut magic = [0u8; 8];
@@ -93,6 +95,7 @@ impl LogIndex {
         let mut path_table = Vec::new();
         let mut path_lookup = AHashMap::new();
         let mut files: HashMap<u32, FileData> = HashMap::new();
+        let mut total_occs: usize = 0;
 
         // Read entries until EOF or truncated entry.
         loop {
@@ -130,6 +133,7 @@ impl LogIndex {
                         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
                         Err(e) => return Err(e),
                     };
+                    total_occs += file_data.occurrences.len();
                     files.insert(path_id, file_data);
                 }
                 TAG_FILE_REMOVED => {
@@ -147,7 +151,16 @@ impl LogIndex {
             }
         }
 
+        let scan_elapsed = t0.elapsed();
+        tracing::info!(
+            "LogIndex::load scan done: {} words, {} paths, {} files, {} occs, \
+             log_size={:.1} MB, {:.1}s",
+            word_table.len(), path_table.len(), files.len(), total_occs,
+            file_size as f64 / (1024.0 * 1024.0), scan_elapsed.as_secs_f64(),
+        );
+
         // Build posting lists from file_occs.
+        let tp = std::time::Instant::now();
         let word_count = word_table.len();
         let mut postings: Vec<Vec<u32>> = vec![Vec::new(); word_count];
         for (&path_id, fd) in &files {
@@ -159,6 +172,10 @@ impl LogIndex {
                 }
             }
         }
+        tracing::info!(
+            "LogIndex::load postings built: {} words, {:.1}s",
+            word_count, tp.elapsed().as_secs_f64(),
+        );
 
         Ok(Some(LogIndex {
             index_dir: dir.to_path_buf(),
@@ -267,6 +284,20 @@ impl LogWriter {
             path_lookup: index.path_lookup.clone(),
             entry_count: 0,
         })
+    }
+
+    /// Write an entire word table upfront (TAG 0x01 for each word).
+    /// Used when word_ids were already resolved by a WordInterner during parallel scan.
+    pub fn write_word_table(&mut self, words: &[String]) -> io::Result<()> {
+        for word in words {
+            let id = self.word_table.len() as u32;
+            self.w.write_all(&[TAG_WORD])?;
+            self.w.write_all(&(word.len() as u16).to_le_bytes())?;
+            self.w.write_all(word.as_bytes())?;
+            self.word_lookup.insert(word.clone(), id);
+            self.word_table.push(word.clone());
+        }
+        Ok(())
     }
 
     /// Intern a word, writing TAG 0x01 if it's new. Returns word_id.

@@ -23,7 +23,7 @@ use tower_lsp::lsp_types::Url;
 
 use crate::fuzzy::deletion_neighborhood::DeletionIndex;
 use crate::parsing::symbols::Symbol;
-use crate::parsing::tokenizer::{self, LangFamily, Occurrence};
+use crate::parsing::tokenizer::{self, LangFamily};
 use crate::parsing::tree_sitter_parse::{self, TsParser};
 use crate::word_index::{
     IndexMeta, LogIndex, LogWriter, OccEntry,
@@ -66,8 +66,52 @@ struct FileEntry {
     /// Language family detected from file extension.
     #[allow(dead_code)]
     lang: Option<LangFamily>,
-    /// All identifier occurrences from the tokenizer (for word index building).
-    occurrences: Vec<Occurrence>,
+    /// Pre-resolved occurrences with interned word_ids (ready for log writing).
+    occurrences: Vec<OccEntry>,
+}
+
+/// Thread-safe word interner. Assigns sequential u32 ids to unique word strings.
+/// Used during the parallel scan to resolve occurrence words while the source is
+/// still in scope, so that `write_full_log` doesn't need to re-read files.
+struct WordInterner {
+    lookup: DashMap<String, u32>,
+    table: std::sync::RwLock<Vec<String>>,
+}
+
+impl WordInterner {
+    fn new() -> Self {
+        Self {
+            lookup: DashMap::new(),
+            table: std::sync::RwLock::new(Vec::new()),
+        }
+    }
+
+    /// Intern a word, returning its id. Thread-safe.
+    fn intern(&self, word: &str) -> u32 {
+        if let Some(id) = self.lookup.get(word) {
+            return *id;
+        }
+        // Race: two threads may both miss and try to insert the same word.
+        // DashMap entry API ensures only one wins.
+        let mut table = self.table.write().unwrap();
+        // Double-check after acquiring write lock.
+        if let Some(id) = self.lookup.get(word) {
+            return *id;
+        }
+        let id = table.len() as u32;
+        table.push(word.to_string());
+        self.lookup.insert(word.to_string(), id);
+        id
+    }
+
+    /// Snapshot the word table for serialization.
+    fn word_table(&self) -> Vec<String> {
+        self.table.read().unwrap().clone()
+    }
+
+    fn word_count(&self) -> usize {
+        self.table.read().unwrap().len()
+    }
 }
 
 /// Unified workspace index. One engine, one path, all operations.
@@ -99,6 +143,9 @@ pub struct Workspace {
     /// On-disk word index for memory-efficient reference lookups.
     /// None until the first scan_directory completes.
     word_index: std::sync::RwLock<Option<LogIndex>>,
+
+    /// Shared word interner for resolving occurrence words during parallel scan.
+    word_interner: WordInterner,
 }
 
 impl Workspace {
@@ -112,6 +159,7 @@ impl Workspace {
             fuzzy: std::sync::RwLock::new(DeletionIndex::new()),
             fuzzy_dirty: std::sync::atomic::AtomicBool::new(false),
             word_index: std::sync::RwLock::new(None),
+            word_interner: WordInterner::new(),
         }
     }
 
@@ -167,7 +215,7 @@ impl Workspace {
             .and_then(|e| e.to_str())
             .and_then(LangFamily::from_extension);
 
-        let (symbols, occurrences) = match lang {
+        let (symbols, raw_occurrences) = match lang {
             Some(LangFamily::CLike) => {
                 let result = tree_sitter_parse::c::CParser::parse(source);
                 let mut symbols = result.symbols;
@@ -183,6 +231,24 @@ impl Workspace {
             }
             None => (Vec::new(), Vec::new()),
         };
+
+        // Resolve raw occurrences → OccEntry with interned word_ids while source is in scope.
+        let mut occurrences = Vec::with_capacity(raw_occurrences.len());
+        for occ in &raw_occurrences {
+            let word = &source[occ.word_offset as usize
+                ..(occ.word_offset as usize + occ.word_len as usize)];
+            let word_id = self.word_interner.intern(word);
+            occurrences.push(OccEntry {
+                word_id,
+                line: occ.line as u32,
+                col: occ.col as u32,
+                len: occ.word_len,
+            });
+        }
+        // Sort by (word_id, line) for binary search during queries.
+        occurrences.sort_unstable_by(|a, b| {
+            a.word_id.cmp(&b.word_id).then_with(|| a.line.cmp(&b.line))
+        });
 
         // Remove old definitions for this file before inserting new ones
         self.remove_definitions_for_file(&path);
@@ -282,85 +348,66 @@ impl Workspace {
     }
 
     /// Write all files to index.log and reload.
+    ///
+    /// Occurrences are already resolved to `OccEntry` with interned word_ids
+    /// (done during the parallel scan via `word_interner`), so this method
+    /// just serializes — no file re-reading or re-tokenizing.
     fn write_full_log(
         &self,
         index_dir: &Path,
         mtime_map: &std::collections::HashMap<String, u64>,
     ) -> std::io::Result<LogIndex> {
+        let t0 = std::time::Instant::now();
         let mut w = LogWriter::create(index_dir)?;
 
-        // Phase 1: Intern all words and paths by scanning all files.
-        // We need to tokenize each file to get occurrences (word offsets).
-        // But tokenization was already done during par_chunks — occurrences
-        // are in self.files[path].occurrences... except they were drained.
-        //
-        // Actually, in the new model we write directly during the par_chunks loop.
-        // This method is called after par_chunks populates self.files with symbols.
-        // But occurrences were consumed by the old builder. We need a different flow.
-        //
-        // For the cold path, we'll re-tokenize here. But that's wasteful.
-        // Instead, let's change the flow: the par_chunks loop writes to the log directly.
-        // For now, re-read + re-tokenize each file.
-        //
-        // TODO: This is a transitional implementation. The next step merges
-        // the par_chunks tokenization with log writing to avoid double work.
+        // Write the global word table from the interner.
+        let word_table = self.word_interner.word_table();
+        w.write_word_table(&word_table)?;
+        tracing::info!(
+            "write_full_log: wrote {} words, {:.1}s",
+            word_table.len(), t0.elapsed().as_secs_f64(),
+        );
+
+        let total_files = self.files.len();
+        let mut files_written: usize = 0;
+        let mut total_occs: usize = 0;
 
         for entry in self.files.iter() {
             let path = entry.key();
             let file_entry = entry.value();
-            let source = match std::fs::read_to_string(path) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
 
             let path_id = w.intern_path(path)?;
             let mtime = mtime_map.get(&path.to_string_lossy().into_owned())
                 .copied().unwrap_or(0);
 
-            // Tokenize to get occurrences.
-            let lang = path.extension()
-                .and_then(|e| e.to_str())
-                .and_then(LangFamily::from_extension);
+            total_occs += file_entry.occurrences.len();
+            w.write_file_data(path_id, mtime, &file_entry.occurrences, &file_entry.symbols, file_entry.lang)?;
 
-            let occurrences = match lang {
-                Some(LangFamily::CLike) => {
-                    crate::parsing::tree_sitter_parse::c::CParser::parse(&source).occurrences
-                }
-                Some(l) => {
-                    let (scan_result, _) = tokenizer::scan_with_contexts(&source, l);
-                    scan_result.occurrences
-                }
-                None => Vec::new(),
-            };
-
-            // Convert to OccEntry with interned word_ids.
-            let mut occ_entries = Vec::with_capacity(occurrences.len());
-            for occ in &occurrences {
-                let word = &source[occ.word_offset as usize
-                    ..(occ.word_offset as usize + occ.word_len as usize)];
-                let word_id = w.intern_word(word)?;
-                occ_entries.push(OccEntry {
-                    word_id,
-                    line: occ.line as u32,
-                    col: occ.col as u32,
-                    len: occ.word_len,
-                });
+            files_written += 1;
+            if files_written % 10000 == 0 {
+                tracing::info!(
+                    "write_full_log progress: {}/{} files, {} occs so far, elapsed={:.1}s",
+                    files_written, total_files, total_occs, t0.elapsed().as_secs_f64(),
+                );
             }
-
-            // Sort by (word_id, line) for binary search during queries.
-            occ_entries.sort_unstable_by(|a, b| {
-                a.word_id.cmp(&b.word_id).then_with(|| a.line.cmp(&b.line))
-            });
-
-            w.write_file_data(path_id, mtime, &occ_entries, &file_entry.symbols, lang)?;
         }
 
+        tracing::info!(
+            "write_full_log loop done: {} files, {} occs, {:.1}s",
+            files_written, total_occs, t0.elapsed().as_secs_f64(),
+        );
+
+        let tf = std::time::Instant::now();
         w.flush()?;
         drop(w);
+        tracing::info!("write_full_log flush: {:.1}s", tf.elapsed().as_secs_f64());
 
         // Reload the log we just wrote.
-        LogIndex::load(index_dir)?
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "log not found after write"))
+        let tl = std::time::Instant::now();
+        let result = LogIndex::load(index_dir)?
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "log not found after write"));
+        tracing::info!("write_full_log reload: {:.1}s", tl.elapsed().as_secs_f64());
+        result
     }
 
     /// Try to load cached symbols from a persisted index.
@@ -964,7 +1011,7 @@ impl Workspace {
                 Err(_) => continue,
             };
 
-            // Re-parse for symbols.
+            // Re-parse for symbols + resolve occurrences via word_interner.
             self.index_file_core(path.clone(), &source, false);
 
             let path_id = match w.intern_path(path) {
@@ -973,44 +1020,32 @@ impl Workspace {
             };
             let mtime = mtime_map.get(&path.to_string_lossy().into_owned()).copied().unwrap_or(0);
 
-            // Tokenize for occurrences.
-            let lang = path.extension()
-                .and_then(|e| e.to_str())
-                .and_then(LangFamily::from_extension);
-
-            let occurrences = match lang {
-                Some(LangFamily::CLike) => {
-                    crate::parsing::tree_sitter_parse::c::CParser::parse(&source).occurrences
+            // Get pre-resolved occurrences + symbols from FileEntry.
+            // Remap word_ids from interner space → LogWriter space.
+            let (occ_entries, symbols, lang) = match self.files.get(path) {
+                Some(entry) => {
+                    let interner_table = self.word_interner.word_table();
+                    let mut remapped = Vec::with_capacity(entry.occurrences.len());
+                    for occ in &entry.occurrences {
+                        let word = &interner_table[occ.word_id as usize];
+                        let writer_word_id = match w.intern_word(word) {
+                            Ok(id) => id,
+                            Err(e) => { tracing::warn!("intern_word failed: {e}"); continue; }
+                        };
+                        remapped.push(OccEntry {
+                            word_id: writer_word_id,
+                            line: occ.line,
+                            col: occ.col,
+                            len: occ.len,
+                        });
+                    }
+                    remapped.sort_unstable_by(|a, b| {
+                        a.word_id.cmp(&b.word_id).then_with(|| a.line.cmp(&b.line))
+                    });
+                    (remapped, entry.symbols.clone(), entry.lang)
                 }
-                Some(l) => {
-                    let (scan_result, _) = tokenizer::scan_with_contexts(&source, l);
-                    scan_result.occurrences
-                }
-                None => Vec::new(),
+                None => continue,
             };
-
-            let mut occ_entries = Vec::with_capacity(occurrences.len());
-            for occ in &occurrences {
-                let word = &source[occ.word_offset as usize..(occ.word_offset as usize + occ.word_len as usize)];
-                let word_id = match w.intern_word(word) {
-                    Ok(id) => id,
-                    Err(e) => { tracing::warn!("intern_word failed: {e}"); continue; }
-                };
-                occ_entries.push(OccEntry {
-                    word_id,
-                    line: occ.line as u32,
-                    col: occ.col as u32,
-                    len: occ.word_len,
-                });
-            }
-            occ_entries.sort_unstable_by(|a, b| {
-                a.word_id.cmp(&b.word_id).then_with(|| a.line.cmp(&b.line))
-            });
-
-            // Get current symbols for this file.
-            let symbols = self.files.get(path)
-                .map(|e| e.symbols.clone())
-                .unwrap_or_default();
 
             if let Err(e) = w.write_file_data(path_id, mtime, &occ_entries, &symbols, lang) {
                 tracing::warn!("Failed to write file data: {e}");
@@ -1178,7 +1213,7 @@ impl Workspace {
                 total_symbols += 1;
             }
             for _occ in &entry.value().occurrences {
-                files_occurrences += std::mem::size_of::<crate::parsing::tokenizer::Occurrence>();
+                files_occurrences += std::mem::size_of::<OccEntry>();
                 total_occurrences += 1;
             }
         }
@@ -1239,12 +1274,20 @@ impl Workspace {
             .sum();
         breakdown.push(("open sources", open_sources_size));
 
+        // 6. word_interner
+        let interner_table = self.word_interner.word_table();
+        let interner_size: usize = interner_table.iter()
+            .map(|w| std::mem::size_of::<String>() + w.len())
+            .sum();
+        breakdown.push(("word interner", interner_size));
+
         // Summary stats
         breakdown.push(("(count) files", self.files.len()));
         breakdown.push(("(count) symbols in files", total_symbols));
         breakdown.push(("(count) occurrences in files", total_occurrences));
         breakdown.push(("(count) definitions", total_defs));
         breakdown.push(("(count) unique def names", self.definitions.len()));
+        breakdown.push(("(count) interned words", interner_table.len()));
 
         breakdown
     }
