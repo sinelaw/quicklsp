@@ -373,6 +373,14 @@ impl Workspace {
             }
         }
 
+        // Return freed pages to the OS. glibc malloc retains freed arenas
+        // indefinitely; this reclaims the ~1 GB freed by draining occurrences
+        // and dropping the word index builder.
+        #[cfg(target_os = "linux")]
+        unsafe {
+            libc::malloc_trim(0);
+        }
+
         let stats = ScanStats {
             indexed: indexed.load(Relaxed),
             skipped,
