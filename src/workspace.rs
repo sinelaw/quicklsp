@@ -218,10 +218,10 @@ impl Workspace {
         }
     }
 
-    /// Build the on-disk word index from all file occurrences and save metadata.
+    /// Write a pre-populated word index builder to disk and store the result.
     ///
     /// Index is stored in the XDG cache directory: `~/.cache/quicklsp/<project-hash>/`
-    fn build_word_index(&self, root: &Path, content_hash: u64) {
+    fn finish_word_index(&self, root: &Path, content_hash: u64, builder: WordIndexBuilder) {
         let index_dir = match index_dir_for_project(root) {
             Some(d) => d,
             None => {
@@ -234,12 +234,6 @@ impl Workspace {
             return;
         }
         let index_path = index_dir.join(index_filename());
-
-        let mut builder = WordIndexBuilder::new();
-        for mut entry in self.files.iter_mut() {
-            let occurrences = std::mem::take(&mut entry.value_mut().occurrences);
-            builder.drain_file_occurrences(entry.key(), occurrences);
-        }
 
         let entry_count = builder.entry_count();
         match WordIndex::build(builder, &index_path) {
@@ -337,40 +331,63 @@ impl Workspace {
         let mut skipped = 0usize;
         Self::collect_paths(root, &self.files, &mut paths, &mut skipped, 0);
 
-        // Phase 2: parallel read + index (no fuzzy updates)
-        // Even with warm startup, we still need to tokenize for definitions/symbols.
-        // The word index from warm startup handles references, but we need
-        // the in-memory definitions map for go-to-definition.
+        // Phase 2+4: parallel read + index in batches, draining occurrences
+        // after each batch to bound peak memory. Without batching, all 6K files'
+        // occurrences (~620 MB) sit in memory until the word index is built.
+        // With batches of 500, only ~50 MB of occurrences are live at any time.
         let indexed = AtomicUsize::new(0);
         let errors = AtomicUsize::new(0);
 
-        paths.par_iter().for_each(|path| {
-            match std::fs::read_to_string(path) {
-                Ok(source) => {
-                    self.index_file_core(path.clone(), source, false);
-                    indexed.fetch_add(1, Relaxed);
+        // Prepare the word index builder outside the batch loop (accumulates
+        // compact entries across all batches, but occurrence Strings are moved
+        // in and the source Vecs freed each iteration).
+        let mut builder = if !warm {
+            Some(WordIndexBuilder::new())
+        } else {
+            None
+        };
+
+        const BATCH_SIZE: usize = 500;
+
+        for batch in paths.chunks(BATCH_SIZE) {
+            // Parallel read + tokenize + index this batch
+            batch.par_iter().for_each(|path| {
+                match std::fs::read_to_string(path) {
+                    Ok(source) => {
+                        self.index_file_core(path.clone(), source, false);
+                        indexed.fetch_add(1, Relaxed);
+                    }
+                    Err(_) => {
+                        errors.fetch_add(1, Relaxed);
+                    }
                 }
-                Err(_) => {
-                    errors.fetch_add(1, Relaxed);
+                crate::parsing::tokenizer::stats::flush();
+            });
+
+            // Drain this batch's occurrences immediately to free memory
+            if let Some(ref mut b) = builder {
+                for path in batch {
+                    if let Some(mut entry) = self.files.get_mut(path) {
+                        let occurrences = std::mem::take(&mut entry.value_mut().occurrences);
+                        b.drain_file_occurrences(path, occurrences);
+                    }
+                }
+            } else {
+                // Warm startup: just drop occurrences
+                for path in batch {
+                    if let Some(mut entry) = self.files.get_mut(path) {
+                        entry.value_mut().occurrences = Vec::new();
+                    }
                 }
             }
-            crate::parsing::tokenizer::stats::flush();
-        });
+        }
 
         // Phase 3: rebuild fuzzy index once from all symbols
         self.rebuild_fuzzy();
 
-        // Phase 4: build on-disk word index (skip if warm startup loaded a fresh one)
-        if !warm {
-            // build_word_index drains occurrences from each FileEntry,
-            // freeing ~60% of peak memory once the index is written to disk.
-            self.build_word_index(root, content_hash);
-        } else {
-            // Warm startup: word index loaded from disk, occurrences not needed.
-            // Drop them to free memory.
-            for mut entry in self.files.iter_mut() {
-                entry.value_mut().occurrences = Vec::new();
-            }
+        // Phase 4: write the accumulated word index to disk
+        if let Some(b) = builder {
+            self.finish_word_index(root, content_hash, b);
         }
 
         // Return freed pages to the OS. glibc malloc retains freed arenas
