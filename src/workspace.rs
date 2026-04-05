@@ -26,8 +26,8 @@ use crate::parsing::symbols::Symbol;
 use crate::parsing::tokenizer::{self, LangFamily, Occurrence};
 use crate::parsing::tree_sitter_parse::{self, TsParser};
 use crate::word_index::{
-    IndexMeta, WordIndex, WordIndexBuilder, collect_file_mtimes,
-    index_dir_for_project,
+    IndexMeta, LogIndex, LogWriter, OccEntry,
+    collect_file_mtimes, index_dir_for_project,
 };
 
 /// A symbol definition with its file location.
@@ -98,7 +98,7 @@ pub struct Workspace {
 
     /// On-disk word index for memory-efficient reference lookups.
     /// None until the first scan_directory completes.
-    word_index: std::sync::RwLock<Option<WordIndex>>,
+    word_index: std::sync::RwLock<Option<LogIndex>>,
 }
 
 impl Workspace {
@@ -225,14 +225,11 @@ impl Workspace {
         self.fuzzy_dirty.store(false, std::sync::atomic::Ordering::Release);
     }
 
-    /// Write a pre-populated word index builder to disk and store the result.
-    ///
-    /// Index is stored in the XDG cache directory: `~/.cache/quicklsp/<project-hash>/`
+    /// Write all indexed files to the append-only log and load the result.
     fn finish_word_index(
         &self,
         root: &Path,
         file_mtimes: &[(PathBuf, std::time::SystemTime)],
-        builder: WordIndexBuilder,
     ) {
         let index_dir = match index_dir_for_project(root) {
             Some(d) => d,
@@ -246,36 +243,124 @@ impl Workspace {
             return;
         }
 
-        let entry_count = builder.entry_count();
-        match WordIndex::build(builder, &index_dir) {
+        // Build the mtime map for change detection.
+        let mtime_map: std::collections::HashMap<String, u64> = file_mtimes
+            .iter()
+            .map(|(p, mt)| {
+                let secs = mt.duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_secs()).unwrap_or(0);
+                (p.to_string_lossy().into_owned(), secs)
+            })
+            .collect();
+
+        // Write the log: all words, paths, and per-file data.
+        match self.write_full_log(&index_dir, &mtime_map) {
             Ok(index) => {
-                // Save metadata for warm startup
                 let meta = IndexMeta {
                     version: crate::word_index::persistence::CURRENT_VERSION,
-                    file_count: self.files.len() as u64,
-                    entry_count: entry_count as u64,
-                    word_count: index.word_dir().len() as u64,
+                    file_count: index.file_count() as u64,
+                    entry_count: 0, // not tracked per-entry anymore
+                    word_count: index.word_count() as u64,
                     built_at: std::time::SystemTime::now()
                         .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0),
+                        .map(|d| d.as_secs()).unwrap_or(0),
                     file_mtimes: IndexMeta::build_mtime_map(file_mtimes),
                 };
                 if let Err(e) = meta.save(&index_dir) {
                     tracing::warn!("Failed to save index metadata: {e}");
                 }
-
-                // Save symbols for warm startup (avoid re-parsing all files).
-                if let Err(e) = save_symbols(&self.files, &index_dir) {
-                    tracing::warn!("Failed to save symbols: {e}");
-                }
-
+                tracing::info!(
+                    "Log index built: {} files, {} words, path: {}",
+                    index.file_count(), index.word_count(), index_dir.display(),
+                );
                 *self.word_index.write().unwrap() = Some(index);
             }
             Err(e) => {
-                tracing::warn!("Failed to build word index: {e}");
+                tracing::warn!("Failed to write log index: {e}");
             }
         }
+    }
+
+    /// Write all files to index.log and reload.
+    fn write_full_log(
+        &self,
+        index_dir: &Path,
+        mtime_map: &std::collections::HashMap<String, u64>,
+    ) -> std::io::Result<LogIndex> {
+        let mut w = LogWriter::create(index_dir)?;
+
+        // Phase 1: Intern all words and paths by scanning all files.
+        // We need to tokenize each file to get occurrences (word offsets).
+        // But tokenization was already done during par_chunks — occurrences
+        // are in self.files[path].occurrences... except they were drained.
+        //
+        // Actually, in the new model we write directly during the par_chunks loop.
+        // This method is called after par_chunks populates self.files with symbols.
+        // But occurrences were consumed by the old builder. We need a different flow.
+        //
+        // For the cold path, we'll re-tokenize here. But that's wasteful.
+        // Instead, let's change the flow: the par_chunks loop writes to the log directly.
+        // For now, re-read + re-tokenize each file.
+        //
+        // TODO: This is a transitional implementation. The next step merges
+        // the par_chunks tokenization with log writing to avoid double work.
+
+        for entry in self.files.iter() {
+            let path = entry.key();
+            let file_entry = entry.value();
+            let source = match std::fs::read_to_string(path) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+
+            let path_id = w.intern_path(path)?;
+            let mtime = mtime_map.get(&path.to_string_lossy().into_owned())
+                .copied().unwrap_or(0);
+
+            // Tokenize to get occurrences.
+            let lang = path.extension()
+                .and_then(|e| e.to_str())
+                .and_then(LangFamily::from_extension);
+
+            let occurrences = match lang {
+                Some(LangFamily::CLike) => {
+                    crate::parsing::tree_sitter_parse::c::CParser::parse(&source).occurrences
+                }
+                Some(l) => {
+                    let (scan_result, _) = tokenizer::scan_with_contexts(&source, l);
+                    scan_result.occurrences
+                }
+                None => Vec::new(),
+            };
+
+            // Convert to OccEntry with interned word_ids.
+            let mut occ_entries = Vec::with_capacity(occurrences.len());
+            for occ in &occurrences {
+                let word = &source[occ.word_offset as usize
+                    ..(occ.word_offset as usize + occ.word_len as usize)];
+                let word_id = w.intern_word(word)?;
+                occ_entries.push(OccEntry {
+                    word_id,
+                    line: occ.line as u32,
+                    col: occ.col as u32,
+                    len: occ.word_len,
+                });
+            }
+
+            // Sort by (word_id, line) for binary search during queries.
+            occ_entries.sort_unstable_by(|a, b| {
+                a.word_id.cmp(&b.word_id).then_with(|| a.line.cmp(&b.line))
+            });
+
+            w.write_file_data(path_id, mtime, &occ_entries, &file_entry.symbols, lang)?;
+        }
+
+        w.flush()?;
+        drop(w);
+
+        // Reload the log we just wrote.
+        LogIndex::load(index_dir)?
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "log not found after write"))
     }
 
     /// Try to load cached symbols from a persisted index.
@@ -304,57 +389,62 @@ impl Workspace {
             return WarmResult::Cold;
         }
 
-        // Load symbols from cache.
-        if let Err(e) = load_symbols(
-            &self.files,
-            &self.definitions,
-            &self.file_ids,
-            &self.id_to_path,
-            &index_dir,
-        ) {
-            tracing::warn!("Failed to load symbols: {e}");
-            // Clear any partially loaded data.
-            self.files.clear();
-            self.definitions.clear();
-            self.file_ids.clear();
-            self.id_to_path.write().unwrap().clear();
-            return WarmResult::Cold;
-        }
+        // Load the log index (contains words, paths, occurrences, symbols).
+        let index = match LogIndex::load(&index_dir) {
+            Ok(Some(idx)) => idx,
+            Ok(None) => return WarmResult::Cold,
+            Err(e) => {
+                tracing::warn!("Failed to load log index: {e}");
+                return WarmResult::Cold;
+            }
+        };
 
+        // Populate workspace files/definitions/file_ids from the loaded log.
+        self.populate_from_log_index(&index);
         self.fuzzy_dirty.store(true, std::sync::atomic::Ordering::Release);
 
-        // Check which files changed.
         let changed = changed_files(&meta, file_mtimes);
 
         if changed.is_empty() {
-            // Fully fresh — also load the word index.
-            match WordIndex::load(&index_dir) {
-                Ok(index) => {
-                    tracing::info!(
-                        "Warm startup: loaded {} words, {} files, {} definitions from {}",
-                        index.word_dir().len(),
-                        self.files.len(),
-                        self.definitions.len(),
-                        index_dir.display(),
-                    );
-                    *self.word_index.write().unwrap() = Some(index);
-                    WarmResult::FullyFresh
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to load word index: {e}");
-                    // Symbols are loaded, but word index is broken.
-                    // Re-index all files but keep the loaded symbols for unchanged files.
-                    let all: Vec<PathBuf> = file_mtimes.iter().map(|(p, _)| p.clone()).collect();
-                    WarmResult::PartiallyStale(all)
-                }
-            }
+            tracing::info!(
+                "Warm startup: loaded {} words, {} files, {} definitions from {}",
+                index.word_count(), index.file_count(),
+                self.definitions.len(), index_dir.display(),
+            );
+            *self.word_index.write().unwrap() = Some(index);
+            WarmResult::FullyFresh
         } else {
             tracing::info!(
                 "Warm startup: {} cached files loaded, {} files changed",
-                self.files.len(),
-                changed.len(),
+                index.file_count(), changed.len(),
             );
+            // Don't store the index — it will be rebuilt after re-parsing changed files.
             WarmResult::PartiallyStale(changed)
+        }
+    }
+
+    /// Populate workspace data structures from a loaded LogIndex.
+    fn populate_from_log_index(&self, index: &LogIndex) {
+        let mut id_table = self.id_to_path.write().unwrap();
+        for (path_id, fd) in &index.files {
+            let path_str = &index.path_table[*path_id as usize];
+            let path = PathBuf::from(path_str);
+
+            let fid = FileId(id_table.len() as u32);
+            id_table.push(path.clone());
+            self.file_ids.insert(path.clone(), fid);
+
+            // Insert symbols into definitions index.
+            for (idx, sym) in fd.symbols.iter().enumerate() {
+                let sym_ref = SymbolRef { file_id: fid, symbol_idx: idx as u32 };
+                self.definitions.entry(sym.name.clone()).or_default().push(sym_ref);
+            }
+
+            self.files.insert(path, FileEntry {
+                symbols: fd.symbols.clone(),
+                lang: fd.lang,
+                occurrences: Vec::new(),
+            });
         }
     }
 
@@ -385,109 +475,57 @@ impl Workspace {
             return stats;
         }
 
-        // Determine which files to index.
-        let mut skipped = 0usize;
-        let paths = match warm_result {
+        match warm_result {
             WarmResult::PartiallyStale(changed) => {
-                // Symbols for unchanged files already loaded from cache.
-                // Re-parse changed files for their symbols, then do a full
-                // word index rebuild (all files need tokenizing for occurrences).
-                let changed_set: std::collections::HashSet<PathBuf> = changed.into_iter().collect();
+                // Truly incremental: append only changed files to the log.
+                self.incremental_update(root, &file_mtimes, changed);
 
-                // Re-parse changed files to update their symbols.
-                for path in &changed_set {
-                    if let Ok(source) = std::fs::read_to_string(path) {
-                        self.index_file_core(path.clone(), &source, false);
-                    }
-                }
-                tracing::info!("Incremental: re-parsed {} changed files", changed_set.len());
-
-                // Collect all paths for the word index rebuild.
-                // Skip editor-opened files (they may have unsaved changes).
-                let editor_files: DashMap<PathBuf, FileEntry> = DashMap::new();
-                for entry in self.open_sources.iter() {
-                    editor_files.insert(entry.key().clone(), FileEntry {
-                        symbols: Vec::new(), lang: None, occurrences: Vec::new(),
-                    });
-                }
-                let mut all_paths = Vec::new();
-                Self::collect_paths(root, &editor_files, &mut all_paths, &mut skipped, 0);
-                all_paths
+                let stats = ScanStats {
+                    indexed: self.files.len(),
+                    skipped: 0,
+                    errors: 0,
+                };
+                tracing::info!(
+                    "Workspace scan complete (incremental): {} files",
+                    stats.indexed,
+                );
+                return stats;
             }
             WarmResult::Cold => {
-                let mut paths = Vec::new();
-                Self::collect_paths(root, &self.files, &mut paths, &mut skipped, 0);
-                paths
+                // Full cold index.
             }
             WarmResult::FullyFresh => unreachable!(),
         };
 
-        // Phase 2+4: parallel read, tokenize, and drain in chunks.
-        //
-        // Each rayon task processes a chunk of files: reads + tokenizes them,
-        // then locks the shared builder once to drain all occurrences.
-        // Sources stay alive per-chunk so byte-offset occurrences can be resolved.
+        // Cold path: collect paths, parallel tokenize, write full log.
+        let mut paths = Vec::new();
+        let mut skipped = 0usize;
+        Self::collect_paths(root, &self.files, &mut paths, &mut skipped, 0);
+
         let indexed = AtomicUsize::new(0);
         let errors = AtomicUsize::new(0);
 
-        let builder = std::sync::Mutex::new(WordIndexBuilder::new());
-
-        const CHUNK_SIZE: usize = 100;
-
-        paths.par_chunks(CHUNK_SIZE).for_each(|chunk| {
-            // Read + tokenize all files in this chunk, keep sources alive.
-            let chunk_data: Vec<_> = chunk
-                .iter()
-                .filter_map(|path| {
-                    match std::fs::read_to_string(path) {
-                        Ok(source) => {
-                            self.index_file_core(path.clone(), &source, false);
-                            indexed.fetch_add(1, Relaxed);
-                            Some((path, source))
-                        }
-                        Err(_) => {
-                            errors.fetch_add(1, Relaxed);
-                            None
-                        }
+        paths.par_chunks(100).for_each(|chunk| {
+            for path in chunk {
+                match std::fs::read_to_string(path) {
+                    Ok(source) => {
+                        self.index_file_core(path.clone(), &source, false);
+                        indexed.fetch_add(1, Relaxed);
                     }
-                })
-                .collect();
-
-            // Lock builder once for the entire chunk, drain occurrences,
-            // then flush entries to disk so peak memory stays bounded.
-            {
-                let mut b = builder.lock().unwrap();
-                for (path, source) in &chunk_data {
-                    if let Some(mut entry) = self.files.get_mut(*path) {
-                        let occurrences = std::mem::take(&mut entry.value_mut().occurrences);
-                        b.drain_file_occurrences(path, occurrences, source);
+                    Err(_) => {
+                        errors.fetch_add(1, Relaxed);
                     }
-                }
-                if let Err(e) = b.flush_to_disk() {
-                    tracing::warn!("Failed to flush word index chunk to disk: {e}");
                 }
             }
-
-            crate::parsing::tokenizer::stats::flush();
         });
 
-        // Phase 3: mark fuzzy index as needing rebuild (built lazily on first query)
         self.fuzzy_dirty.store(true, std::sync::atomic::Ordering::Release);
 
-        // Phase 4: write the accumulated word index to disk
-        {
-            let b = builder.into_inner().unwrap();
-            tracing::info!(
-                "Word index builder ready: {} entries, {}",
-                b.entry_count(), Self::rss_summary()
-            );
-            self.finish_word_index(root, &file_mtimes, b);
-            tracing::info!("Word index written, {}", Self::rss_summary());
-        }
+        tracing::info!("Indexed {} files, writing log index, {}", indexed.load(Relaxed), Self::rss_summary());
+        self.finish_word_index(root, &file_mtimes);
+        tracing::info!("Log index written, {}", Self::rss_summary());
 
         // Strip doc_comment and signature from symbols to reduce resident memory.
-        // These are only needed for hover_info, which re-extracts them from source
-        // on demand (see hover_info_from_source).
         for mut entry in self.files.iter_mut() {
             for sym in &mut entry.value_mut().symbols {
                 sym.doc_comment = None;
@@ -495,9 +533,6 @@ impl Workspace {
             }
         }
 
-        // Return freed pages to the OS. glibc malloc retains freed arenas
-        // indefinitely; this reclaims the ~1 GB freed by draining occurrences
-        // and dropping the word index builder.
         #[cfg(target_os = "linux")]
         unsafe {
             libc::malloc_trim(0);
@@ -731,10 +766,11 @@ impl Workspace {
     /// If an on-disk word index is available, uses seek-based lookup (O(1) I/O).
     /// Otherwise falls back to word-boundary text search across all files.
     pub fn find_references(&self, name: &str) -> Vec<Reference> {
-        // Try the on-disk word index first
+        // Try the log-based word index first
         if let Ok(guard) = self.word_index.read() {
             if let Some(ref index) = *guard {
-                if let Ok(entries) = index.find_references(name) {
+                let entries = index.find_references(name);
+                if !entries.is_empty() {
                     return entries
                         .into_iter()
                         .map(|e| Reference {
@@ -862,6 +898,158 @@ impl Workspace {
             &lines, loc.symbol.line, loc.symbol.col, lang,
         );
         Some((sig, doc))
+    }
+
+    /// Incremental update: append only changed files to the existing log.
+    /// O(changed files), not O(total files).
+    fn incremental_update(
+        &self,
+        root: &Path,
+        file_mtimes: &[(PathBuf, std::time::SystemTime)],
+        changed: Vec<PathBuf>,
+    ) {
+        let index_dir = match index_dir_for_project(root) {
+            Some(d) => d,
+            None => {
+                tracing::warn!("Cannot determine cache directory");
+                return;
+            }
+        };
+
+        // Load the existing log index to seed the append writer.
+        let index = match LogIndex::load(&index_dir) {
+            Ok(Some(idx)) => idx,
+            _ => {
+                tracing::warn!("Cannot load existing log for incremental update");
+                return;
+            }
+        };
+
+        // Open log for appending.
+        let mut w = match LogWriter::open_append(&index_dir, &index) {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::warn!("Cannot open log for append: {e}");
+                return;
+            }
+        };
+
+        let mtime_map: std::collections::HashMap<String, u64> = file_mtimes
+            .iter()
+            .map(|(p, mt)| {
+                let secs = mt.duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_secs()).unwrap_or(0);
+                (p.to_string_lossy().into_owned(), secs)
+            })
+            .collect();
+
+        let mut appended = 0usize;
+        for path in &changed {
+            // Check if file still exists (could be deleted).
+            if !path.exists() {
+                // File was removed.
+                if let Some(&pid) = index.path_lookup.get(&path.to_string_lossy().into_owned()) {
+                    if let Err(e) = w.write_file_removed(pid) {
+                        tracing::warn!("Failed to write file removal: {e}");
+                    }
+                    // Update in-memory workspace.
+                    self.remove_definitions_for_file(path);
+                    self.files.remove(path);
+                }
+                continue;
+            }
+
+            let source = match std::fs::read_to_string(path) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+
+            // Re-parse for symbols.
+            self.index_file_core(path.clone(), &source, false);
+
+            let path_id = match w.intern_path(path) {
+                Ok(id) => id,
+                Err(e) => { tracing::warn!("intern_path failed: {e}"); continue; }
+            };
+            let mtime = mtime_map.get(&path.to_string_lossy().into_owned()).copied().unwrap_or(0);
+
+            // Tokenize for occurrences.
+            let lang = path.extension()
+                .and_then(|e| e.to_str())
+                .and_then(LangFamily::from_extension);
+
+            let occurrences = match lang {
+                Some(LangFamily::CLike) => {
+                    crate::parsing::tree_sitter_parse::c::CParser::parse(&source).occurrences
+                }
+                Some(l) => {
+                    let (scan_result, _) = tokenizer::scan_with_contexts(&source, l);
+                    scan_result.occurrences
+                }
+                None => Vec::new(),
+            };
+
+            let mut occ_entries = Vec::with_capacity(occurrences.len());
+            for occ in &occurrences {
+                let word = &source[occ.word_offset as usize..(occ.word_offset as usize + occ.word_len as usize)];
+                let word_id = match w.intern_word(word) {
+                    Ok(id) => id,
+                    Err(e) => { tracing::warn!("intern_word failed: {e}"); continue; }
+                };
+                occ_entries.push(OccEntry {
+                    word_id,
+                    line: occ.line as u32,
+                    col: occ.col as u32,
+                    len: occ.word_len,
+                });
+            }
+            occ_entries.sort_unstable_by(|a, b| {
+                a.word_id.cmp(&b.word_id).then_with(|| a.line.cmp(&b.line))
+            });
+
+            // Get current symbols for this file.
+            let symbols = self.files.get(path)
+                .map(|e| e.symbols.clone())
+                .unwrap_or_default();
+
+            if let Err(e) = w.write_file_data(path_id, mtime, &occ_entries, &symbols, lang) {
+                tracing::warn!("Failed to write file data: {e}");
+            }
+            appended += 1;
+        }
+
+        if let Err(e) = w.flush() {
+            tracing::warn!("Failed to flush log: {e}");
+            return;
+        }
+        drop(w);
+
+        tracing::info!("Incremental: appended {} files to log", appended);
+
+        // Reload the log to get updated in-memory index.
+        match LogIndex::load(&index_dir) {
+            Ok(Some(new_index)) => {
+                // Update meta.json with new mtimes.
+                let meta = IndexMeta {
+                    version: crate::word_index::persistence::CURRENT_VERSION,
+                    file_count: new_index.file_count() as u64,
+                    entry_count: 0,
+                    word_count: new_index.word_count() as u64,
+                    built_at: std::time::SystemTime::now()
+                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                        .map(|d| d.as_secs()).unwrap_or(0),
+                    file_mtimes: IndexMeta::build_mtime_map(file_mtimes),
+                };
+                if let Err(e) = meta.save(&index_dir) {
+                    tracing::warn!("Failed to save meta: {e}");
+                }
+                *self.word_index.write().unwrap() = Some(new_index);
+            }
+            Ok(None) => tracing::warn!("Log not found after incremental append"),
+            Err(e) => tracing::warn!("Failed to reload log: {e}"),
+        }
+
+        self.fuzzy_dirty.store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Re-extract doc_comment and signature from source if they were stripped.
@@ -1037,13 +1225,13 @@ impl Workspace {
         };
         breakdown.push(("fuzzy index", fuzzy_size));
 
-        // 4. word index directory
+        // 4. log index (in-memory postings + occurrences)
         let word_index_size = if let Ok(guard) = self.word_index.read() {
-            guard.as_ref().map(|wi| wi.word_dir().memory_usage()).unwrap_or(0)
+            guard.as_ref().map(|wi| wi.memory_usage()).unwrap_or(0)
         } else {
             0
         };
-        breakdown.push(("word index directory", word_index_size));
+        breakdown.push(("log index (postings + occs)", word_index_size));
 
         // 5. open_sources (should be 0 for scan_directory benchmarks)
         let open_sources_size: usize = self.open_sources.iter()
