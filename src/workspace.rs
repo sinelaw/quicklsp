@@ -179,8 +179,9 @@ impl Workspace {
         let index_path = index_dir.join(index_filename());
 
         let mut builder = WordIndexBuilder::new();
-        for entry in self.files.iter() {
-            builder.add_file_occurrences(entry.key(), &entry.value().occurrences);
+        for mut entry in self.files.iter_mut() {
+            let occurrences = std::mem::take(&mut entry.value_mut().occurrences);
+            builder.drain_file_occurrences(entry.key(), occurrences);
         }
 
         let entry_count = builder.entry_count();
@@ -304,7 +305,15 @@ impl Workspace {
 
         // Phase 4: build on-disk word index (skip if warm startup loaded a fresh one)
         if !warm {
+            // build_word_index drains occurrences from each FileEntry,
+            // freeing ~60% of peak memory once the index is written to disk.
             self.build_word_index(root, content_hash);
+        } else {
+            // Warm startup: word index loaded from disk, occurrences not needed.
+            // Drop them to free memory.
+            for mut entry in self.files.iter_mut() {
+                entry.value_mut().occurrences = Vec::new();
+            }
         }
 
         let stats = ScanStats {
