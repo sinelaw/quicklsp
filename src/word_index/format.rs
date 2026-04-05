@@ -243,36 +243,37 @@ impl WordIndexBuilder {
 
         let t0 = Instant::now();
 
-        // ── 1. Group entries by file (path_id) ──────────────────────────
-        let mut file_buckets: Vec<Vec<CompactEntry>> = Vec::with_capacity(path_count);
-        file_buckets.resize_with(path_count, Vec::new);
-        for entry in self.entries.drain(..) {
-            file_buckets[entry.path_id as usize].push(entry);
-        }
-        self.entries = Vec::new();
+        // ── 1. In-place sort by (path_id, word_id, line) ────────────────
+        //
+        // Instead of copying entries into per-file Vec<Vec<CompactEntry>>
+        // (which doubles peak memory), sort in-place. Contiguous slices
+        // with the same path_id are equivalent to the old per-file buckets.
+        log_rss("build: before sort");
+        self.entries.sort_unstable_by(|a, b| {
+            a.path_id.cmp(&b.path_id)
+                .then_with(|| a.word_id.cmp(&b.word_id))
+                .then_with(|| a.line.cmp(&b.line))
+        });
+        log_rss("build: after in-place sort (no extra allocation)");
 
-        // Sort each file's entries by (word_id, line).
-        for bucket in &mut file_buckets {
-            bucket.sort_unstable_by(|a, b| {
-                a.word_id.cmp(&b.word_id).then_with(|| a.line.cmp(&b.line))
-            });
-        }
+        // Build a slice index: for each path_id, (start, end) into self.entries.
+        let file_slices = build_file_slices(&self.entries, path_count);
 
         let t1 = Instant::now();
-        tracing::info!("word index build: group + sort by file: {:.2?} ({} entries, {} files)",
+        tracing::info!("word index build: in-place sort: {:.2?} ({} entries, {} files)",
             t1 - t0, total_entries, path_count);
 
         // ── 2–5. Write three files with overlapped I/O ─────────────────
         //
         // files.v2.bin write runs on a background thread while the main
-        // thread builds posting lists from the same file_buckets data.
+        // thread builds posting lists from the same sorted entries.
         // Then index.v2.bin and words.v2.bin are written concurrently.
 
         let files_path = dir.join("files.v2.bin");
         let index_path = dir.join("index.v2.bin");
         let words_path = dir.join("words.v2.bin");
 
-        // Build posting lists from file_buckets (CPU work).
+        // Build posting lists from sorted entries (CPU work).
         // Overlap with files.v2.bin disk write using thread::scope.
         let mut word_postings: Vec<Vec<u32>> = Vec::with_capacity(word_count);
         word_postings.resize_with(word_count, Vec::new);
@@ -281,16 +282,19 @@ impl WordIndexBuilder {
 
         std::thread::scope(|s| {
             // Background: write files.v2.bin
-            s.spawn(|| {
-                if let Err(e) = write_files_bin(&files_path, &file_buckets, path_count) {
-                    *files_write_err.lock().unwrap() = Some(e);
+            let entries = &self.entries;
+            let slices = &file_slices;
+            let err_slot = &files_write_err;
+            s.spawn(move || {
+                if let Err(e) = write_files_bin(&files_path, entries, slices, path_count) {
+                    *err_slot.lock().unwrap() = Some(e);
                 }
             });
 
             // Main thread: build posting lists (CPU-only)
-            for (file_id, bucket) in file_buckets.iter().enumerate() {
+            for (file_id, &(start, end)) in file_slices.iter().enumerate() {
                 let mut prev_word_id = u32::MAX;
-                for e in bucket {
+                for e in &self.entries[start..end] {
                     if e.word_id != prev_word_id {
                         word_postings[e.word_id as usize].push(file_id as u32);
                         prev_word_id = e.word_id;
@@ -302,7 +306,7 @@ impl WordIndexBuilder {
         if let Some(e) = files_write_err.into_inner().unwrap() {
             return Err(e);
         }
-        drop(file_buckets);
+        drop(self.entries);
 
         let t2 = Instant::now();
         tracing::info!("word index build: files.v2.bin + posting lists (overlapped): {:.2?}", t2 - t1);
@@ -354,9 +358,43 @@ impl Default for WordIndexBuilder {
     fn default() -> Self { Self::new() }
 }
 
+fn log_rss(label: &str) {
+    if let Ok(statm) = std::fs::read_to_string("/proc/self/statm") {
+        if let Some(rss_pages) = statm.split_whitespace().nth(1).and_then(|s| s.parse::<usize>().ok()) {
+            let rss_mb = rss_pages * 4096 / (1024 * 1024);
+            tracing::info!("RSS [{}]: {} MB", label, rss_mb);
+        }
+    }
+}
+
+/// Build a (start, end) slice index from sorted entries, one per path_id.
+fn build_file_slices(entries: &[CompactEntry], path_count: usize) -> Vec<(usize, usize)> {
+    let mut slices = vec![(0usize, 0usize); path_count];
+    if entries.is_empty() {
+        return slices;
+    }
+    let mut cur_path = entries[0].path_id as usize;
+    let mut cur_start = 0;
+    for (i, e) in entries.iter().enumerate() {
+        let pid = e.path_id as usize;
+        if pid != cur_path {
+            slices[cur_path] = (cur_start, i);
+            cur_path = pid;
+            cur_start = i;
+        }
+    }
+    slices[cur_path] = (cur_start, entries.len());
+    slices
+}
+
 // ── File writers (used from thread::scope) ────────────────────────────────
 
-fn write_files_bin(path: &Path, file_buckets: &[Vec<CompactEntry>], path_count: usize) -> io::Result<()> {
+fn write_files_bin(
+    path: &Path,
+    entries: &[CompactEntry],
+    file_slices: &[(usize, usize)],
+    path_count: usize,
+) -> io::Result<()> {
     let mut w = BufWriter::with_capacity(1 << 20, File::create(path)?);
     w.write_all(&MAGIC_FILES)?;
     w.write_all(&(path_count as u32).to_le_bytes())?;
@@ -368,7 +406,8 @@ fn write_files_bin(path: &Path, file_buckets: &[Vec<CompactEntry>], path_count: 
     w.write_all(&vec![0u8; file_table_size as usize])?;
 
     let mut occ_offset = file_table_offset + file_table_size;
-    for bucket in file_buckets {
+    for &(start, end) in file_slices {
+        let bucket = &entries[start..end];
         file_table.push((occ_offset, bucket.len() as u32));
         for e in bucket {
             w.write_all(&e.word_id.to_le_bytes())?;
