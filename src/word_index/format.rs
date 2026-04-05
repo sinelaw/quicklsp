@@ -26,6 +26,7 @@
 //! [posting data]      file_id(u32) per posting, grouped by word
 //! ```
 
+use ahash::AHashMap;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -130,9 +131,9 @@ impl WordDirectory {
 pub struct WordIndexBuilder {
     entries: Vec<CompactEntry>,
     path_table: Vec<String>,
-    path_lookup: std::collections::HashMap<String, u32>,
+    path_lookup: AHashMap<String, u32>,
     word_table: Vec<String>,
-    word_lookup: std::collections::HashMap<String, u32>,
+    word_lookup: AHashMap<String, u32>,
 }
 
 impl WordIndexBuilder {
@@ -140,9 +141,9 @@ impl WordIndexBuilder {
         Self {
             entries: Vec::new(),
             path_table: Vec::new(),
-            path_lookup: std::collections::HashMap::new(),
+            path_lookup: AHashMap::new(),
             word_table: Vec::new(),
-            word_lookup: std::collections::HashMap::new(),
+            word_lookup: AHashMap::new(),
         }
     }
 
@@ -233,8 +234,8 @@ impl WordIndexBuilder {
         use std::time::Instant;
 
         // Free lookup tables — only needed during accumulation.
-        self.word_lookup = std::collections::HashMap::new();
-        self.path_lookup = std::collections::HashMap::new();
+        self.word_lookup = AHashMap::new();
+        self.path_lookup = AHashMap::new();
 
         let total_entries = self.entries.len();
         let word_count = self.word_table.len();
@@ -261,161 +262,89 @@ impl WordIndexBuilder {
         tracing::info!("word index build: group + sort by file: {:.2?} ({} entries, {} files)",
             t1 - t0, total_entries, path_count);
 
-        // ── 2. Write files.v2.bin ───────────────────────────────────────
+        // ── 2–5. Write three files with overlapped I/O ─────────────────
+        //
+        // files.v2.bin write runs on a background thread while the main
+        // thread builds posting lists from the same file_buckets data.
+        // Then index.v2.bin and words.v2.bin are written concurrently.
+
         let files_path = dir.join("files.v2.bin");
-        {
-            let mut w = BufWriter::with_capacity(1 << 20, File::create(&files_path)?);
-            // Header
-            w.write_all(&MAGIC_FILES)?;
-            w.write_all(&(path_count as u32).to_le_bytes())?;
-            w.write_all(&0u32.to_le_bytes())?; // reserved
+        let index_path = dir.join("index.v2.bin");
+        let words_path = dir.join("words.v2.bin");
 
-            // File table placeholder — we'll fill occ_offset/occ_count as we write
-            let file_table_offset = 16u64;
-            let file_table_size = path_count as u64 * 12;
-            let mut file_table: Vec<(u64, u32)> = Vec::with_capacity(path_count);
-
-            // Skip file table area, we'll seek back
-            w.write_all(&vec![0u8; file_table_size as usize])?;
-
-            let mut occ_offset = file_table_offset + file_table_size;
-            for bucket in &file_buckets {
-                file_table.push((occ_offset, bucket.len() as u32));
-                for e in bucket {
-                    w.write_all(&e.word_id.to_le_bytes())?;
-                    w.write_all(&e.line.to_le_bytes())?;
-                    w.write_all(&e.col.to_le_bytes())?;
-                    w.write_all(&e.len.to_le_bytes())?;
-                }
-                occ_offset += (bucket.len() * OCC_SIZE) as u64;
-            }
-            w.flush()?;
-
-            // Seek back and write file table
-            let mut file = w.into_inner()?;
-            file.seek(SeekFrom::Start(file_table_offset))?;
-            let mut tw = BufWriter::new(file);
-            for &(off, cnt) in &file_table {
-                tw.write_all(&off.to_le_bytes())?;
-                tw.write_all(&cnt.to_le_bytes())?;
-            }
-            tw.flush()?;
-        }
-
-        let t2 = Instant::now();
-        tracing::info!("word index build: write files.v2.bin: {:.2?}", t2 - t1);
-
-        // ── 3. Build posting lists ──────────────────────────────────────
-        // For each word, collect the set of file_ids that contain it.
+        // Build posting lists from file_buckets (CPU work).
+        // Overlap with files.v2.bin disk write using thread::scope.
         let mut word_postings: Vec<Vec<u32>> = Vec::with_capacity(word_count);
         word_postings.resize_with(word_count, Vec::new);
-        for (file_id, bucket) in file_buckets.iter().enumerate() {
-            let mut prev_word_id = u32::MAX;
-            for e in bucket {
-                if e.word_id != prev_word_id {
-                    word_postings[e.word_id as usize].push(file_id as u32);
-                    prev_word_id = e.word_id;
+
+        let files_write_err: std::sync::Mutex<Option<io::Error>> = std::sync::Mutex::new(None);
+
+        std::thread::scope(|s| {
+            // Background: write files.v2.bin
+            s.spawn(|| {
+                if let Err(e) = write_files_bin(&files_path, &file_buckets, path_count) {
+                    *files_write_err.lock().unwrap() = Some(e);
+                }
+            });
+
+            // Main thread: build posting lists (CPU-only)
+            for (file_id, bucket) in file_buckets.iter().enumerate() {
+                let mut prev_word_id = u32::MAX;
+                for e in bucket {
+                    if e.word_id != prev_word_id {
+                        word_postings[e.word_id as usize].push(file_id as u32);
+                        prev_word_id = e.word_id;
+                    }
                 }
             }
+        });
+
+        if let Some(e) = files_write_err.into_inner().unwrap() {
+            return Err(e);
         }
-        // Free file buckets — no longer needed
         drop(file_buckets);
 
-        let t3 = Instant::now();
-        tracing::info!("word index build: build posting lists: {:.2?}", t3 - t2);
+        let t2 = Instant::now();
+        tracing::info!("word index build: files.v2.bin + posting lists (overlapped): {:.2?}", t2 - t1);
 
-        // ── 4. Write index.v2.bin ───────────────────────────────────────
-        // Sort words lexicographically and build the word directory.
+        // Sort words lexicographically for the word directory.
         let mut sorted_word_ids: Vec<u32> = (0..word_count as u32).collect();
         sorted_word_ids.sort_unstable_by(|&a, &b| {
             self.word_table[a as usize].cmp(&self.word_table[b as usize])
         });
 
-        let index_path = dir.join("index.v2.bin");
+        // Write index.v2.bin and words.v2.bin concurrently.
         let mut word_dir = WordDirectory::new();
-        {
-            let mut w = BufWriter::with_capacity(1 << 20, File::create(&index_path)?);
-            // Header
-            w.write_all(&MAGIC_INDEX)?;
-            w.write_all(&(word_count as u32).to_le_bytes())?;
-            w.write_all(&0u32.to_le_bytes())?; // reserved
+        let words_write_err: std::sync::Mutex<Option<io::Error>> = std::sync::Mutex::new(None);
 
-            // Word directory placeholder (indexed by word_id, not sorted order)
-            let dir_table_offset = 16u64;
-            let dir_table_size = word_count as u64 * 8;
-            w.write_all(&vec![0u8; dir_table_size as usize])?;
-
-            // Write posting data in sorted word order, tracking offsets per word_id
-            let mut posting_offset: u32 = 0;
-            let mut dir_by_word_id: Vec<(u32, u32)> = vec![(0, 0); word_count];
-            for &word_id in &sorted_word_ids {
-                let postings = &word_postings[word_id as usize];
-                dir_by_word_id[word_id as usize] = (posting_offset, postings.len() as u32);
-                word_dir.insert(
-                    &self.word_table[word_id as usize],
-                    posting_offset,
-                    postings.len() as u32,
-                );
-                for &file_id in postings {
-                    w.write_all(&file_id.to_le_bytes())?;
+        std::thread::scope(|s| {
+            // Background: write words.v2.bin
+            let word_table = &self.word_table;
+            let path_table = &self.path_table;
+            s.spawn(|| {
+                if let Err(e) = write_words_bin(&words_path, word_table, path_table) {
+                    *words_write_err.lock().unwrap() = Some(e);
                 }
-                posting_offset += postings.len() as u32;
-            }
-            w.flush()?;
+            });
 
-            // Seek back and write directory table (in word_id order)
-            let mut file = w.into_inner()?;
-            file.seek(SeekFrom::Start(dir_table_offset))?;
-            let mut tw = BufWriter::new(file);
-            for &(off, cnt) in &dir_by_word_id {
-                tw.write_all(&off.to_le_bytes())?;
-                tw.write_all(&cnt.to_le_bytes())?;
+            // Main thread: write index.v2.bin + build word_dir
+            let result = write_index_bin(
+                &index_path, &sorted_word_ids, &word_postings,
+                &self.word_table, &mut word_dir,
+            );
+            if let Err(e) = result {
+                tracing::warn!("Failed to write index.v2.bin: {e}");
             }
-            tw.flush()?;
+        });
+
+        if let Some(e) = words_write_err.into_inner().unwrap() {
+            return Err(e);
         }
 
-        let t4 = Instant::now();
-        tracing::info!("word index build: write index.v2.bin: {:.2?}", t4 - t3);
-
-        // ── 5. Write words.v2.bin ───────────────────────────────────────
-        let words_path = dir.join("words.v2.bin");
-        {
-            let mut w = BufWriter::with_capacity(1 << 20, File::create(&words_path)?);
-            // Header
-            w.write_all(&MAGIC_WORDS)?;
-            w.write_all(&(word_count as u32).to_le_bytes())?;
-            w.write_all(&(path_count as u32).to_le_bytes())?;
-            w.write_all(&0u64.to_le_bytes())?; // reserved
-
-            // Word offsets + data
-            let mut offset = 0u32;
-            for word in &self.word_table {
-                w.write_all(&offset.to_le_bytes())?;
-                offset += word.len() as u32;
-            }
-            w.write_all(&offset.to_le_bytes())?; // sentinel
-            for word in &self.word_table {
-                w.write_all(word.as_bytes())?;
-            }
-
-            // Path offsets + data
-            offset = 0;
-            for path in &self.path_table {
-                w.write_all(&offset.to_le_bytes())?;
-                offset += path.len() as u32;
-            }
-            w.write_all(&offset.to_le_bytes())?; // sentinel
-            for path in &self.path_table {
-                w.write_all(path.as_bytes())?;
-            }
-
-            w.flush()?;
-        }
-
-        let t5 = Instant::now();
-        tracing::info!("word index build: write words.v2.bin: {:.2?}", t5 - t4);
+        let t3 = Instant::now();
+        tracing::info!("word index build: index.v2.bin + words.v2.bin (overlapped): {:.2?}", t3 - t2);
         tracing::info!("word index build: total: {:.2?} ({} entries, {} words, {} files)",
-            t5 - t0, total_entries, word_count, path_count);
+            t3 - t0, total_entries, word_count, path_count);
 
         Ok((word_dir, self.word_table, self.path_table))
     }
@@ -423,6 +352,115 @@ impl WordIndexBuilder {
 
 impl Default for WordIndexBuilder {
     fn default() -> Self { Self::new() }
+}
+
+// ── File writers (used from thread::scope) ────────────────────────────────
+
+fn write_files_bin(path: &Path, file_buckets: &[Vec<CompactEntry>], path_count: usize) -> io::Result<()> {
+    let mut w = BufWriter::with_capacity(1 << 20, File::create(path)?);
+    w.write_all(&MAGIC_FILES)?;
+    w.write_all(&(path_count as u32).to_le_bytes())?;
+    w.write_all(&0u32.to_le_bytes())?;
+
+    let file_table_offset = 16u64;
+    let file_table_size = path_count as u64 * 12;
+    let mut file_table: Vec<(u64, u32)> = Vec::with_capacity(path_count);
+    w.write_all(&vec![0u8; file_table_size as usize])?;
+
+    let mut occ_offset = file_table_offset + file_table_size;
+    for bucket in file_buckets {
+        file_table.push((occ_offset, bucket.len() as u32));
+        for e in bucket {
+            w.write_all(&e.word_id.to_le_bytes())?;
+            w.write_all(&e.line.to_le_bytes())?;
+            w.write_all(&e.col.to_le_bytes())?;
+            w.write_all(&e.len.to_le_bytes())?;
+        }
+        occ_offset += (bucket.len() * OCC_SIZE) as u64;
+    }
+    w.flush()?;
+
+    let mut file = w.into_inner()?;
+    file.seek(SeekFrom::Start(file_table_offset))?;
+    let mut tw = BufWriter::new(file);
+    for &(off, cnt) in &file_table {
+        tw.write_all(&off.to_le_bytes())?;
+        tw.write_all(&cnt.to_le_bytes())?;
+    }
+    tw.flush()?;
+    Ok(())
+}
+
+fn write_index_bin(
+    path: &Path,
+    sorted_word_ids: &[u32],
+    word_postings: &[Vec<u32>],
+    word_table: &[String],
+    word_dir: &mut WordDirectory,
+) -> io::Result<()> {
+    let word_count = word_table.len();
+    let mut w = BufWriter::with_capacity(1 << 20, File::create(path)?);
+    w.write_all(&MAGIC_INDEX)?;
+    w.write_all(&(word_count as u32).to_le_bytes())?;
+    w.write_all(&0u32.to_le_bytes())?;
+
+    let dir_table_offset = 16u64;
+    let dir_table_size = word_count as u64 * 8;
+    w.write_all(&vec![0u8; dir_table_size as usize])?;
+
+    let mut posting_offset: u32 = 0;
+    let mut dir_by_word_id: Vec<(u32, u32)> = vec![(0, 0); word_count];
+    for &word_id in sorted_word_ids {
+        let postings = &word_postings[word_id as usize];
+        dir_by_word_id[word_id as usize] = (posting_offset, postings.len() as u32);
+        word_dir.insert(&word_table[word_id as usize], posting_offset, postings.len() as u32);
+        for &file_id in postings {
+            w.write_all(&file_id.to_le_bytes())?;
+        }
+        posting_offset += postings.len() as u32;
+    }
+    w.flush()?;
+
+    let mut file = w.into_inner()?;
+    file.seek(SeekFrom::Start(dir_table_offset))?;
+    let mut tw = BufWriter::new(file);
+    for &(off, cnt) in &dir_by_word_id {
+        tw.write_all(&off.to_le_bytes())?;
+        tw.write_all(&cnt.to_le_bytes())?;
+    }
+    tw.flush()?;
+    Ok(())
+}
+
+fn write_words_bin(path: &Path, word_table: &[String], path_table: &[String]) -> io::Result<()> {
+    let mut w = BufWriter::with_capacity(1 << 20, File::create(path)?);
+    w.write_all(&MAGIC_WORDS)?;
+    w.write_all(&(word_table.len() as u32).to_le_bytes())?;
+    w.write_all(&(path_table.len() as u32).to_le_bytes())?;
+    w.write_all(&0u64.to_le_bytes())?;
+
+    let mut offset = 0u32;
+    for word in word_table {
+        w.write_all(&offset.to_le_bytes())?;
+        offset += word.len() as u32;
+    }
+    w.write_all(&offset.to_le_bytes())?;
+    for word in word_table {
+        w.write_all(word.as_bytes())?;
+    }
+
+    offset = 0;
+    for path in path_table {
+        w.write_all(&offset.to_le_bytes())?;
+        offset += path.len() as u32;
+    }
+    w.write_all(&offset.to_le_bytes())?;
+    for path in path_table {
+        w.write_all(path.as_bytes())?;
+    }
+
+    w.flush()?;
+    Ok(())
 }
 
 // ── WordIndex ─────────────────────────────────────────────────────────────
