@@ -85,12 +85,30 @@ impl WordDirectory {
 /// Builder for constructing a word index file.
 pub struct WordIndexBuilder {
     entries: Vec<IndexEntry>,
+    /// Interned paths: map from path to index, and the reverse list.
+    path_table: Vec<PathBuf>,
+    path_lookup: std::collections::HashMap<PathBuf, u32>,
 }
 
 impl WordIndexBuilder {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
+            path_table: Vec::new(),
+            path_lookup: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Intern a path, returning a cheap-to-clone PathBuf (shared via the table).
+    fn intern_path(&mut self, path: &Path) -> PathBuf {
+        if let Some(&idx) = self.path_lookup.get(path) {
+            self.path_table[idx as usize].clone()
+        } else {
+            let idx = self.path_table.len() as u32;
+            let owned = path.to_path_buf();
+            self.path_lookup.insert(owned.clone(), idx);
+            self.path_table.push(owned.clone());
+            owned
         }
     }
 
@@ -99,16 +117,36 @@ impl WordIndexBuilder {
         self.entries.push(entry);
     }
 
-    /// Add entries from a file's occurrences.
+    /// Add entries from a file's occurrences (borrowed — clones strings).
     pub fn add_file_occurrences(
         &mut self,
         path: &Path,
         occurrences: &[crate::parsing::tokenizer::Occurrence],
     ) {
+        let interned = self.intern_path(path);
         for occ in occurrences {
             self.entries.push(IndexEntry {
                 word: occ.word.clone(),
-                path: path.to_path_buf(),
+                path: interned.clone(),
+                line: occ.line as u32,
+                col: occ.col as u32,
+                len: occ.len as u16,
+            });
+        }
+    }
+
+    /// Drain entries from a file's occurrences (takes ownership — moves strings).
+    pub fn drain_file_occurrences(
+        &mut self,
+        path: &Path,
+        occurrences: Vec<crate::parsing::tokenizer::Occurrence>,
+    ) {
+        let interned = self.intern_path(path);
+        self.entries.reserve(occurrences.len());
+        for occ in occurrences {
+            self.entries.push(IndexEntry {
+                word: occ.word, // moved, not cloned
+                path: interned.clone(),
                 line: occ.line as u32,
                 col: occ.col as u32,
                 len: occ.len as u16,
