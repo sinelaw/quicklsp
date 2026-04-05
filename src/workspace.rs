@@ -497,6 +497,13 @@ impl Workspace {
             }
         }
 
+        // Return freed memory to the OS before the large LogIndex allocation.
+        // Rayon worker threads and the writer thread accumulate freed pages in
+        // glibc's per-thread arenas that won't be returned without this.
+        #[cfg(target_os = "linux")]
+        unsafe { libc::malloc_trim(0); }
+        tracing::info!("After malloc_trim (pre-reload): {}", Self::rss_summary());
+
         // Load the written log index.
         if let Some(ref idx_dir) = index_dir {
             let tl = std::time::Instant::now();
