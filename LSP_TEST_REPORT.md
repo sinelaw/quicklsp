@@ -90,6 +90,36 @@
 | gin | 3.2 MB | < 3s | Moderate |
 | redis | 21.6 MB | ~4s | Large C codebase |
 
+### C Parsing Benchmark (quicklsp vs tree-sitter vs ctags/etags)
+
+Benchmarked on redis `server.c` (339 KB, 8181 lines). quicklsp and tree-sitter
+are in-process (no fork overhead); ctags/etags are external processes (includes
+~5.4ms fork overhead — pure parse time ~4.6ms for ctags).
+
+| Engine | Median | Throughput | Defs found |
+|---|---|---|---|
+| **quicklsp** | **1.75 ms** | **194 MB/s** | 93* |
+| ctags (universal-ctags) | 10.33 ms | 33 MB/s | 304 |
+| etags (universal-ctags) | 8.20 ms | 41 MB/s | 305 |
+| tree-sitter parse only | 34.57 ms | 9.8 MB/s | — |
+| tree-sitter parse+extract | 37.94 ms | 8.9 MB/s | 485 |
+
+*\*quicklsp finds only 93 definitions (structs/enums/typedefs) due to Bug #1 —
+C functions are not indexed. ctags finds 304, tree-sitter finds 485.*
+
+**Relative speed:** quicklsp is **~5.9x faster** than ctags, **~4.7x faster**
+than etags, and **~21.7x faster** than tree-sitter (parse+extract). Even
+after subtracting fork overhead, quicklsp's pure parse is ~2.6x faster than
+ctags' pure parse (~1.75ms vs ~4.6ms).
+
+Multi-file consistency:
+```
+file                     size    quicklsp  tree-sitter       ctags       etags
+server.c             339292B      1.82ms     34.11ms     10.50ms      7.86ms
+networking.c         232144B      1.21ms     23.48ms      8.00ms      5.58ms
+replication.c        226080B    989.36µs     20.39ms      7.20ms      4.98ms
+```
+
 ### Feature Latency
 - **Hover:** Response within 1-2 seconds across all languages. No perceptible blocking.
 - **Go to Definition:** Response within 1-3 seconds. Cross-file jumps (Python, Go) completed without delay.
