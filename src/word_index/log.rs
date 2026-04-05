@@ -1,14 +1,17 @@
-//! Append-only log-based word index.
+//! Append-only log-based word index with hash-based posting lists.
 //!
 //! Single file format (`index.log`) that supports both cold indexing (write all
 //! files sequentially) and incremental updates (append changed files). At load
-//! time, a sequential scan builds in-memory query structures.
+//! time, a sequential scan builds in-memory posting lists.
+//!
+//! Words are identified by 32-bit FNV-1a hashes — no intern table needed.
+//! Only posting lists (word_hash → [file_ids]) are kept in memory;
+//! exact positions are resolved by re-scanning source files at query time.
 //!
 //! ## Tags
 //!
-//! - `0x01` define word  — assigns word_id sequentially
 //! - `0x02` define path  — assigns path_id sequentially
-//! - `0x03` file data    — occurrences + symbols, replaces earlier entry for path_id
+//! - `0x03` file data    — word hashes + symbols, replaces earlier entry for path_id
 //! - `0x04` file removed — drops everything for path_id
 
 use ahash::AHashMap;
@@ -20,32 +23,28 @@ use std::path::{Path, PathBuf};
 use crate::parsing::symbols::{Symbol, SymbolKind};
 use crate::parsing::tokenizer::{LangFamily, Visibility};
 
-use super::format::IndexEntry;
+const LOG_MAGIC: [u8; 8] = *b"QLSL\x02\x00\x00\x00"; // v2 format
 
-const LOG_MAGIC: [u8; 8] = *b"QLSL\x01\x00\x00\x00";
-
-const TAG_WORD: u8 = 0x01;
 const TAG_PATH: u8 = 0x02;
 const TAG_FILE_DATA: u8 = 0x03;
 const TAG_FILE_REMOVED: u8 = 0x04;
 
-/// On-disk occurrence: word_id(4) + line(4) + col(4) + len(2) = 14 bytes.
-const OCC_SIZE: usize = 14;
+// ── Word hashing ───────────────────────────────────────────────────────
 
-// ── In-memory occurrence ────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Copy)]
-pub struct OccEntry {
-    pub word_id: u32,
-    pub line: u32,
-    pub col: u32,
-    pub len: u16,
+/// Deterministic 32-bit FNV-1a hash for word identification.
+pub fn word_hash(word: &str) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for &b in word.as_bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
 }
 
 // ── Per-file data loaded from the log ───────────────────────────────────
 
 pub struct FileData {
-    pub occurrences: Vec<OccEntry>,
+    pub word_hashes: Vec<u32>,
     pub symbols: Vec<Symbol>,
     pub lang: Option<LangFamily>,
     pub mtime: u64,
@@ -56,17 +55,15 @@ pub struct FileData {
 pub struct LogIndex {
     pub index_dir: PathBuf,
 
-    // String tables
-    pub word_table: Vec<String>,
-    pub word_lookup: AHashMap<String, u32>,
+    // Path tables
     pub path_table: Vec<String>,
     pub path_lookup: AHashMap<String, u32>,
 
-    // Per-file data (last TAG 0x03 per path_id wins)
+    // Per-file data (last TAG 0x03 per path_id wins) — symbols + lang for warm startup
     pub files: HashMap<u32, FileData>,
 
-    // Posting lists: word_id → [path_ids that contain it]
-    pub postings: Vec<Vec<u32>>,
+    // Posting lists: word_hash → [path_ids that contain it]
+    pub postings: AHashMap<u32, Vec<u32>>,
 }
 
 impl LogIndex {
@@ -90,12 +87,9 @@ impl LogIndex {
         let mut buf4 = [0u8; 4];
         r.read_exact(&mut buf4)?; // reserved
 
-        let mut word_table = Vec::new();
-        let mut word_lookup = AHashMap::new();
         let mut path_table = Vec::new();
         let mut path_lookup = AHashMap::new();
         let mut files: HashMap<u32, FileData> = HashMap::new();
-        let mut total_occs: usize = 0;
 
         // Read entries until EOF or truncated entry.
         loop {
@@ -107,16 +101,6 @@ impl LogIndex {
             }
 
             match tag[0] {
-                TAG_WORD => {
-                    let word = match read_word_entry(&mut r) {
-                        Ok(w) => w,
-                        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                        Err(e) => return Err(e),
-                    };
-                    let id = word_table.len() as u32;
-                    word_lookup.insert(word.clone(), id);
-                    word_table.push(word);
-                }
                 TAG_PATH => {
                     let path = match read_path_entry(&mut r) {
                         Ok(p) => p,
@@ -133,7 +117,6 @@ impl LogIndex {
                         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
                         Err(e) => return Err(e),
                     };
-                    total_occs += file_data.occurrences.len();
                     files.insert(path_id, file_data);
                 }
                 TAG_FILE_REMOVED => {
@@ -144,7 +127,6 @@ impl LogIndex {
                     }
                 }
                 _ => {
-                    // Unknown tag — likely corruption or truncation. Stop.
                     tracing::warn!("Unknown tag 0x{:02x} in index.log, stopping scan", tag[0]);
                     break;
                 }
@@ -153,35 +135,29 @@ impl LogIndex {
 
         let scan_elapsed = t0.elapsed();
         tracing::info!(
-            "LogIndex::load scan done: {} words, {} paths, {} files, {} occs, \
+            "LogIndex::load scan done: {} paths, {} files, \
              log_size={:.1} MB, {:.1}s, {}",
-            word_table.len(), path_table.len(), files.len(), total_occs,
+            path_table.len(), files.len(),
             file_size as f64 / (1024.0 * 1024.0), scan_elapsed.as_secs_f64(),
             rss_summary(),
         );
 
-        // Build posting lists from file_occs.
+        // Build posting lists from per-file word hashes.
         let tp = std::time::Instant::now();
-        let word_count = word_table.len();
-        let mut postings: Vec<Vec<u32>> = vec![Vec::new(); word_count];
+        let mut postings: AHashMap<u32, Vec<u32>> = AHashMap::new();
         for (&path_id, fd) in &files {
-            let mut prev_word_id = u32::MAX;
-            for occ in &fd.occurrences {
-                if occ.word_id != prev_word_id && (occ.word_id as usize) < word_count {
-                    postings[occ.word_id as usize].push(path_id);
-                    prev_word_id = occ.word_id;
-                }
+            for &wh in &fd.word_hashes {
+                postings.entry(wh).or_default().push(path_id);
             }
         }
+        let unique_hashes = postings.len();
         tracing::info!(
-            "LogIndex::load postings built: {} words, {:.1}s, {}",
-            word_count, tp.elapsed().as_secs_f64(), rss_summary(),
+            "LogIndex::load postings built: {} unique hashes, {:.1}s, {}",
+            unique_hashes, tp.elapsed().as_secs_f64(), rss_summary(),
         );
 
         Ok(Some(LogIndex {
             index_dir: dir.to_path_buf(),
-            word_table,
-            word_lookup,
             path_table,
             path_lookup,
             files,
@@ -189,58 +165,41 @@ impl LogIndex {
         }))
     }
 
-    /// Find all occurrences of a word.
-    pub fn find_references(&self, word: &str) -> Vec<IndexEntry> {
-        let word_id = match self.word_lookup.get(word) {
-            Some(&id) => id,
-            None => return Vec::new(),
-        };
-
-        let file_ids = match self.postings.get(word_id as usize) {
-            Some(ids) => ids,
-            None => return Vec::new(),
-        };
-
-        let mut results = Vec::new();
-        for &file_id in file_ids {
-            let fd = match self.files.get(&file_id) {
-                Some(fd) => fd,
-                None => continue,
-            };
-            let path = PathBuf::from(&self.path_table[file_id as usize]);
-
-            // Occurrences are sorted by (word_id, line). Binary search.
-            let start = fd.occurrences.partition_point(|o| o.word_id < word_id);
-            for occ in &fd.occurrences[start..] {
-                if occ.word_id != word_id {
-                    break;
-                }
-                results.push(IndexEntry {
-                    word: word.to_string(),
-                    path: path.clone(),
-                    line: occ.line,
-                    col: occ.col,
-                    len: occ.len,
-                });
+    /// Find all files containing a word (by hash).
+    pub fn find_files(&self, word: &str) -> Vec<PathBuf> {
+        let wh = word_hash(word);
+        match self.postings.get(&wh) {
+            Some(file_ids) => {
+                file_ids.iter()
+                    .filter_map(|&fid| {
+                        self.path_table.get(fid as usize)
+                            .map(|s| PathBuf::from(s))
+                    })
+                    .collect()
             }
+            None => Vec::new(),
         }
-        results
     }
 
-    pub fn word_count(&self) -> usize { self.word_table.len() }
+    pub fn unique_hash_count(&self) -> usize { self.postings.len() }
     pub fn file_count(&self) -> usize { self.files.len() }
 
-    /// Memory usage of the in-memory posting lists + word directory.
+    /// Memory usage of the in-memory posting lists.
     pub fn memory_usage(&self) -> usize {
-        let words: usize = self.word_table.iter().map(|w| w.len() + std::mem::size_of::<String>()).sum();
-        let paths: usize = self.path_table.iter().map(|p| p.len() + std::mem::size_of::<String>()).sum();
+        let paths: usize = self.path_table.iter()
+            .map(|p| p.len() + std::mem::size_of::<String>())
+            .sum();
         let postings: usize = self.postings.iter()
-            .map(|v| v.len() * 4 + std::mem::size_of::<Vec<u32>>())
+            .map(|(_, v)| std::mem::size_of::<u32>() + v.len() * 4 + std::mem::size_of::<Vec<u32>>())
             .sum();
-        let occs: usize = self.files.values()
-            .map(|fd| fd.occurrences.len() * std::mem::size_of::<OccEntry>())
+        // Per-file word_hashes kept for incremental updates
+        let file_hashes: usize = self.files.values()
+            .map(|fd| fd.word_hashes.len() * 4)
             .sum();
-        words + paths + postings + occs
+        let file_symbols: usize = self.files.values()
+            .map(|fd| fd.symbols.len() * std::mem::size_of::<Symbol>())
+            .sum();
+        paths + postings + file_hashes + file_symbols
     }
 }
 
@@ -248,8 +207,6 @@ impl LogIndex {
 
 pub struct LogWriter {
     w: BufWriter<File>,
-    word_table: Vec<String>,
-    word_lookup: AHashMap<String, u32>,
     path_table: Vec<String>,
     path_lookup: AHashMap<String, u32>,
     entry_count: usize,
@@ -264,43 +221,23 @@ impl LogWriter {
         w.write_all(&0u32.to_le_bytes())?; // reserved
         Ok(Self {
             w,
-            word_table: Vec::new(),
-            word_lookup: AHashMap::new(),
             path_table: Vec::new(),
             path_lookup: AHashMap::new(),
             entry_count: 0,
         })
     }
 
-    /// Open an existing log for appending. Seeds intern tables from a loaded LogIndex.
+    /// Open an existing log for appending. Seeds path tables from a loaded LogIndex.
     pub fn open_append(dir: &Path, index: &LogIndex) -> io::Result<Self> {
         let log_path = dir.join("index.log");
         let file = std::fs::OpenOptions::new().append(true).open(&log_path)?;
         let w = BufWriter::with_capacity(1 << 20, file);
         Ok(Self {
             w,
-            word_table: index.word_table.clone(),
-            word_lookup: index.word_lookup.clone(),
             path_table: index.path_table.clone(),
             path_lookup: index.path_lookup.clone(),
             entry_count: 0,
         })
-    }
-
-    /// Intern a word, writing TAG 0x01 if it's new. Returns word_id.
-    pub fn intern_word(&mut self, word: &str) -> io::Result<u32> {
-        if let Some(&id) = self.word_lookup.get(word) {
-            return Ok(id);
-        }
-        let id = self.word_table.len() as u32;
-        // Write TAG 0x01
-        self.w.write_all(&[TAG_WORD])?;
-        self.w.write_all(&(word.len() as u16).to_le_bytes())?;
-        self.w.write_all(word.as_bytes())?;
-
-        self.word_lookup.insert(word.to_string(), id);
-        self.word_table.push(word.to_string());
-        Ok(id)
     }
 
     /// Intern a path, writing TAG 0x02 if it's new. Returns path_id.
@@ -311,7 +248,6 @@ impl LogWriter {
         }
         let id = self.path_table.len() as u32;
         let bytes = path_str.as_bytes();
-        // Write TAG 0x02
         self.w.write_all(&[TAG_PATH])?;
         self.w.write_all(&(bytes.len() as u32).to_le_bytes())?;
         self.w.write_all(bytes)?;
@@ -322,12 +258,12 @@ impl LogWriter {
         Ok(id)
     }
 
-    /// Write a file's occurrences + symbols as TAG 0x03.
+    /// Write a file's word hashes + symbols as TAG 0x03.
     pub fn write_file_data(
         &mut self,
         path_id: u32,
         mtime: u64,
-        occurrences: &[OccEntry],
+        word_hashes: &[u32],
         symbols: &[Symbol],
         lang: Option<LangFamily>,
     ) -> io::Result<()> {
@@ -335,13 +271,10 @@ impl LogWriter {
         self.w.write_all(&path_id.to_le_bytes())?;
         self.w.write_all(&mtime.to_le_bytes())?;
 
-        // Occurrences
-        self.w.write_all(&(occurrences.len() as u32).to_le_bytes())?;
-        for occ in occurrences {
-            self.w.write_all(&occ.word_id.to_le_bytes())?;
-            self.w.write_all(&occ.line.to_le_bytes())?;
-            self.w.write_all(&occ.col.to_le_bytes())?;
-            self.w.write_all(&occ.len.to_le_bytes())?;
+        // Word hashes (sorted, unique)
+        self.w.write_all(&(word_hashes.len() as u32).to_le_bytes())?;
+        for &wh in word_hashes {
+            self.w.write_all(&wh.to_le_bytes())?;
         }
 
         // Symbols
@@ -369,7 +302,6 @@ impl LogWriter {
     }
 
     pub fn entry_count(&self) -> usize { self.entry_count }
-    pub fn word_count(&self) -> usize { self.word_table.len() }
     pub fn path_count(&self) -> usize { self.path_table.len() }
 }
 
@@ -405,11 +337,6 @@ fn read_string(r: &mut impl Read, len: usize) -> io::Result<String> {
     String::from_utf8(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-fn read_word_entry(r: &mut impl Read) -> io::Result<String> {
-    let len = read_u16(r)? as usize;
-    read_string(r, len)
-}
-
 fn read_path_entry(r: &mut impl Read) -> io::Result<String> {
     let len = read_u32(r)? as usize;
     read_string(r, len)
@@ -419,15 +346,11 @@ fn read_file_data_entry(r: &mut impl Read) -> io::Result<(u32, FileData)> {
     let path_id = read_u32(r)?;
     let mtime = read_u64(r)?;
 
-    // Occurrences
-    let occ_count = read_u32(r)? as usize;
-    let mut occurrences = Vec::with_capacity(occ_count);
-    for _ in 0..occ_count {
-        let word_id = read_u32(r)?;
-        let line = read_u32(r)?;
-        let col = read_u32(r)?;
-        let len = read_u16(r)?;
-        occurrences.push(OccEntry { word_id, line, col, len });
+    // Word hashes
+    let hash_count = read_u32(r)? as usize;
+    let mut word_hashes = Vec::with_capacity(hash_count);
+    for _ in 0..hash_count {
+        word_hashes.push(read_u32(r)?);
     }
 
     // Symbols
@@ -440,26 +363,20 @@ fn read_file_data_entry(r: &mut impl Read) -> io::Result<(u32, FileData)> {
     // Lang
     let lang = u8_to_lang(read_u8(r)?);
 
-    Ok((path_id, FileData { occurrences, symbols, lang, mtime }))
+    Ok((path_id, FileData { word_hashes, symbols, lang, mtime }))
 }
 
 // ── Symbol serialization ────────────────────────────────────────────────
 
 fn write_symbol(w: &mut impl Write, sym: &Symbol) -> io::Result<()> {
-    // name
     w.write_all(&(sym.name.len() as u16).to_le_bytes())?;
     w.write_all(sym.name.as_bytes())?;
-    // kind
     w.write_all(&[symbol_kind_to_u8(sym.kind)])?;
-    // line, col
     w.write_all(&(sym.line as u32).to_le_bytes())?;
     w.write_all(&(sym.col as u32).to_le_bytes())?;
-    // def_keyword
     w.write_all(&(sym.def_keyword.len() as u16).to_le_bytes())?;
     w.write_all(sym.def_keyword.as_bytes())?;
-    // visibility
     w.write_all(&[visibility_to_u8(sym.visibility)])?;
-    // container
     match &sym.container {
         Some(c) => {
             w.write_all(&[1u8])?;
@@ -468,7 +385,6 @@ fn write_symbol(w: &mut impl Write, sym: &Symbol) -> io::Result<()> {
         }
         None => w.write_all(&[0u8])?,
     }
-    // depth
     w.write_all(&(sym.depth as u32).to_le_bytes())?;
     Ok(())
 }
@@ -582,20 +498,18 @@ mod tests {
     fn write_and_load_log() {
         let dir = tempfile::tempdir().unwrap();
 
-        // Write a log with two files.
         {
             let mut w = LogWriter::create(dir.path()).unwrap();
-            let wid_foo = w.intern_word("foo").unwrap();
-            let wid_bar = w.intern_word("bar").unwrap();
             let pid_main = w.intern_path(Path::new("/src/main.rs")).unwrap();
             let pid_lib = w.intern_path(Path::new("/src/lib.rs")).unwrap();
 
+            let mut hashes_main = vec![word_hash("foo"), word_hash("bar")];
+            hashes_main.sort();
+            hashes_main.dedup();
+
             w.write_file_data(
                 pid_main, 1000,
-                &[
-                    OccEntry { word_id: wid_foo, line: 0, col: 3, len: 3 },
-                    OccEntry { word_id: wid_bar, line: 2, col: 0, len: 3 },
-                ],
+                &hashes_main,
                 &[Symbol {
                     name: "foo".into(), kind: SymbolKind::Function,
                     line: 0, col: 3, def_keyword: "fn".into(),
@@ -605,9 +519,10 @@ mod tests {
                 Some(LangFamily::Rust),
             ).unwrap();
 
+            let hashes_lib = vec![word_hash("foo")];
             w.write_file_data(
                 pid_lib, 1001,
-                &[OccEntry { word_id: wid_foo, line: 5, col: 10, len: 3 }],
+                &hashes_lib,
                 &[],
                 Some(LangFamily::Rust),
             ).unwrap();
@@ -615,22 +530,16 @@ mod tests {
             w.flush().unwrap();
         }
 
-        // Load and query.
         let idx = LogIndex::load(dir.path()).unwrap().unwrap();
-        assert_eq!(idx.word_count(), 2);
         assert_eq!(idx.file_count(), 2);
 
-        let refs = idx.find_references("foo");
-        assert_eq!(refs.len(), 2);
-        let paths: Vec<_> = refs.iter().map(|r| r.path.to_str().unwrap().to_string()).collect();
-        assert!(paths.contains(&"/src/main.rs".to_string()));
-        assert!(paths.contains(&"/src/lib.rs".to_string()));
+        let files = idx.find_files("foo");
+        assert_eq!(files.len(), 2);
 
-        let refs = idx.find_references("bar");
-        assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0].line, 2);
+        let files = idx.find_files("bar");
+        assert_eq!(files.len(), 1);
 
-        assert!(idx.find_references("baz").is_empty());
+        assert!(idx.find_files("baz").is_empty());
 
         // Check symbols loaded.
         let main_id = *idx.path_lookup.get("/src/main.rs").unwrap();
@@ -643,50 +552,34 @@ mod tests {
     fn incremental_append() {
         let dir = tempfile::tempdir().unwrap();
 
-        // Cold index.
         {
             let mut w = LogWriter::create(dir.path()).unwrap();
-            let wid = w.intern_word("alpha").unwrap();
             let pid = w.intern_path(Path::new("/a.rs")).unwrap();
             w.write_file_data(
                 pid, 100,
-                &[OccEntry { word_id: wid, line: 1, col: 0, len: 5 }],
+                &[word_hash("alpha")],
                 &[], None,
             ).unwrap();
             w.flush().unwrap();
         }
 
         let idx = LogIndex::load(dir.path()).unwrap().unwrap();
-        assert_eq!(idx.find_references("alpha").len(), 1);
-        assert_eq!(idx.find_references("alpha")[0].line, 1);
+        assert_eq!(idx.find_files("alpha").len(), 1);
 
-        // Incremental: modify /a.rs (line changes from 1 to 42).
+        // Incremental: modify /a.rs, add beta.
         {
             let mut w = LogWriter::open_append(dir.path(), &idx).unwrap();
-            let wid = w.intern_word("alpha").unwrap(); // already exists
-            let wid2 = w.intern_word("beta").unwrap(); // new word
-            let pid = w.intern_path(Path::new("/a.rs")).unwrap(); // already exists
-            w.write_file_data(
-                pid, 200,
-                &[
-                    OccEntry { word_id: wid, line: 42, col: 0, len: 5 },
-                    OccEntry { word_id: wid2, line: 43, col: 0, len: 4 },
-                ],
-                &[], None,
-            ).unwrap();
+            let pid = w.intern_path(Path::new("/a.rs")).unwrap();
+            let mut hashes = vec![word_hash("alpha"), word_hash("beta")];
+            hashes.sort();
+            hashes.dedup();
+            w.write_file_data(pid, 200, &hashes, &[], None).unwrap();
             w.flush().unwrap();
         }
 
-        // Reload — should see updated data.
         let idx2 = LogIndex::load(dir.path()).unwrap().unwrap();
-        assert_eq!(idx2.word_count(), 2); // alpha, beta
-        let refs = idx2.find_references("alpha");
-        assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0].line, 42); // updated!
-
-        let refs = idx2.find_references("beta");
-        assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0].line, 43);
+        assert_eq!(idx2.find_files("alpha").len(), 1);
+        assert_eq!(idx2.find_files("beta").len(), 1);
     }
 
     #[test]
@@ -695,16 +588,14 @@ mod tests {
 
         {
             let mut w = LogWriter::create(dir.path()).unwrap();
-            let wid = w.intern_word("x").unwrap();
             let pid = w.intern_path(Path::new("/a.rs")).unwrap();
-            w.write_file_data(pid, 100, &[OccEntry { word_id: wid, line: 1, col: 0, len: 1 }], &[], None).unwrap();
+            w.write_file_data(pid, 100, &[word_hash("x")], &[], None).unwrap();
             w.flush().unwrap();
         }
 
         let idx = LogIndex::load(dir.path()).unwrap().unwrap();
-        assert_eq!(idx.find_references("x").len(), 1);
+        assert_eq!(idx.find_files("x").len(), 1);
 
-        // Remove the file.
         {
             let mut w = LogWriter::open_append(dir.path(), &idx).unwrap();
             w.write_file_removed(0).unwrap();
@@ -712,7 +603,7 @@ mod tests {
         }
 
         let idx2 = LogIndex::load(dir.path()).unwrap().unwrap();
-        assert!(idx2.find_references("x").is_empty());
+        assert!(idx2.find_files("x").is_empty());
         assert_eq!(idx2.file_count(), 0);
     }
 
@@ -724,8 +615,15 @@ mod tests {
             w.flush().unwrap();
         }
         let idx = LogIndex::load(dir.path()).unwrap().unwrap();
-        assert_eq!(idx.word_count(), 0);
         assert_eq!(idx.file_count(), 0);
-        assert!(idx.find_references("anything").is_empty());
+        assert!(idx.find_files("anything").is_empty());
+    }
+
+    #[test]
+    fn hash_determinism() {
+        // Same word always produces same hash
+        assert_eq!(word_hash("mutex_lock"), word_hash("mutex_lock"));
+        // Different words produce different hashes (not guaranteed but should hold for these)
+        assert_ne!(word_hash("foo"), word_hash("bar"));
     }
 }

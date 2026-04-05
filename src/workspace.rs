@@ -26,7 +26,7 @@ use crate::parsing::symbols::Symbol;
 use crate::parsing::tokenizer::{self, LangFamily};
 use crate::parsing::tree_sitter_parse::{self, TsParser};
 use crate::word_index::{
-    IndexMeta, LogIndex, LogWriter, OccEntry,
+    IndexMeta, LogIndex, LogWriter, word_hash,
     collect_file_mtimes, index_dir_for_project,
 };
 
@@ -72,8 +72,7 @@ struct FileEntry {
 /// Contains everything needed to write one file's data to the log.
 struct LogWriteMsg {
     path: PathBuf,
-    source: String,
-    occurrences: Vec<crate::parsing::tokenizer::Occurrence>,
+    word_hashes: Vec<u32>,
     symbols: Vec<Symbol>,
     lang: Option<LangFamily>,
     mtime: u64,
@@ -168,15 +167,15 @@ impl Workspace {
     }
 
     /// Core indexing: tokenize, extract symbols, update definition index.
-    /// Parse a file and update symbols + definitions. Returns raw occurrences
-    /// for the caller to handle (e.g. send through a channel for log writing).
+    /// Parse a file and update symbols + definitions. Returns unique sorted
+    /// word hashes for the caller to send to the log writer.
     /// Source text is NOT stored in FileEntry — only open_sources holds it.
     fn index_file_core(
         &self,
         path: PathBuf,
         source: &str,
         update_fuzzy: bool,
-    ) -> Vec<crate::parsing::tokenizer::Occurrence> {
+    ) -> Vec<u32> {
         let lang = path
             .extension()
             .and_then(|e| e.to_str())
@@ -198,6 +197,17 @@ impl Workspace {
             }
             None => (Vec::new(), Vec::new()),
         };
+
+        // Compute unique word hashes from occurrences while we have the source.
+        let mut hashes: Vec<u32> = occurrences.iter()
+            .map(|occ| {
+                let word = &source[occ.word_offset as usize
+                    ..(occ.word_offset as usize + occ.word_len as usize)];
+                word_hash(word)
+            })
+            .collect();
+        hashes.sort_unstable();
+        hashes.dedup();
 
         // Remove old definitions for this file before inserting new ones
         self.remove_definitions_for_file(&path);
@@ -221,7 +231,7 @@ impl Workspace {
         }
 
         self.files.insert(path, FileEntry { symbols, lang });
-        occurrences
+        hashes
     }
 
     /// Rebuild the fuzzy index from all currently indexed symbols if it's dirty.
@@ -285,8 +295,8 @@ impl Workspace {
 
         if changed.is_empty() {
             tracing::info!(
-                "Warm startup: loaded {} words, {} files, {} definitions from {}",
-                index.word_count(), index.file_count(),
+                "Warm startup: loaded {} hashes, {} files, {} definitions from {}",
+                index.unique_hash_count(), index.file_count(),
                 self.definitions.len(), index_dir.display(),
             );
             *self.word_index.write().unwrap() = Some(index);
@@ -401,37 +411,18 @@ impl Workspace {
                 let t0 = std::time::Instant::now();
                 let mut w = LogWriter::create(&idx_dir)?;
                 let mut files_written = 0usize;
-                let mut total_occs = 0usize;
+                let mut total_hashes = 0usize;
 
                 for msg in rx {
                     let path_id = w.intern_path(&msg.path)?;
-
-                    // Resolve raw occurrences → OccEntry while we have the source.
-                    let mut occ_entries = Vec::with_capacity(msg.occurrences.len());
-                    for occ in &msg.occurrences {
-                        let word = &msg.source[occ.word_offset as usize
-                            ..(occ.word_offset as usize + occ.word_len as usize)];
-                        let word_id = w.intern_word(word)?;
-                        occ_entries.push(OccEntry {
-                            word_id,
-                            line: occ.line as u32,
-                            col: occ.col as u32,
-                            len: occ.word_len,
-                        });
-                    }
-                    occ_entries.sort_unstable_by(|a, b| {
-                        a.word_id.cmp(&b.word_id).then_with(|| a.line.cmp(&b.line))
-                    });
-
-                    total_occs += occ_entries.len();
-                    w.write_file_data(path_id, msg.mtime, &occ_entries, &msg.symbols, msg.lang)?;
-                    // msg (source + occurrences) dropped here — memory freed immediately.
+                    total_hashes += msg.word_hashes.len();
+                    w.write_file_data(path_id, msg.mtime, &msg.word_hashes, &msg.symbols, msg.lang)?;
 
                     files_written += 1;
                     if files_written % 10000 == 0 {
                         tracing::info!(
-                            "log writer progress: {}/{} files, {} occs, {:.1}s, {}",
-                            files_written, "?", total_occs, t0.elapsed().as_secs_f64(),
+                            "log writer progress: {}/{} files, {} hashes, {:.1}s, {}",
+                            files_written, "?", total_hashes, t0.elapsed().as_secs_f64(),
                             rss_summary(),
                         );
                     }
@@ -439,8 +430,8 @@ impl Workspace {
 
                 w.flush()?;
                 tracing::info!(
-                    "log writer done: {} files, {} occs, {} words, {:.1}s, {}",
-                    files_written, total_occs, w.word_count(), t0.elapsed().as_secs_f64(),
+                    "log writer done: {} files, {} hashes, {:.1}s, {}",
+                    files_written, total_hashes, t0.elapsed().as_secs_f64(),
                     rss_summary(),
                 );
                 Ok(())
@@ -461,7 +452,7 @@ impl Workspace {
             for path in chunk {
                 match std::fs::read_to_string(path) {
                     Ok(source) => {
-                        let occurrences = self.index_file_core(path.clone(), &source, false);
+                        let word_hashes = self.index_file_core(path.clone(), &source, false);
                         let lang = path.extension()
                             .and_then(|e| e.to_str())
                             .and_then(LangFamily::from_extension);
@@ -470,8 +461,7 @@ impl Workspace {
                         // Send to writer. If writer died, just drop silently.
                         let _ = tx.send(LogWriteMsg {
                             path: path.clone(),
-                            source,
-                            occurrences,
+                            word_hashes,
                             symbols: self.files.get(path).map(|e| e.symbols.clone()).unwrap_or_default(),
                             lang,
                             mtime,
@@ -513,7 +503,7 @@ impl Workspace {
                         version: crate::word_index::persistence::CURRENT_VERSION,
                         file_count: index.file_count() as u64,
                         entry_count: 0,
-                        word_count: index.word_count() as u64,
+                        word_count: index.unique_hash_count() as u64,
                         built_at: std::time::SystemTime::now()
                             .duration_since(std::time::SystemTime::UNIX_EPOCH)
                             .map(|d| d.as_secs()).unwrap_or(0),
@@ -523,8 +513,8 @@ impl Workspace {
                         tracing::warn!("Failed to save index metadata: {e}");
                     }
                     tracing::info!(
-                        "Log index loaded: {} files, {} words, {:.1}s, {}",
-                        index.file_count(), index.word_count(),
+                        "Log index loaded: {} files, {} hashes, {:.1}s, {}",
+                        index.file_count(), index.unique_hash_count(),
                         tl.elapsed().as_secs_f64(), Self::rss_summary(),
                     );
                     *self.word_index.write().unwrap() = Some(index);
@@ -778,30 +768,25 @@ impl Workspace {
     /// If an on-disk word index is available, uses seek-based lookup (O(1) I/O).
     /// Otherwise falls back to word-boundary text search across all files.
     pub fn find_references(&self, name: &str) -> Vec<Reference> {
-        // Try the log-based word index first
-        if let Ok(guard) = self.word_index.read() {
-            if let Some(ref index) = *guard {
-                let entries = index.find_references(name);
-                if !entries.is_empty() {
-                    return entries
-                        .into_iter()
-                        .map(|e| Reference {
-                            file: e.path,
-                            line: e.line as usize,
-                            col: e.col as usize,
-                            len: e.len as usize,
-                        })
-                        .collect();
-                }
-            }
-        }
+        // Use the log-based word index to narrow down to candidate files,
+        // then re-scan those files for exact positions.
+        let candidate_files: Option<Vec<PathBuf>> = if let Ok(guard) = self.word_index.read() {
+            guard.as_ref().map(|index| index.find_files(name))
+        } else {
+            None
+        };
 
-        // Fallback: full text search (reads source from open_sources or disk)
-        self.files
-            .iter()
-            .par_bridge()
-            .flat_map_iter(|entry| {
-                let path = entry.key().clone();
+        let files_to_scan: Vec<PathBuf> = match candidate_files {
+            Some(files) if !files.is_empty() => files,
+            _ => {
+                // No index or no hits — fall back to scanning all files.
+                self.files.iter().map(|e| e.key().clone()).collect()
+            }
+        };
+
+        files_to_scan
+            .into_iter()
+            .flat_map(|path| {
                 let source = self.open_sources.get(&path)
                     .map(|s| s.clone())
                     .or_else(|| std::fs::read_to_string(&path).ok());
@@ -976,8 +961,8 @@ impl Workspace {
                 Err(_) => continue,
             };
 
-            // Re-parse for symbols, get raw occurrences.
-            let raw_occs = self.index_file_core(path.clone(), &source, false);
+            // Re-parse for symbols, get word hashes.
+            let word_hashes = self.index_file_core(path.clone(), &source, false);
 
             let path_id = match w.intern_path(path) {
                 Ok(id) => id,
@@ -985,32 +970,12 @@ impl Workspace {
             };
             let mtime = mtime_map.get(&path.to_string_lossy().into_owned()).copied().unwrap_or(0);
 
-            // Resolve raw occurrences → OccEntry using LogWriter's intern table.
-            let mut occ_entries = Vec::with_capacity(raw_occs.len());
-            for occ in &raw_occs {
-                let word = &source[occ.word_offset as usize
-                    ..(occ.word_offset as usize + occ.word_len as usize)];
-                let word_id = match w.intern_word(word) {
-                    Ok(id) => id,
-                    Err(e) => { tracing::warn!("intern_word failed: {e}"); continue; }
-                };
-                occ_entries.push(OccEntry {
-                    word_id,
-                    line: occ.line as u32,
-                    col: occ.col as u32,
-                    len: occ.word_len,
-                });
-            }
-            occ_entries.sort_unstable_by(|a, b| {
-                a.word_id.cmp(&b.word_id).then_with(|| a.line.cmp(&b.line))
-            });
-
             let (symbols, lang) = match self.files.get(path) {
                 Some(entry) => (entry.symbols.clone(), entry.lang),
                 None => continue,
             };
 
-            if let Err(e) = w.write_file_data(path_id, mtime, &occ_entries, &symbols, lang) {
+            if let Err(e) = w.write_file_data(path_id, mtime, &word_hashes, &symbols, lang) {
                 tracing::warn!("Failed to write file data: {e}");
             }
             appended += 1;
@@ -1032,7 +997,7 @@ impl Workspace {
                     version: crate::word_index::persistence::CURRENT_VERSION,
                     file_count: new_index.file_count() as u64,
                     entry_count: 0,
-                    word_count: new_index.word_count() as u64,
+                    word_count: new_index.unique_hash_count() as u64,
                     built_at: std::time::SystemTime::now()
                         .duration_since(std::time::SystemTime::UNIX_EPOCH)
                         .map(|d| d.as_secs()).unwrap_or(0),
@@ -1222,7 +1187,7 @@ impl Workspace {
         } else {
             0
         };
-        breakdown.push(("log index (postings + occs)", word_index_size));
+        breakdown.push(("log index (postings)", word_index_size));
 
         // 5. open_sources (should be 0 for scan_directory benchmarks)
         let open_sources_size: usize = self.open_sources.iter()

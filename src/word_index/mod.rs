@@ -7,5 +7,5 @@ pub mod log;
 pub mod persistence;
 
 pub use format::IndexEntry;
-pub use log::{LogIndex, LogWriter, OccEntry, FileData};
+pub use log::{LogIndex, LogWriter, FileData, word_hash};
 pub use persistence::{IndexMeta, collect_file_mtimes, index_dir_for_project};

@@ -14,6 +14,7 @@
 //! The binary is intentionally minimal so flamegraphs show real bottlenecks,
 //! not benchmark scaffolding.
 
+
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
