@@ -437,6 +437,168 @@ fn test_find_references_after_indexing() {
     server.shutdown();
 }
 
+/// Open a fixture file via textDocument/didOpen.
+fn open_fixture(server: &mut LspServer, filename: &str) -> (String, String) {
+    let file_path = fixtures_dir().join(filename);
+    let source = std::fs::read_to_string(&file_path).unwrap();
+    let file_uri = format!("file://{}", file_path.display());
+
+    server.send(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+            "textDocument": {
+                "uri": file_uri,
+                "languageId": "rust",
+                "version": 1,
+                "text": source
+            }
+        }
+    }));
+
+    (file_uri, source)
+}
+
+#[test]
+fn test_document_symbols() {
+    let mut server = LspServer::spawn();
+    server.initialize(&fixtures_dir());
+    drain_until_progress_end(&mut server);
+
+    let (file_uri, _source) = open_fixture(&mut server, "sample_rust.rs");
+
+    server.send(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 30,
+        "method": "textDocument/documentSymbol",
+        "params": {
+            "textDocument": { "uri": file_uri }
+        }
+    }));
+
+    let response = server.wait_for(Duration::from_secs(5), |msg| {
+        msg.get("id").and_then(|v| v.as_u64()) == Some(30)
+    }).expect("Should receive documentSymbol response");
+
+    let result = response["result"].as_array().expect("result should be array");
+    assert!(!result.is_empty(), "Should find symbols in sample_rust.rs");
+
+    // Verify we find expected symbols
+    let names: Vec<&str> = result.iter()
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+    assert!(names.contains(&"Config"), "Should find struct Config, got: {names:?}");
+    assert!(names.contains(&"Server"), "Should find struct Server, got: {names:?}");
+    assert!(names.contains(&"process_request"), "Should find fn process_request, got: {names:?}");
+
+    server.shutdown();
+}
+
+#[test]
+fn test_workspace_symbol_search() {
+    let mut server = LspServer::spawn();
+    server.initialize(&fixtures_dir());
+    drain_until_progress_end(&mut server);
+
+    server.send(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 40,
+        "method": "workspace/symbol",
+        "params": {
+            "query": "Config"
+        }
+    }));
+
+    let response = server.wait_for(Duration::from_secs(5), |msg| {
+        msg.get("id").and_then(|v| v.as_u64()) == Some(40)
+    }).expect("Should receive workspace/symbol response");
+
+    let result = response["result"].as_array().expect("result should be array");
+    assert!(!result.is_empty(), "Should find symbols matching 'Config'");
+
+    let names: Vec<&str> = result.iter()
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+    assert!(names.contains(&"Config"), "Should find Config in results, got: {names:?}");
+
+    server.shutdown();
+}
+
+#[test]
+fn test_completion() {
+    let mut server = LspServer::spawn();
+    server.initialize(&fixtures_dir());
+    drain_until_progress_end(&mut server);
+
+    let (file_uri, source) = open_fixture(&mut server, "sample_rust.rs");
+
+    // Find a line where we can complete — after "process_" should suggest "process_request"
+    let line = source.lines().enumerate()
+        .find(|(_, l)| l.contains("fn process_request"))
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+
+    // Request completion at "process_" prefix position
+    server.send(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 50,
+        "method": "textDocument/completion",
+        "params": {
+            "textDocument": { "uri": file_uri },
+            "position": { "line": line, "character": 12 }
+        }
+    }));
+
+    let response = server.wait_for(Duration::from_secs(5), |msg| {
+        msg.get("id").and_then(|v| v.as_u64()) == Some(50)
+    }).expect("Should receive completion response");
+
+    // Should have a result (array or CompletionList)
+    assert!(
+        response.get("result").is_some(),
+        "Completion should return a result, got: {response}"
+    );
+
+    server.shutdown();
+}
+
+#[test]
+fn test_hover() {
+    let mut server = LspServer::spawn();
+    server.initialize(&fixtures_dir());
+    drain_until_progress_end(&mut server);
+
+    let (file_uri, source) = open_fixture(&mut server, "sample_rust.rs");
+
+    // Hover over "Config" on the struct definition line
+    let line = source.lines().enumerate()
+        .find(|(_, l)| l.contains("struct Config"))
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+
+    server.send(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 60,
+        "method": "textDocument/hover",
+        "params": {
+            "textDocument": { "uri": file_uri },
+            "position": { "line": line, "character": 10 }
+        }
+    }));
+
+    let response = server.wait_for(Duration::from_secs(5), |msg| {
+        msg.get("id").and_then(|v| v.as_u64()) == Some(60)
+    }).expect("Should receive hover response");
+
+    // Should have a result (may be null if no hover info, but no error)
+    assert!(
+        !response.get("error").is_some(),
+        "Hover should not return an error, got: {response}"
+    );
+
+    server.shutdown();
+}
+
 /// Drain messages until we see a progress End, or timeout.
 /// Also responds to workDoneProgress/create requests.
 fn drain_until_progress_end(server: &mut LspServer) {
