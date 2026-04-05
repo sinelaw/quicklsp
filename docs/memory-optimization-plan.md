@@ -243,178 +243,277 @@ proportional to chunk size (configurable).
 
 ### Problem
 
-When any file changes, the entire word index is rebuilt from scratch.
-All 6030 files are re-read, re-tokenized, and re-merged — even if only
-one file changed. On our test corpus this takes 2.3s. On the full Linux
-kernel it would take much longer.
+When any file changes, the entire word index is rebuilt from scratch:
+every file is re-read, re-tokenized, all entries are re-sorted, and all
+three output files are rewritten. The cost is O(total entries) —
+proportional to the entire codebase, not the change.
 
-The symbol cache (symbols.bin) already avoids re-extracting definitions
-for unchanged files. But the word index rebuild re-tokenizes every file
-because it needs occurrences (word_id, line, col, len) from every file
-to produce the three output files.
+At 100K files with ~30 entries per file = ~3M entries, the merge+write
+alone is significant. At Linux kernel scale (65K files, 47M entries),
+it dominates. The goal: updating 1 file should cost O(entries in that
+file), not O(entries in all files).
 
-### Key insight: files.v2.bin is already seekable per-file
+### Why the naive "read unchanged from disk" approach isn't enough
 
-The existing on-disk format stores occurrences grouped by file_id with
-a file table for random access:
+A naive fix (read unchanged files' occurrences from old files.v2.bin
+instead of re-tokenizing) still requires:
+
+- Reading all ~3M unchanged entries from disk (42 MB at 14 bytes each)
+- Feeding them all through the builder
+- K-way merge sorting all entries
+- Rewriting all three output files from scratch
+
+This is faster than re-tokenizing (no CPU for parsing) but still
+O(total entries) in I/O and merge time. For a 100K-file codebase
+that's still seconds of wall time to rewrite hundreds of MB.
+
+### Design: overlay-based incremental updates
+
+Instead of rewriting the base index on every change, maintain a small
+**overlay** that records deltas. Queries merge base + overlay at read
+time. Periodically compact the overlay into the base.
+
+This is the same principle as LSM-trees (LevelDB, RocksDB, Lucene).
+
+#### On-disk layout
 
 ```
-file_table[file_id] = (occ_offset: u64, occ_count: u32)
+~/.cache/quicklsp/<project>/
+  words.v2.bin      ← base string tables (word_id → word, path_id → path)
+  files.v2.bin      ← base per-file occurrences
+  index.v2.bin      ← base posting lists
+  meta.json          ← base metadata + per-file mtimes
+  symbols.bin        ← base symbol cache
+
+  overlay.bin        ← NEW: incremental delta
+  overlay_meta.json  ← NEW: overlay metadata
 ```
 
-We can read back any unchanged file's occurrences by seeking to
-`occ_offset` and reading `occ_count × 14` bytes. No source text or
-tokenization needed. The `find_references()` query path already does
-exactly this.
+#### overlay.bin format
 
-### Approach
+```
+[header: 16 bytes]
+  magic(8)
+  overlay_count(u32)    — number of file patches in this overlay
+  new_word_count(u32)   — number of words added beyond base word table
 
-When the PartiallyStale path detects N changed files out of F total:
+[new words section]
+  new_word_count × (len: u16, word_bytes)
+  — words with IDs = base_word_count + 0, +1, +2, ...
 
-#### Phase A: Read unchanged occurrences from disk
+[new paths section]
+  new_path_count(u32)
+  new_path_count × (len: u32, path_bytes)
+  — paths with IDs = base_path_count + 0, +1, +2, ...
 
-For each unchanged file_id:
-1. Look up `(occ_offset, occ_count)` from the old file table
-   (already in memory as `WordIndex.file_table`).
-2. Seek into old `files.v2.bin`, read `occ_count × 14` bytes.
-3. Parse into CompactEntry values using the existing word_id/path_id
-   namespace (word and path tables from the old index).
-4. Feed these entries into the builder as a sorted chunk (they're
-   already sorted by (word_id, line) within each file).
+[file patches]
+  overlay_count × file_patch:
+    path_id(u32)
+    action(u8)           — 0 = removed, 1 = replaced
+    if replaced:
+      occ_count(u32)
+      occ_count × (word_id(u32) + line(u32) + col(u32) + len(u16))
+      — sorted by (word_id, line), same format as files.v2.bin
+```
 
-This is O(unchanged_entries) in I/O but zero CPU for tokenization.
+When a file is modified: its old data in the base is logically
+invalidated, and the overlay contains the new occurrences. When a
+file is deleted: the overlay records action=removed. When a file is
+added: the overlay assigns a new path_id and records its occurrences.
 
-#### Phase B: Re-tokenize changed files
+#### overlay_meta.json
 
-For each changed file:
-1. Read source from disk.
-2. Tokenize to get occurrences.
-3. Intern words — some may be new (not in old word table), some
-   existing. The builder's intern tables handle this naturally.
-4. Intern path — may be a new file (new path_id) or existing.
-5. Feed entries into the builder.
+```json
+{
+  "base_version": 2,
+  "overlay_count": 3,
+  "patched_files": { "src/foo.c": 1234567890 },
+  "removed_files": ["src/old.c"],
+  "new_files": { "src/new.c": 1234567891 }
+}
+```
 
-For removed files: skip them (don't read from old files.v2.bin,
-don't tokenize).
+Merged with the base meta.json to get the full current mtime map.
 
-For added files: tokenize them (they won't be in old files.v2.bin).
+#### Query path: merge base + overlay
 
-#### Phase C: Build new word index
+**find_references(word):**
 
-The builder now has entries from both sources (disk + fresh tokenize).
-Proceed with the normal build path: flush to disk, k-way merge,
-write new files.v2.bin + index.v2.bin + words.v2.bin.
+1. Look up `word` in base `word_dir` → `(posting_offset, posting_count)`.
+   Also check if word is in the overlay's new words (linear scan or
+   small hash — overlay is tiny).
 
-#### Handling word_id / path_id identity
+2. Read base posting list: file_ids that contain this word.
 
-The old word index has a word_table and path_table baked into
-words.v2.bin. When reading unchanged occurrences, the word_ids
-refer to this old table. The new builder has its own intern tables.
+3. Filter out file_ids that are patched or removed in the overlay.
 
-Two options:
+4. For surviving base file_ids: read occurrences from base
+   `files.v2.bin` (existing code path, unchanged).
 
-**Option A: Seed builder with old tables.**
+5. For patched file_ids: read occurrences from `overlay.bin` instead.
 
-Before processing any files, seed the builder's intern tables with
-the old word_table and path_table (loaded from words.v2.bin during
-warm startup — already in `WordIndex.word_table` / `path_table`).
-This ensures old word_ids and path_ids are valid in the new builder.
-New words from changed files get new IDs appended to the end.
+6. For new file_ids (added files in overlay): scan their overlay
+   occurrences for the word.
 
-This is the simplest approach. The builder's `intern_word` /
-`intern_path` already deduplicate, so seeding just pre-fills the
-tables. Old CompactEntry values can be fed directly without
-re-interning.
+7. Merge results.
 
-**Option B: Remap IDs.**
+Cost: O(base postings for word + overlay size). The overlay is small
+(only changed files), so this adds negligible overhead to queries.
 
-Build fresh intern tables and remap old entries' word_id/path_id
-to new IDs. More complex, no benefit.
+**Per-file occurrences (for files.v2.bin reads):**
 
-**Verdict: Option A.** Seed the builder from the old index.
+- If file_id is NOT in overlay → read from base files.v2.bin (unchanged)
+- If file_id IS in overlay → read from overlay.bin
+- This is a simple branch before the existing seek+read logic.
 
-### What changes
+#### Update path: O(changed file's entries)
 
-1. **New method: `WordIndexBuilder::seed_from_index(word_table, path_table)`**
-   — Pre-fills intern tables so old IDs remain valid.
+When a file changes:
 
-2. **New method: `WordIndexBuilder::ingest_unchanged_file(file_id, occurrences)`**
-   — Accepts pre-parsed occurrences from disk (already has valid IDs).
+1. **Tokenize** the changed file → occurrences.
 
-3. **New function: `read_file_occurrences(files_bin_path, file_table, file_id) → Vec<CompactEntry>`**
-   — Reads one file's occurrences from files.v2.bin using the seekable
-   file table.
+2. **Intern new words**: Check each word against the base word table
+   (loaded in memory). Words not found get new IDs appended to the
+   overlay's new words section. The base word table is read-only.
 
-4. **PartiallyStale path in `scan_directory`:**
-   ```
-   // 1. Seed builder from old index
-   builder.seed_from_index(&old_word_table, &old_path_table);
+3. **Write file patch** to overlay.bin: the file's path_id + new
+   occurrences.
 
-   // 2. Read unchanged files' occurrences from disk
-   for file_id in 0..old_file_count {
-       let path = &old_path_table[file_id];
-       if !changed_set.contains(path) {
-           let occs = read_file_occurrences(&files_bin, &file_table, file_id);
-           builder.ingest_unchanged_file(file_id, occs);
-       }
-   }
+4. **Update overlay_meta.json**: record the file's new mtime.
 
-   // 3. Re-tokenize changed files only
-   for path in &changed_files {
-       let source = read_to_string(path)?;
-       index_file_core(path, &source, false);  // updates symbols
-       let occs = take(&mut files[path].occurrences);
-       builder.drain_file_occurrences(path, occs, &source);
-   }
+5. **Update symbols.bin**: re-save symbols for this file.
 
-   // 4. Build new index (same as cold path)
-   builder.flush_to_disk()?;
-   finish_word_index(root, &file_mtimes, builder);
-   ```
+6. **Rebuild in-memory overlay index**: a small in-memory structure
+   mapping path_id → overlay offset, and a set of invalidated
+   file_ids. This is O(overlay file count), not O(total files).
 
-5. **`scan_directory` no longer calls par_chunks for PartiallyStale.**
-   The reading-from-disk loop replaces the parallel tokenize loop for
-   unchanged files. Only changed files are read + tokenized.
+Cost: O(entries in changed file). No reading or writing of unchanged
+files. No merge. No rewrite of base index.
 
-### Expected performance
+#### Compaction: amortized O(total)
 
-If 1 file out of 6030 changes:
-- Read ~1.7M occurrences from files.v2.bin: sequential I/O, ~33 MB
-  at 14 bytes/entry. On SSD: ~50ms. On warm OS page cache: ~10ms.
-- Tokenize 1 file: <1ms.
-- Build new word index from seeded builder: ~150ms (same as cold).
-- **Total: ~200ms** vs current 2.3s for the full re-tokenize.
+When the overlay grows beyond a threshold (e.g., >5% of base size
+or >1000 patched files), compact by merging overlay into base:
 
-If 100 files change: ~200ms + ~50ms tokenize = ~250ms.
+1. Read base files.v2.bin + overlay patches.
+2. Build merged word/path tables (base + overlay new words/paths).
+3. Write new files.v2.bin, index.v2.bin, words.v2.bin.
+4. Delete overlay.bin and overlay_meta.json.
 
-The dominant cost is always the k-way merge + write, which is O(total
-entries) regardless. Reading unchanged occurrences from disk is much
-faster than reading + tokenizing source files.
+This is the current full rebuild, but it happens infrequently.
+Amortized cost per update: O(1) average, O(total) worst case.
+
+#### In-memory structures
+
+After loading base + overlay:
+
+```
+WordIndex {
+    // Base index (existing)
+    index_dir: PathBuf,
+    word_dir: WordDirectory,        // base word directory
+    file_table: Vec<(u64, u32)>,    // base file table
+    path_table: Vec<String>,
+    word_table: Vec<String>,
+
+    // Overlay (new)
+    overlay: Option<Overlay>,
+}
+
+Overlay {
+    patched_files: HashMap<u32, OverlayFile>,  // path_id → new occs
+    removed_files: HashSet<u32>,                // invalidated path_ids
+    new_words: Vec<String>,                     // IDs = base_word_count + i
+    new_paths: Vec<String>,                     // IDs = base_path_count + i
+    // Reverse posting index for overlay entries (small)
+    word_to_files: HashMap<u32, Vec<u32>>,      // word_id → [path_id]
+}
+
+OverlayFile {
+    occurrences: Vec<(u32, u32, u32, u16)>,  // (word_id, line, col, len)
+}
+```
+
+Memory for the overlay: proportional to the number of changed files ×
+their avg occurrences. For 10 changed files × 500 entries: ~100 KB.
+Negligible.
+
+### What stays the same
+
+- Cold index path: unchanged. Builds base index from scratch.
+- FullyFresh warm startup: unchanged. Loads base index, no overlay.
+- All existing query methods: unchanged internally, just add an
+  overlay merge step.
+- Three-file format: unchanged. Overlay is an additional file.
+
+### Implementation order
+
+**5a. Overlay data structures + write path**
+
+Add `Overlay` struct. When a file changes in the PartiallyStale path,
+write overlay.bin + overlay_meta.json instead of rebuilding the full
+index. Tokenize only the changed files. Cost: O(changed).
+
+**5b. Query path: merge base + overlay**
+
+Modify `find_references()` to filter invalidated file_ids and include
+overlay entries. Modify per-file occurrence reads to check overlay
+first. This is a small code change.
+
+**5c. Load overlay on warm startup**
+
+When loading index, also load overlay.bin if it exists. Populate the
+in-memory Overlay structure. Merge overlay_meta's mtimes with base
+meta's mtimes for freshness checks.
+
+**5d. Compaction**
+
+When overlay exceeds threshold, trigger a full rebuild (current cold
+path) that produces a fresh base index with no overlay. This can
+happen during an idle period or at startup.
+
+**5e. Multi-edit accumulation**
+
+Multiple files can change before compaction. The overlay accumulates
+patches. Each new change to a file replaces its previous overlay
+entry (last writer wins).
+
+### Performance at 100K file scale
+
+| Scenario | Current | With overlay |
+|---|---|---|
+| Cold index (100K files) | ~40s | ~40s (same) |
+| Warm startup (0 changes) | ~100ms | ~100ms (same) |
+| 1 file changed | ~40s full rebuild | **~50ms** (tokenize + write overlay) |
+| 100 files changed | ~40s full rebuild | **~500ms** (tokenize 100 + write overlay) |
+| 10K files changed | ~40s full rebuild | ~5s tokenize, then trigger compaction |
+| Query (word in 200 files) | ~2ms | ~2ms + overlay scan (~0.1ms) |
+
+The key win: **single-file update drops from O(total) to O(changed)**.
+For a 100K-file codebase, that's 3-4 orders of magnitude faster.
 
 ### Tradeoffs
 
-- **Disk I/O vs CPU**: Reading 33 MB from files.v2.bin replaces
-  reading ~hundreds of MB of source files + tokenizing each one.
-  Net I/O is much less; CPU savings are large.
-- **Complexity**: The seed-from-old-index path is a new code path
-  that must maintain word_id/path_id consistency. Bugs here would
-  produce corrupted indexes.
-- **New files with new words**: Handled naturally by the builder's
-  intern tables — new words get IDs after the seeded range.
-- **Removed files**: Their old entries are simply not read from disk.
-  Their word_ids may become orphaned (no entries reference them), but
-  this is harmless — the word table just has a few unused entries.
+- **Query overhead**: Each query must check the overlay. The overlay
+  is small (in memory, hash lookups), so overhead is <0.1ms per query.
+  Negligible compared to disk I/O for base posting lists.
+- **Complexity**: Two-level index with merge-on-read. More code paths
+  to test. But the overlay is simple (just a list of file patches).
+- **Stale overlay**: If quicklsp crashes before compaction, the overlay
+  is still valid — it's written atomically (write + rename). Next
+  startup loads it and continues.
+- **Disk space**: Overlay duplicates data for patched files. At most
+  ~5% of base size (compaction threshold). Negligible.
 
 ### Verification
 
-- Run the full test suite.
-- Benchmark: cold index, then modify 1 file, measure incremental.
-- Verify that `find_references("word_in_unchanged_file")` still works.
-- Verify that `find_references("word_in_changed_file")` reflects the
-  new content.
-- Verify that `find_references("new_word_only_in_changed_file")` works.
-- Compare output of incremental build vs full rebuild to verify they
-  produce identical index files.
+- Full test suite passes.
+- Incremental: modify 1 file, verify `find_references` returns updated
+  results.
+- Add new file with new words, verify they're queryable.
+- Delete a file, verify its references disappear.
+- Compact, verify results identical to a fresh cold index.
+- Benchmark: 100K-file corpus, modify 1 file, measure update time.
 
 ## Completed steps
 
