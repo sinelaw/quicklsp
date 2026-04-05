@@ -37,10 +37,26 @@ impl TsParser for CParser {
 }
 
 /// Walk top-level nodes and extract definitions.
+/// Recurses into preprocessor conditional blocks (#ifdef, #ifndef, #if, #else,
+/// #elif) so that definitions guarded by conditionals are still indexed.
 fn collect_definitions(root: Node, source: &str, symbols: &mut Vec<Symbol>) {
-    let mut cursor = root.walk();
-    for child in root.children(&mut cursor) {
-        extract_definition(child, source, symbols, false);
+    collect_definitions_recursive(root, source, symbols);
+}
+
+fn collect_definitions_recursive(node: Node, source: &str, symbols: &mut Vec<Symbol>) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "preproc_ifdef" | "preproc_if" | "preproc_elif" | "preproc_else"
+            | "preproc_ifndef" => {
+                // Recurse into preprocessor conditional blocks to find
+                // definitions nested inside #ifdef CONFIG_*, #if, etc.
+                collect_definitions_recursive(child, source, symbols);
+            }
+            _ => {
+                extract_definition(child, source, symbols, false);
+            }
+        }
     }
 }
 
@@ -409,5 +425,75 @@ int main() {
 
         // Check occurrences exist
         assert!(!result.occurrences.is_empty(), "should have occurrences");
+    }
+
+    #[test]
+    fn test_c_parser_ifdef_nested_definitions() {
+        // Kernel-style code: definitions inside #ifdef / #if / #ifndef blocks
+        let source = r#"
+#include <linux/kernel.h>
+
+#ifdef CONFIG_SECURITY
+struct security_ops {
+    int (*init)(void);
+};
+
+static int security_init(void) {
+    return 0;
+}
+#endif
+
+#ifndef CONFIG_PREEMPT
+void preempt_disable(void) {}
+#endif
+
+#if defined(CONFIG_SMP)
+typedef struct {
+    int lock;
+} spinlock_t;
+
+int spin_lock(spinlock_t *lock) {
+    return 0;
+}
+
+#ifdef CONFIG_DEBUG_SPINLOCK
+void spin_dump(spinlock_t *lock) {}
+#endif
+
+#else
+void no_smp_fallback(void) {}
+#endif
+
+#define CIA_MAX_OPS 16
+
+enum cia_type { CIA_READ, CIA_WRITE };
+
+void top_level_func(void) {}
+"#;
+        let result = CParser::parse(source);
+        let names: Vec<&str> = result.symbols.iter().map(|s| s.name.as_str()).collect();
+
+        // Top-level definitions (should still work)
+        assert!(names.contains(&"CIA_MAX_OPS"), "should find top-level #define, got: {:?}", names);
+        assert!(names.contains(&"cia_type"), "should find top-level enum, got: {:?}", names);
+        assert!(names.contains(&"CIA_READ"), "should find enumerator, got: {:?}", names);
+        assert!(names.contains(&"top_level_func"), "should find top-level function, got: {:?}", names);
+
+        // Definitions inside #ifdef CONFIG_SECURITY
+        assert!(names.contains(&"security_ops"), "should find struct inside #ifdef, got: {:?}", names);
+        assert!(names.contains(&"security_init"), "should find function inside #ifdef, got: {:?}", names);
+
+        // Definitions inside #ifndef CONFIG_PREEMPT
+        assert!(names.contains(&"preempt_disable"), "should find function inside #ifndef, got: {:?}", names);
+
+        // Definitions inside #if defined(CONFIG_SMP)
+        assert!(names.contains(&"spinlock_t"), "should find typedef inside #if, got: {:?}", names);
+        assert!(names.contains(&"spin_lock"), "should find function inside #if, got: {:?}", names);
+
+        // Definitions inside nested #ifdef (inside #if)
+        assert!(names.contains(&"spin_dump"), "should find function inside nested #ifdef, got: {:?}", names);
+
+        // Definitions inside #else
+        assert!(names.contains(&"no_smp_fallback"), "should find function inside #else, got: {:?}", names);
     }
 }

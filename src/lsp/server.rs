@@ -109,7 +109,7 @@ impl QuickLspServer {
         line[..byte_offset.min(line.len())].chars().count()
     }
 
-    fn word_at_position(content: &str, line_idx: usize, col: usize) -> Option<String> {
+    pub fn word_at_position(content: &str, line_idx: usize, col: usize) -> Option<String> {
         let line = content.lines().nth(line_idx)?;
         let chars: Vec<char> = line.chars().collect();
         if col > chars.len() {
