@@ -1,45 +1,43 @@
-//! Word index file format and I/O.
+//! Word index: three-file format for compact storage and incremental update.
 //!
-//! ## File layout
+//! ## Files (in `~/.cache/quicklsp/<project-hash>/`)
 //!
+//! ### `words.v2.bin` — shared string tables
 //! ```text
-//! [header]                    (32 bytes, fixed)
-//!   magic: b"QLSP\x01\x00\x00\x00"  (8 bytes)
-//!   entry_count: u64
-//!   dir_offset: u64           byte offset to word directory
-//!   dir_count: u64            number of words in directory
+//! [header: 24 bytes]  magic + word_count(u32) + path_count(u32) + reserved(u64)
+//! [word offsets]      (word_count+1) × u32 — byte offset into word data
+//! [word data]         concatenated word strings
+//! [path offsets]      (path_count+1) × u32 — byte offset into path data
+//! [path data]         concatenated path strings
+//! ```
 //!
-//! [entries section]           (sorted by word, then path, then line)
-//!   Each entry is variable-length:
-//!     word_len: u16
-//!     word: [u8; word_len]
-//!     path_len: u16
-//!     path: [u8; path_len]
-//!     line: u32
-//!     col: u32
-//!     len: u16
+//! ### `files.v2.bin` — per-file occurrences (unit of incremental update)
+//! ```text
+//! [header: 16 bytes]  magic + file_count(u32) + reserved(u32)
+//! [file table]        file_count × 12 bytes: occ_offset(u64) + occ_count(u32)
+//! [occurrence data]   per file, sorted by (word_id, line):
+//!                     word_id(u32) + line(u32) + col(u32) + len(u16) = 14 bytes
+//! ```
 //!
-//! [word directory]            (sorted by word, variable-size entries)
-//!   Each entry:
-//!     word_len: u16
-//!     word: [u8; word_len]
-//!     first_entry_offset: u64
-//!     entry_count: u32
+//! ### `index.v2.bin` — inverted posting lists for queries
+//! ```text
+//! [header: 16 bytes]  magic + word_count(u32) + reserved(u32)
+//! [word directory]    word_count × 8 bytes: posting_offset(u32) + posting_count(u32)
+//! [posting data]      file_id(u32) per posting, grouped by word
 //! ```
 
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-const MAGIC: [u8; 8] = *b"QLSP\x01\x00\x00\x00";
-const HEADER_SIZE: u64 = 32;
+const MAGIC_WORDS: [u8; 8] = *b"QLSW\x02\x00\x00\x00";
+const MAGIC_FILES: [u8; 8] = *b"QLSF\x02\x00\x00\x00";
+const MAGIC_INDEX: [u8; 8] = *b"QLSI\x02\x00\x00\x00";
 
-/// Size of a CompactEntry on disk in the sorted run files.
-const COMPACT_ENTRY_SIZE: usize = std::mem::size_of::<CompactEntry>();
+/// Size of a single on-disk occurrence: word_id(4) + line(4) + col(4) + len(2) = 14.
+const OCC_SIZE: usize = 14;
 
-/// A single entry in the word index (used for reading / public API).
+/// A single entry in the word index (public API for query results).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct IndexEntry {
     pub word: String,
@@ -51,8 +49,6 @@ pub struct IndexEntry {
 
 /// Compact in-memory entry used during index building.
 /// Stores intern-table IDs instead of full strings.
-///
-/// repr(C) ensures a deterministic byte layout for raw read/write to temp files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 struct CompactEntry {
@@ -61,92 +57,55 @@ struct CompactEntry {
     line: u32,
     col: u32,
     len: u16,
-    /// Padding to make the struct exactly 20 bytes with predictable layout.
     _pad: u16,
 }
 
-// Verify the size at compile time.
-const _: () = assert!(COMPACT_ENTRY_SIZE == 20);
+const _: () = assert!(std::mem::size_of::<CompactEntry>() == 20);
 
 impl CompactEntry {
     fn new(word_id: u32, path_id: u32, line: u32, col: u32, len: u16) -> Self {
         Self { word_id, path_id, line, col, len, _pad: 0 }
     }
-
-    /// Read from raw bytes. Returns None on EOF.
-    fn read_from<R: Read>(reader: &mut R) -> io::Result<Option<Self>> {
-        let mut buf = [0u8; COMPACT_ENTRY_SIZE];
-        match reader.read_exact(&mut buf) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(e),
-        }
-        Ok(Some(Self {
-            word_id: u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
-            path_id: u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]),
-            line: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
-            col: u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]),
-            len: u16::from_le_bytes([buf[16], buf[17]]),
-            _pad: 0,
-        }))
-    }
-
-    /// Write to raw bytes.
-    fn write_to<W: Write>(&self, writer: &mut W) -> io::Result<()> {
-        writer.write_all(&self.word_id.to_le_bytes())?;
-        writer.write_all(&self.path_id.to_le_bytes())?;
-        writer.write_all(&self.line.to_le_bytes())?;
-        writer.write_all(&self.col.to_le_bytes())?;
-        writer.write_all(&self.len.to_le_bytes())?;
-        writer.write_all(&self._pad.to_le_bytes())?;
-        Ok(())
-    }
 }
+
+// ── WordDirectory ─────────────────────────────────────────────────────────
 
 /// Compact in-memory word directory: sorted flat array + string pool.
 ///
-/// Replaces `BTreeMap<String, (u64, u32)>` which used ~549 MB for 5.15M words
-/// (94 bytes/entry from String headers + BTreeMap node overhead).
-/// This uses ~18 bytes/entry + pooled string data ≈ 144 MB total (~3.8× smaller).
+/// Supports two lookup modes:
+/// - `get(word)` → (posting_offset, posting_count) for find_references queries
+/// - `get_word_id(word)` → word_id for building/updating the index
 #[derive(Debug, Default)]
 pub struct WordDirectory {
-    /// Concatenated word strings (all words back-to-back).
     pool: String,
-    /// Sorted entries: (pool_offset, word_len, file_offset, entry_count).
     entries: Vec<DirEntry>,
 }
 
-/// Single entry in the compact word directory.
 #[derive(Debug, Clone, Copy)]
 struct DirEntry {
     pool_offset: u32,
     word_len: u16,
-    file_offset: u64,
-    entry_count: u32,
+    posting_offset: u32,
+    posting_count: u32,
 }
 
 impl WordDirectory {
     pub fn new() -> Self {
-        Self {
-            pool: String::new(),
-            entries: Vec::new(),
-        }
+        Self { pool: String::new(), entries: Vec::new() }
     }
 
-    /// Insert a word (must be inserted in sorted order).
-    fn insert(&mut self, word: &str, file_offset: u64, entry_count: u32) {
+    fn insert(&mut self, word: &str, posting_offset: u32, posting_count: u32) {
         let pool_offset = self.pool.len() as u32;
         self.pool.push_str(word);
-        self.entries.push(DirEntry {
-            pool_offset,
-            word_len: word.len() as u16,
-            file_offset,
-            entry_count,
-        });
+        self.entries.push(DirEntry { pool_offset, word_len: word.len() as u16, posting_offset, posting_count });
     }
 
-    /// Look up a word in the directory via binary search.
-    pub fn get(&self, word: &str) -> Option<(u64, u32)> {
+    fn word_at(&self, e: &DirEntry) -> &str {
+        &self.pool[e.pool_offset as usize..(e.pool_offset as usize + e.word_len as usize)]
+    }
+
+    /// Look up a word → (posting_offset, posting_count).
+    pub fn get(&self, word: &str) -> Option<(u32, u32)> {
         let pool = self.pool.as_bytes();
         self.entries
             .binary_search_by(|e| {
@@ -154,54 +113,25 @@ impl WordDirectory {
                     .cmp(word.as_bytes())
             })
             .ok()
-            .map(|i| (self.entries[i].file_offset, self.entries[i].entry_count))
+            .map(|i| (self.entries[i].posting_offset, self.entries[i].posting_count))
     }
 
-    /// Number of unique words in the directory.
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
+    pub fn len(&self) -> usize { self.entries.len() }
+    pub fn is_empty(&self) -> bool { self.entries.is_empty() }
 
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    /// Estimated memory usage in bytes.
     pub fn memory_usage(&self) -> usize {
-        self.pool.len()
-            + self.entries.len() * std::mem::size_of::<DirEntry>()
+        self.pool.len() + self.entries.len() * std::mem::size_of::<DirEntry>()
     }
 }
 
-/// A sorted run of CompactEntry records stored in a temp file.
-pub struct SortedRun {
-    file: tempfile::NamedTempFile,
-}
+// ── WordIndexBuilder ──────────────────────────────────────────────────────
 
-/// Builder for constructing a word index file.
-///
-/// Uses compact interned entries internally to minimize memory:
-/// words and paths are stored once in lookup tables, and each entry
-/// is a 20-byte struct with table indices instead of heap Strings.
-///
-/// For large indexes, entries are flushed to sorted temp-file runs
-/// after each batch and merged during the final build step. This
-/// keeps peak memory bounded to one batch's worth of entries (~25 MB)
-/// instead of the full dataset (~200+ MB).
+/// Builder for constructing the three-file word index.
 pub struct WordIndexBuilder {
     entries: Vec<CompactEntry>,
-    /// Sorted runs flushed to temp files.
-    runs: Vec<SortedRun>,
-    /// Total entries across all flushed runs (not counting self.entries).
-    flushed_entry_count: usize,
-    /// Interned paths: id → String (String comparison is memcmp;
-    /// PathBuf::cmp does expensive component-by-component iteration).
     path_table: Vec<String>,
-    /// Reverse lookup: path string → id.
     path_lookup: std::collections::HashMap<String, u32>,
-    /// Interned words: id → String.
     word_table: Vec<String>,
-    /// Reverse lookup: word → id.
     word_lookup: std::collections::HashMap<String, u32>,
 }
 
@@ -209,8 +139,6 @@ impl WordIndexBuilder {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
-            runs: Vec::new(),
-            flushed_entry_count: 0,
             path_table: Vec::new(),
             path_lookup: std::collections::HashMap::new(),
             word_table: Vec::new(),
@@ -218,7 +146,6 @@ impl WordIndexBuilder {
         }
     }
 
-    /// Intern a path, returning its table index.
     fn intern_path(&mut self, path: &Path) -> u32 {
         let path_str = path.to_string_lossy();
         if let Some(&idx) = self.path_lookup.get(path_str.as_ref()) {
@@ -232,7 +159,6 @@ impl WordIndexBuilder {
         }
     }
 
-    /// Intern a word string, returning its table index.
     fn intern_word(&mut self, word: &str) -> u32 {
         if let Some(&idx) = self.word_lookup.get(word) {
             idx
@@ -244,7 +170,6 @@ impl WordIndexBuilder {
         }
     }
 
-    /// Intern a word by moving the String, returning its table index.
     fn intern_word_owned(&mut self, word: String) -> u32 {
         if let Some(&idx) = self.word_lookup.get(&word) {
             idx
@@ -281,7 +206,6 @@ impl WordIndexBuilder {
     }
 
     /// Drain entries from a file's occurrences, resolving byte offsets against `source`.
-    /// The occurrence Vec is consumed to free its memory.
     pub fn drain_file_occurrences(
         &mut self,
         path: &Path,
@@ -299,569 +223,444 @@ impl WordIndexBuilder {
         }
     }
 
-    /// Total number of entries across all runs and the current buffer.
-    pub fn entry_count(&self) -> usize {
-        self.flushed_entry_count + self.entries.len()
-    }
+    pub fn entry_count(&self) -> usize { self.entries.len() }
+    pub fn entries_in_buffer(&self) -> usize { self.entries.len() }
 
-    /// Number of entries currently in the in-memory buffer (not yet flushed).
-    pub fn entries_in_buffer(&self) -> usize {
-        self.entries.len()
-    }
-
-    /// Sort the current in-memory entries and flush them to a temp file.
-    /// Frees the in-memory Vec for reuse by the next batch.
+    /// Build the three-file index. `dir` is the output directory.
     ///
-    /// Call this after each batch's `drain_file_occurrences` to keep
-    /// peak memory bounded to one batch.
-    pub fn flush_sorted_run(&mut self) -> io::Result<()> {
-        if self.entries.is_empty() {
-            return Ok(());
-        }
-
-        // Compare strings directly instead of building sort-order maps over
-        // the entire (and ever-growing) intern tables.  The sort-order
-        // approach is O(W log W) setup where W = total accumulated words,
-        // which dominates when W >> batch size.
-        let word_table = &self.word_table;
-        let path_table = &self.path_table;
-        self.entries.sort_unstable_by(|a, b| {
-            word_table[a.word_id as usize]
-                .cmp(&word_table[b.word_id as usize])
-                .then_with(|| {
-                    path_table[a.path_id as usize].cmp(&path_table[b.path_id as usize])
-                })
-                .then_with(|| a.line.cmp(&b.line))
-        });
-
-        let mut temp = tempfile::NamedTempFile::new()?;
-        {
-            let mut writer = BufWriter::new(&mut temp);
-            for entry in &self.entries {
-                entry.write_to(&mut writer)?;
-            }
-            writer.flush()?;
-        }
-
-        let count = self.entries.len();
-        self.entries.clear();
-        self.flushed_entry_count += count;
-        self.runs.push(SortedRun { file: temp });
-
-        Ok(())
-    }
-
-    /// Sort entries and write the index file. Returns the word directory.
-    ///
-    /// If sorted runs have been flushed, performs a K-way merge from the
-    /// run files. Otherwise, sorts and writes in memory (for small indexes).
-    pub fn build(mut self, path: &Path) -> io::Result<WordDirectory> {
-        // If there are unflushed entries remaining, flush them as a final run.
-        if !self.entries.is_empty() && !self.runs.is_empty() {
-            self.flush_sorted_run()?;
-        }
-
-        if self.runs.is_empty() {
-            // In-memory path: single sort + sequential write. Used when
-            // entries were accumulated without flushing sorted runs.
-            self.build_in_memory(path)
-        } else {
-            // Large index path: K-way merge from sorted runs
-            // Free the lookup HashMaps before merge — they're only needed
-            // during the accumulation phase. Frees ~50 MB.
-            self.word_lookup = std::collections::HashMap::new();
-            self.path_lookup = std::collections::HashMap::new();
-            self.build_from_runs(path)
-        }
-    }
-
-    /// Bucket entries by word, sort each bucket, and write the index file.
-    ///
-    /// Instead of sorting all N entries globally (O(N log N) on gigabytes,
-    /// terrible cache behavior), we bucket by word_id in O(N), then sort
-    /// each word's ~180 entries (fits in L1 cache).
-    fn build_in_memory(mut self, path: &Path) -> io::Result<WordDirectory> {
+    /// Returns (WordDirectory, word_table, path_table) for constructing a WordIndex.
+    pub fn build(mut self, dir: &Path) -> io::Result<(WordDirectory, Vec<String>, Vec<String>)> {
         use std::time::Instant;
 
-        let t0 = Instant::now();
-
-        // Free lookup HashMaps — only needed during accumulation.
+        // Free lookup tables — only needed during accumulation.
         self.word_lookup = std::collections::HashMap::new();
         self.path_lookup = std::collections::HashMap::new();
 
         let total_entries = self.entries.len();
-
-        // Bucket entries by word_id.
         let word_count = self.word_table.len();
-        let mut buckets: Vec<Vec<CompactEntry>> = Vec::with_capacity(word_count);
-        buckets.resize_with(word_count, Vec::new);
+        let path_count = self.path_table.len();
+
+        let t0 = Instant::now();
+
+        // ── 1. Group entries by file (path_id) ──────────────────────────
+        let mut file_buckets: Vec<Vec<CompactEntry>> = Vec::with_capacity(path_count);
+        file_buckets.resize_with(path_count, Vec::new);
         for entry in self.entries.drain(..) {
-            buckets[entry.word_id as usize].push(entry);
+            file_buckets[entry.path_id as usize].push(entry);
         }
-        self.entries = Vec::new(); // free allocation
+        self.entries = Vec::new();
+
+        // Sort each file's entries by (word_id, line).
+        for bucket in &mut file_buckets {
+            bucket.sort_unstable_by(|a, b| {
+                a.word_id.cmp(&b.word_id).then_with(|| a.line.cmp(&b.line))
+            });
+        }
 
         let t1 = Instant::now();
-        tracing::info!("build_in_memory: bucketing {} entries into {} words: {:.2?}", total_entries, word_count, t1 - t0);
+        tracing::info!("word index build: group + sort by file: {:.2?} ({} entries, {} files)",
+            t1 - t0, total_entries, path_count);
 
-        // Build path sort order once (O(P log P) for ~55K paths).
-        let path_sort_order = Self::build_sort_order(&self.path_table);
+        // ── 2. Write files.v2.bin ───────────────────────────────────────
+        let files_path = dir.join("files.v2.bin");
+        {
+            let mut w = BufWriter::with_capacity(1 << 20, File::create(&files_path)?);
+            // Header
+            w.write_all(&MAGIC_FILES)?;
+            w.write_all(&(path_count as u32).to_le_bytes())?;
+            w.write_all(&0u32.to_le_bytes())?; // reserved
 
-        // Sort word_ids by word string to get lexicographic word order.
-        let mut word_ids: Vec<u32> = (0..word_count as u32).collect();
-        word_ids.sort_unstable_by(|&a, &b| {
+            // File table placeholder — we'll fill occ_offset/occ_count as we write
+            let file_table_offset = 16u64;
+            let file_table_size = path_count as u64 * 12;
+            let mut file_table: Vec<(u64, u32)> = Vec::with_capacity(path_count);
+
+            // Skip file table area, we'll seek back
+            w.write_all(&vec![0u8; file_table_size as usize])?;
+
+            let mut occ_offset = file_table_offset + file_table_size;
+            for bucket in &file_buckets {
+                file_table.push((occ_offset, bucket.len() as u32));
+                for e in bucket {
+                    w.write_all(&e.word_id.to_le_bytes())?;
+                    w.write_all(&e.line.to_le_bytes())?;
+                    w.write_all(&e.col.to_le_bytes())?;
+                    w.write_all(&e.len.to_le_bytes())?;
+                }
+                occ_offset += (bucket.len() * OCC_SIZE) as u64;
+            }
+            w.flush()?;
+
+            // Seek back and write file table
+            let mut file = w.into_inner()?;
+            file.seek(SeekFrom::Start(file_table_offset))?;
+            let mut tw = BufWriter::new(file);
+            for &(off, cnt) in &file_table {
+                tw.write_all(&off.to_le_bytes())?;
+                tw.write_all(&cnt.to_le_bytes())?;
+            }
+            tw.flush()?;
+        }
+
+        let t2 = Instant::now();
+        tracing::info!("word index build: write files.v2.bin: {:.2?}", t2 - t1);
+
+        // ── 3. Build posting lists ──────────────────────────────────────
+        // For each word, collect the set of file_ids that contain it.
+        let mut word_postings: Vec<Vec<u32>> = Vec::with_capacity(word_count);
+        word_postings.resize_with(word_count, Vec::new);
+        for (file_id, bucket) in file_buckets.iter().enumerate() {
+            let mut prev_word_id = u32::MAX;
+            for e in bucket {
+                if e.word_id != prev_word_id {
+                    word_postings[e.word_id as usize].push(file_id as u32);
+                    prev_word_id = e.word_id;
+                }
+            }
+        }
+        // Free file buckets — no longer needed
+        drop(file_buckets);
+
+        let t3 = Instant::now();
+        tracing::info!("word index build: build posting lists: {:.2?}", t3 - t2);
+
+        // ── 4. Write index.v2.bin ───────────────────────────────────────
+        // Sort words lexicographically and build the word directory.
+        let mut sorted_word_ids: Vec<u32> = (0..word_count as u32).collect();
+        sorted_word_ids.sort_unstable_by(|&a, &b| {
             self.word_table[a as usize].cmp(&self.word_table[b as usize])
         });
 
-        let t2 = Instant::now();
-        tracing::info!("build_in_memory: sort orders + word_ids sort: {:.2?}", t2 - t1);
+        let index_path = dir.join("index.v2.bin");
+        let mut word_dir = WordDirectory::new();
+        {
+            let mut w = BufWriter::with_capacity(1 << 20, File::create(&index_path)?);
+            // Header
+            w.write_all(&MAGIC_INDEX)?;
+            w.write_all(&(word_count as u32).to_le_bytes())?;
+            w.write_all(&0u32.to_le_bytes())?; // reserved
 
-        let mut index_writer = IndexFileWriter::new(path)?;
+            // Word directory placeholder (indexed by word_id, not sorted order)
+            let dir_table_offset = 16u64;
+            let dir_table_size = word_count as u64 * 8;
+            w.write_all(&vec![0u8; dir_table_size as usize])?;
 
-        let mut sort_ns: u64 = 0;
-        let mut serialize_ns: u64 = 0;
-        let mut io_ns: u64 = 0;
-        let mut total_bytes: u64 = 0;
-        let mut entry_buf = Vec::with_capacity(256);
-
-        for &word_id in &word_ids {
-            let bucket = &mut buckets[word_id as usize];
-            if bucket.is_empty() {
-                continue;
+            // Write posting data in sorted word order, tracking offsets per word_id
+            let mut posting_offset: u32 = 0;
+            let mut dir_by_word_id: Vec<(u32, u32)> = vec![(0, 0); word_count];
+            for &word_id in &sorted_word_ids {
+                let postings = &word_postings[word_id as usize];
+                dir_by_word_id[word_id as usize] = (posting_offset, postings.len() as u32);
+                word_dir.insert(
+                    &self.word_table[word_id as usize],
+                    posting_offset,
+                    postings.len() as u32,
+                );
+                for &file_id in postings {
+                    w.write_all(&file_id.to_le_bytes())?;
+                }
+                posting_offset += postings.len() as u32;
             }
+            w.flush()?;
 
-            let ts0 = Instant::now();
-            bucket.sort_unstable_by(|a, b| {
-                path_sort_order[a.path_id as usize]
-                    .cmp(&path_sort_order[b.path_id as usize])
-                    .then_with(|| a.line.cmp(&b.line))
-            });
-            let ts1 = Instant::now();
-            sort_ns += (ts1 - ts0).as_nanos() as u64;
-
-            let word = &self.word_table[word_id as usize];
-            for entry in bucket.iter() {
-                let path_str = &self.path_table[entry.path_id as usize];
-
-                // Serialize to buffer (no I/O)
-                entry_buf.clear();
-                let wb = word.as_bytes();
-                let pb = path_str.as_bytes();
-                entry_buf.extend_from_slice(&(wb.len() as u16).to_le_bytes());
-                entry_buf.extend_from_slice(wb);
-                entry_buf.extend_from_slice(&(pb.len() as u16).to_le_bytes());
-                entry_buf.extend_from_slice(pb);
-                entry_buf.extend_from_slice(&entry.line.to_le_bytes());
-                entry_buf.extend_from_slice(&entry.col.to_le_bytes());
-                entry_buf.extend_from_slice(&entry.len.to_le_bytes());
-                total_bytes += entry_buf.len() as u64;
+            // Seek back and write directory table (in word_id order)
+            let mut file = w.into_inner()?;
+            file.seek(SeekFrom::Start(dir_table_offset))?;
+            let mut tw = BufWriter::new(file);
+            for &(off, cnt) in &dir_by_word_id {
+                tw.write_all(&off.to_le_bytes())?;
+                tw.write_all(&cnt.to_le_bytes())?;
             }
-            let ts2 = Instant::now();
-            serialize_ns += (ts2 - ts1).as_nanos() as u64;
-
-            // Write all entries for this word via IndexFileWriter
-            for entry in bucket.iter() {
-                let path_str = &self.path_table[entry.path_id as usize];
-                index_writer.write_entry(word, path_str, entry)?;
-            }
-            io_ns += (Instant::now() - ts2).as_nanos() as u64;
+            tw.flush()?;
         }
-
-        let t3 = Instant::now();
-        tracing::info!(
-            "build_in_memory: per-word loop: {:.2?} (sort: {:.2?}, serialize: {:.2?}, write: {:.2?}, {:.1} GB)",
-            t3 - t2,
-            std::time::Duration::from_nanos(sort_ns),
-            std::time::Duration::from_nanos(serialize_ns),
-            std::time::Duration::from_nanos(io_ns),
-            total_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-        );
-
-        let result = index_writer.finish(total_entries);
 
         let t4 = Instant::now();
-        tracing::info!("build_in_memory: finish (dir write + header): {:.2?}", t4 - t3);
+        tracing::info!("word index build: write index.v2.bin: {:.2?}", t4 - t3);
 
-        result
-    }
+        // ── 5. Write words.v2.bin ───────────────────────────────────────
+        let words_path = dir.join("words.v2.bin");
+        {
+            let mut w = BufWriter::with_capacity(1 << 20, File::create(&words_path)?);
+            // Header
+            w.write_all(&MAGIC_WORDS)?;
+            w.write_all(&(word_count as u32).to_le_bytes())?;
+            w.write_all(&(path_count as u32).to_le_bytes())?;
+            w.write_all(&0u64.to_le_bytes())?; // reserved
 
-    /// K-way merge from sorted run files.
-    fn build_from_runs(mut self, path: &Path) -> io::Result<WordDirectory> {
-        let word_sort_order = Self::build_sort_order(&self.word_table);
-        let path_sort_order = Self::build_sort_order_path(&self.path_table);
-
-        let total_entries = self.flushed_entry_count;
-
-        // Open a BufReader on each run, seed the heap with the first entry.
-        let mut readers: Vec<BufReader<File>> = Vec::with_capacity(self.runs.len());
-        for run in &mut self.runs {
-            let file = run.file.as_file_mut();
-            file.seek(SeekFrom::Start(0))?;
-            readers.push(BufReader::new(file.try_clone()?));
-        }
-
-        // Min-heap for K-way merge.
-        let mut heap: BinaryHeap<Reverse<MergeHead>> = BinaryHeap::with_capacity(readers.len());
-        for (i, reader) in readers.iter_mut().enumerate() {
-            if let Some(entry) = CompactEntry::read_from(reader)? {
-                heap.push(Reverse(MergeHead {
-                    sort_key: sort_key_for(&entry, &word_sort_order, &path_sort_order),
-                    entry,
-                    run_index: i,
-                }));
+            // Word offsets + data
+            let mut offset = 0u32;
+            for word in &self.word_table {
+                w.write_all(&offset.to_le_bytes())?;
+                offset += word.len() as u32;
             }
-        }
-
-        let mut index_writer = IndexFileWriter::new(path)?;
-
-        while let Some(Reverse(head)) = heap.pop() {
-            let word = &self.word_table[head.entry.word_id as usize];
-            let path_str = &self.path_table[head.entry.path_id as usize];
-            index_writer.write_entry(word, path_str, &head.entry)?;
-
-            // Read next entry from the same run.
-            if let Some(next) = CompactEntry::read_from(&mut readers[head.run_index])? {
-                heap.push(Reverse(MergeHead {
-                    sort_key: sort_key_for(&next, &word_sort_order, &path_sort_order),
-                    entry: next,
-                    run_index: head.run_index,
-                }));
+            w.write_all(&offset.to_le_bytes())?; // sentinel
+            for word in &self.word_table {
+                w.write_all(word.as_bytes())?;
             }
+
+            // Path offsets + data
+            offset = 0;
+            for path in &self.path_table {
+                w.write_all(&offset.to_le_bytes())?;
+                offset += path.len() as u32;
+            }
+            w.write_all(&offset.to_le_bytes())?; // sentinel
+            for path in &self.path_table {
+                w.write_all(path.as_bytes())?;
+            }
+
+            w.flush()?;
         }
 
-        // Runs are dropped here, deleting temp files.
-        drop(self.runs);
+        let t5 = Instant::now();
+        tracing::info!("word index build: write words.v2.bin: {:.2?}", t5 - t4);
+        tracing::info!("word index build: total: {:.2?} ({} entries, {} words, {} files)",
+            t5 - t0, total_entries, word_count, path_count);
 
-        index_writer.finish(total_entries)
-    }
-
-    /// Compare two CompactEntries by (word, path, line) using sort-rank mappings.
-    fn compare_entries(
-        a: &CompactEntry,
-        b: &CompactEntry,
-        word_order: &[u32],
-        path_order: &[u32],
-    ) -> std::cmp::Ordering {
-        word_order[a.word_id as usize]
-            .cmp(&word_order[b.word_id as usize])
-            .then_with(|| path_order[a.path_id as usize].cmp(&path_order[b.path_id as usize]))
-            .then_with(|| a.line.cmp(&b.line))
-    }
-
-    /// Build a sort-order mapping: table_index → sort_rank.
-    fn build_sort_order(table: &[String]) -> Vec<u32> {
-        let mut indices: Vec<u32> = (0..table.len() as u32).collect();
-        indices.sort_unstable_by(|&a, &b| table[a as usize].cmp(&table[b as usize]));
-        let mut order = vec![0u32; table.len()];
-        for (rank, &idx) in indices.iter().enumerate() {
-            order[idx as usize] = rank as u32;
-        }
-        order
-    }
-
-    /// Build a sort-order mapping for path table (both are String now).
-    fn build_sort_order_path(table: &[String]) -> Vec<u32> {
-        Self::build_sort_order(table)
+        Ok((word_dir, self.word_table, self.path_table))
     }
 }
 
 impl Default for WordIndexBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new() }
 }
 
-// ── Merge heap entry ────────────────────────────────────────────────────
+// ── WordIndex ─────────────────────────────────────────────────────────────
 
-/// Sort key for the merge heap: (word_rank, path_rank, line).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct SortKey(u32, u32, u32);
-
-fn sort_key_for(entry: &CompactEntry, word_order: &[u32], path_order: &[u32]) -> SortKey {
-    SortKey(
-        word_order[entry.word_id as usize],
-        path_order[entry.path_id as usize],
-        entry.line,
-    )
-}
-
-/// Entry in the K-way merge heap. Ordered by sort key.
-#[derive(Debug, Eq, PartialEq)]
-struct MergeHead {
-    sort_key: SortKey,
-    entry: CompactEntry,
-    run_index: usize,
-}
-
-impl Ord for MergeHead {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.sort_key.cmp(&other.sort_key)
-    }
-}
-
-impl PartialOrd for MergeHead {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-// ── Index file writer ──────────────────────────────────────────────────
-
-/// Helper that writes the final index file format, tracking word boundaries.
-struct IndexFileWriter {
-    writer: BufWriter<File>,
-    dir: WordDirectory,
-    current_word: Option<String>,
-    word_start_offset: u64,
-    word_entry_count: u32,
-    offset: u64,
-}
-
-impl IndexFileWriter {
-    fn new(path: &Path) -> io::Result<Self> {
-        let file = File::create(path)?;
-        let mut writer = BufWriter::new(file);
-
-        // Write placeholder header.
-        let header_buf = [0u8; HEADER_SIZE as usize];
-        writer.write_all(&header_buf)?;
-
-        Ok(Self {
-            writer,
-            dir: WordDirectory::new(),
-            current_word: None,
-            word_start_offset: HEADER_SIZE,
-            word_entry_count: 0,
-            offset: HEADER_SIZE,
-        })
-    }
-
-    fn write_entry(
-        &mut self,
-        word: &str,
-        path: &str,
-        entry: &CompactEntry,
-    ) -> io::Result<()> {
-        if self.current_word.as_deref() != Some(word) {
-            // Flush previous word.
-            if let Some(ref prev_word) = self.current_word {
-                self.dir.insert(prev_word, self.word_start_offset, self.word_entry_count);
-            }
-            self.current_word = Some(word.to_string());
-            self.word_start_offset = self.offset;
-            self.word_entry_count = 0;
-        }
-
-        let entry_size = write_resolved_entry(&mut self.writer, word, path, entry)?;
-        self.offset += entry_size as u64;
-        self.word_entry_count += 1;
-        Ok(())
-    }
-
-    fn finish(mut self, total_entries: usize) -> io::Result<WordDirectory> {
-        // Flush last word.
-        if let Some(ref prev_word) = self.current_word {
-            self.dir.insert(prev_word, self.word_start_offset, self.word_entry_count);
-        }
-
-        let dir_offset = self.offset;
-        let dir_count = self.dir.entries.len() as u64;
-
-        // Write word directory.
-        let pool = self.dir.pool.as_bytes();
-        for e in &self.dir.entries {
-            let word_bytes = &pool[e.pool_offset as usize..(e.pool_offset as usize + e.word_len as usize)];
-            self.writer.write_all(&(word_bytes.len() as u16).to_le_bytes())?;
-            self.writer.write_all(word_bytes)?;
-            self.writer.write_all(&e.file_offset.to_le_bytes())?;
-            self.writer.write_all(&e.entry_count.to_le_bytes())?;
-        }
-
-        self.writer.flush()?;
-
-        // Write real header.
-        let mut file = self.writer.into_inner()?;
-        file.seek(SeekFrom::Start(0))?;
-        file.write_all(&MAGIC)?;
-        file.write_all(&(total_entries as u64).to_le_bytes())?;
-        file.write_all(&dir_offset.to_le_bytes())?;
-        file.write_all(&dir_count.to_le_bytes())?;
-        file.flush()?;
-
-        Ok(self.dir)
-    }
-}
-
-// ─��� Entry I/O ──────────────────────────────────────────────────────────
-
-/// Write a resolved compact entry to the writer, returning bytes written.
-fn write_resolved_entry<W: Write>(
-    writer: &mut W,
-    word: &str,
-    path: &str,
-    entry: &CompactEntry,
-) -> io::Result<usize> {
-    let word_bytes = word.as_bytes();
-    let path_bytes = path.as_bytes();
-
-    let mut written = 0;
-    writer.write_all(&(word_bytes.len() as u16).to_le_bytes())?;
-    written += 2;
-    writer.write_all(word_bytes)?;
-    written += word_bytes.len();
-    writer.write_all(&(path_bytes.len() as u16).to_le_bytes())?;
-    written += 2;
-    writer.write_all(path_bytes)?;
-    written += path_bytes.len();
-    writer.write_all(&entry.line.to_le_bytes())?;
-    written += 4;
-    writer.write_all(&entry.col.to_le_bytes())?;
-    written += 4;
-    writer.write_all(&entry.len.to_le_bytes())?;
-    written += 2;
-
-    Ok(written)
-}
-
-/// Read a single entry from the reader.
-fn read_entry<R: Read>(reader: &mut R) -> io::Result<IndexEntry> {
-    let mut buf2 = [0u8; 2];
-    let mut buf4 = [0u8; 4];
-
-    reader.read_exact(&mut buf2)?;
-    let word_len = u16::from_le_bytes(buf2) as usize;
-    let mut word_buf = vec![0u8; word_len];
-    reader.read_exact(&mut word_buf)?;
-    let word = String::from_utf8(word_buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-    reader.read_exact(&mut buf2)?;
-    let path_len = u16::from_le_bytes(buf2) as usize;
-    let mut path_buf = vec![0u8; path_len];
-    reader.read_exact(&mut path_buf)?;
-    let path_str = String::from_utf8(path_buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    let path = PathBuf::from(path_str);
-
-    reader.read_exact(&mut buf4)?;
-    let line = u32::from_le_bytes(buf4);
-
-    reader.read_exact(&mut buf4)?;
-    let col = u32::from_le_bytes(buf4);
-
-    reader.read_exact(&mut buf2)?;
-    let len = u16::from_le_bytes(buf2);
-
-    Ok(IndexEntry {
-        word,
-        path,
-        line,
-        col,
-        len,
-    })
-}
-
-// ── WordIndex ──────────────────────────────────────────────────────────
-
-/// On-disk word index with in-memory directory for seek-based lookups.
+/// On-disk word index backed by three files.
 pub struct WordIndex {
-    index_path: PathBuf,
+    index_dir: PathBuf,
     word_dir: WordDirectory,
+    /// file_id → (occ_offset, occ_count) in files.v2.bin
+    file_table: Vec<(u64, u32)>,
+    /// file_id → path string
+    path_table: Vec<String>,
+    /// word_id → word string (used for resolving query results)
+    word_table: Vec<String>,
 }
 
 impl WordIndex {
-    /// Build a new word index from a builder and store at the given path.
-    pub fn build(builder: WordIndexBuilder, path: &Path) -> io::Result<Self> {
-        let word_dir = builder.build(path)?;
-        Ok(Self {
-            index_path: path.to_path_buf(),
-            word_dir,
-        })
+    /// Build a new word index from a builder, writing to `dir`.
+    pub fn build(builder: WordIndexBuilder, dir: &Path) -> io::Result<Self> {
+        let total = builder.entry_count();
+        let (word_dir, word_table, path_table) = builder.build(dir)?;
+
+        // Read back the file table we just wrote
+        let file_table = Self::load_file_table(&dir.join("files.v2.bin"))?;
+
+        tracing::info!(
+            "Word index built: {} entries, {} unique words, dir memory ~{} KB, path: {}",
+            total,
+            word_dir.len(),
+            word_dir.memory_usage() / 1024,
+            dir.display(),
+        );
+
+        Ok(Self { index_dir: dir.to_path_buf(), word_dir, file_table, path_table, word_table })
     }
 
     /// Load an existing word index from disk.
-    pub fn load(path: &Path) -> io::Result<Self> {
-        let file = File::open(path)?;
-        let mut reader = BufReader::new(file);
+    pub fn load(dir: &Path) -> io::Result<Self> {
+        let (word_table, path_table) = Self::load_words_file(&dir.join("words.v2.bin"))?;
+        let file_table = Self::load_file_table(&dir.join("files.v2.bin"))?;
+        let word_dir = Self::load_index_file(&dir.join("index.v2.bin"), &word_table)?;
 
-        // Read header
+        Ok(Self { index_dir: dir.to_path_buf(), word_dir, file_table, path_table, word_table })
+    }
+
+    fn load_words_file(path: &Path) -> io::Result<(Vec<String>, Vec<String>)> {
+        let mut r = BufReader::new(File::open(path)?);
         let mut magic = [0u8; 8];
-        reader.read_exact(&mut magic)?;
-        if magic != MAGIC {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid word index magic",
-            ));
+        r.read_exact(&mut magic)?;
+        if magic != MAGIC_WORDS {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid words magic"));
         }
-
+        let mut buf4 = [0u8; 4];
+        r.read_exact(&mut buf4)?;
+        let word_count = u32::from_le_bytes(buf4) as usize;
+        r.read_exact(&mut buf4)?;
+        let path_count = u32::from_le_bytes(buf4) as usize;
         let mut buf8 = [0u8; 8];
-        reader.read_exact(&mut buf8)?;
-        let _entry_count = u64::from_le_bytes(buf8);
+        r.read_exact(&mut buf8)?; // reserved
 
-        reader.read_exact(&mut buf8)?;
-        let dir_offset = u64::from_le_bytes(buf8);
+        // Read word offsets + data
+        let word_table = Self::read_string_table(&mut r, word_count)?;
+        let path_table = Self::read_string_table(&mut r, path_count)?;
 
-        reader.read_exact(&mut buf8)?;
-        let dir_count = u64::from_le_bytes(buf8);
+        Ok((word_table, path_table))
+    }
 
-        // Seek to word directory and read it
-        reader.seek(SeekFrom::Start(dir_offset))?;
-        let mut word_dir = WordDirectory::new();
+    fn read_string_table<R: Read>(r: &mut R, count: usize) -> io::Result<Vec<String>> {
+        let mut buf4 = [0u8; 4];
+        let mut offsets = Vec::with_capacity(count + 1);
+        for _ in 0..=count {
+            r.read_exact(&mut buf4)?;
+            offsets.push(u32::from_le_bytes(buf4));
+        }
+        let total_len = *offsets.last().unwrap() as usize;
+        let mut data = vec![0u8; total_len];
+        r.read_exact(&mut data)?;
 
-        // Pre-allocate for expected entry count.
-        word_dir.entries.reserve(dir_count as usize);
-
-        for _ in 0..dir_count {
-            let mut buf2 = [0u8; 2];
-            let mut buf4 = [0u8; 4];
-
-            reader.read_exact(&mut buf2)?;
-            let word_len = u16::from_le_bytes(buf2) as usize;
-            let mut word_buf = vec![0u8; word_len];
-            reader.read_exact(&mut word_buf)?;
-            let word = std::str::from_utf8(&word_buf)
+        let mut table = Vec::with_capacity(count);
+        for i in 0..count {
+            let start = offsets[i] as usize;
+            let end = offsets[i + 1] as usize;
+            let s = String::from_utf8(data[start..end].to_vec())
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            table.push(s);
+        }
+        Ok(table)
+    }
 
-            reader.read_exact(&mut buf8)?;
-            let first_offset = u64::from_le_bytes(buf8);
+    fn load_file_table(path: &Path) -> io::Result<Vec<(u64, u32)>> {
+        let mut r = BufReader::new(File::open(path)?);
+        let mut magic = [0u8; 8];
+        r.read_exact(&mut magic)?;
+        if magic != MAGIC_FILES {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid files magic"));
+        }
+        let mut buf4 = [0u8; 4];
+        r.read_exact(&mut buf4)?;
+        let file_count = u32::from_le_bytes(buf4) as usize;
+        r.read_exact(&mut buf4)?; // reserved
 
-            reader.read_exact(&mut buf4)?;
-            let count = u32::from_le_bytes(buf4);
+        let mut table = Vec::with_capacity(file_count);
+        let mut buf8 = [0u8; 8];
+        for _ in 0..file_count {
+            r.read_exact(&mut buf8)?;
+            let occ_offset = u64::from_le_bytes(buf8);
+            r.read_exact(&mut buf4)?;
+            let occ_count = u32::from_le_bytes(buf4);
+            table.push((occ_offset, occ_count));
+        }
+        Ok(table)
+    }
 
-            word_dir.insert(word, first_offset, count);
+    fn load_index_file(path: &Path, word_table: &[String]) -> io::Result<WordDirectory> {
+        let mut r = BufReader::new(File::open(path)?);
+        let mut magic = [0u8; 8];
+        r.read_exact(&mut magic)?;
+        if magic != MAGIC_INDEX {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid index magic"));
+        }
+        let mut buf4 = [0u8; 4];
+        r.read_exact(&mut buf4)?;
+        let word_count = u32::from_le_bytes(buf4) as usize;
+        r.read_exact(&mut buf4)?; // reserved
+
+        // Read directory entries (posting_offset, posting_count) per word_id
+        let mut raw_dir: Vec<(u32, u32)> = Vec::with_capacity(word_count);
+        for _ in 0..word_count {
+            let mut a = [0u8; 4];
+            let mut b = [0u8; 4];
+            r.read_exact(&mut a)?;
+            r.read_exact(&mut b)?;
+            raw_dir.push((u32::from_le_bytes(a), u32::from_le_bytes(b)));
         }
 
-        Ok(Self {
-            index_path: path.to_path_buf(),
-            word_dir,
-        })
+        // Build sorted WordDirectory from word_table + raw_dir
+        // raw_dir is indexed by word_id (insertion order), but WordDirectory
+        // needs entries in sorted word order.
+        let mut sorted_ids: Vec<u32> = (0..word_count as u32).collect();
+        sorted_ids.sort_unstable_by(|&a, &b| word_table[a as usize].cmp(&word_table[b as usize]));
+
+        let mut word_dir = WordDirectory::new();
+        word_dir.entries.reserve(word_count);
+        for &word_id in &sorted_ids {
+            let (posting_offset, posting_count) = raw_dir[word_id as usize];
+            word_dir.insert(&word_table[word_id as usize], posting_offset, posting_count);
+        }
+
+        Ok(word_dir)
     }
 
     /// Find all occurrences of a word in the index.
     pub fn find_references(&self, word: &str) -> io::Result<Vec<IndexEntry>> {
-        let (offset, count) = match self.word_dir.get(word) {
+        let (posting_offset, posting_count) = match self.word_dir.get(word) {
             Some(entry) => entry,
             None => return Ok(Vec::new()),
         };
 
-        let mut file = File::open(&self.index_path)?;
-        file.seek(SeekFrom::Start(offset))?;
-        let mut reader = BufReader::new(file);
-
-        let mut refs = Vec::with_capacity(count as usize);
-        for _ in 0..count {
-            refs.push(read_entry(&mut reader)?);
+        if posting_count == 0 {
+            return Ok(Vec::new());
         }
-        Ok(refs)
+
+        // Read posting list (file_ids) from index.v2.bin
+        let index_path = self.index_dir.join("index.v2.bin");
+        let mut index_file = File::open(&index_path)?;
+        // Posting data starts after header (16) + word_dir (word_count * 8)
+        let posting_data_offset = 16 + self.word_dir.len() as u64 * 8;
+        index_file.seek(SeekFrom::Start(
+            posting_data_offset + posting_offset as u64 * 4,
+        ))?;
+        let mut reader = BufReader::new(index_file);
+        let mut file_ids = Vec::with_capacity(posting_count as usize);
+        let mut buf4 = [0u8; 4];
+        for _ in 0..posting_count {
+            reader.read_exact(&mut buf4)?;
+            file_ids.push(u32::from_le_bytes(buf4));
+        }
+
+        // For each file, binary search its occurrences for this word
+        let files_path = self.index_dir.join("files.v2.bin");
+        let mut files_file = BufReader::new(File::open(&files_path)?);
+
+        // We need the word_id to search occurrences. Find it via binary search
+        // in the word directory — we already found the word, now we need its id
+        // to match against the occurrence word_id field.
+        // Since we have word_table, just scan for the word. For large tables
+        // this could be optimized with a reverse map, but it's only done once per query.
+        let word_id = self.word_table.iter().position(|w| w == word)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "word not in table"))? as u32;
+
+        let mut results = Vec::new();
+        for &file_id in &file_ids {
+            let (occ_offset, occ_count) = self.file_table[file_id as usize];
+            if occ_count == 0 {
+                continue;
+            }
+
+            // Read this file's occurrences and binary search for word_id
+            files_file.seek(SeekFrom::Start(occ_offset))?;
+            let path = PathBuf::from(&self.path_table[file_id as usize]);
+
+            // Read all occurrences for this file (14 bytes each)
+            // Binary search for the start of word_id entries
+            let mut occs = Vec::with_capacity(occ_count as usize);
+            for _ in 0..occ_count {
+                let mut buf = [0u8; OCC_SIZE];
+                files_file.read_exact(&mut buf)?;
+                let wid = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                let line = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+                let col = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+                let len = u16::from_le_bytes([buf[12], buf[13]]);
+                occs.push((wid, line, col, len));
+            }
+
+            // Since sorted by word_id, find the range via binary search
+            let start = occs.partition_point(|o| o.0 < word_id);
+            for &(wid, line, col, len) in &occs[start..] {
+                if wid != word_id {
+                    break;
+                }
+                results.push(IndexEntry {
+                    word: word.to_string(),
+                    path: path.clone(),
+                    line,
+                    col,
+                    len,
+                });
+            }
+        }
+
+        Ok(results)
     }
 
-    /// Get the word directory (for memory stats).
-    pub fn word_dir(&self) -> &WordDirectory {
-        &self.word_dir
-    }
-
-    /// Path to the index file on disk.
-    pub fn index_path(&self) -> &Path {
-        &self.index_path
-    }
+    pub fn word_dir(&self) -> &WordDirectory { &self.word_dir }
+    pub fn index_path(&self) -> &Path { &self.index_dir }
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -870,50 +669,42 @@ mod tests {
     #[test]
     fn build_and_query_index() {
         let dir = tempfile::tempdir().unwrap();
-        let index_path = dir.path().join("test.qlsp");
 
         let mut builder = WordIndexBuilder::new();
         builder.add(IndexEntry {
             word: "foo".to_string(),
             path: PathBuf::from("/src/main.rs"),
-            line: 0,
-            col: 3,
-            len: 3,
+            line: 0, col: 3, len: 3,
         });
         builder.add(IndexEntry {
             word: "foo".to_string(),
             path: PathBuf::from("/src/lib.rs"),
-            line: 5,
-            col: 10,
-            len: 3,
+            line: 5, col: 10, len: 3,
         });
         builder.add(IndexEntry {
             word: "bar".to_string(),
             path: PathBuf::from("/src/main.rs"),
-            line: 2,
-            col: 0,
-            len: 3,
+            line: 2, col: 0, len: 3,
         });
 
-        let index = WordIndex::build(builder, &index_path).unwrap();
+        let index = WordIndex::build(builder, dir.path()).unwrap();
 
-        // Query foo
         let refs = index.find_references("foo").unwrap();
         assert_eq!(refs.len(), 2);
-        assert_eq!(refs[0].path, PathBuf::from("/src/lib.rs"));
-        assert_eq!(refs[1].path, PathBuf::from("/src/main.rs"));
+        // Results should include both files
+        let paths: Vec<_> = refs.iter().map(|r| r.path.to_str().unwrap()).collect();
+        assert!(paths.contains(&"/src/lib.rs"));
+        assert!(paths.contains(&"/src/main.rs"));
 
-        // Query bar
         let refs = index.find_references("bar").unwrap();
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].line, 2);
 
-        // Query nonexistent
         let refs = index.find_references("baz").unwrap();
         assert!(refs.is_empty());
 
         // Reload from disk
-        let loaded = WordIndex::load(&index_path).unwrap();
+        let loaded = WordIndex::load(dir.path()).unwrap();
         let refs = loaded.find_references("foo").unwrap();
         assert_eq!(refs.len(), 2);
     }
@@ -921,10 +712,9 @@ mod tests {
     #[test]
     fn empty_index() {
         let dir = tempfile::tempdir().unwrap();
-        let index_path = dir.path().join("empty.qlsp");
 
         let builder = WordIndexBuilder::new();
-        let index = WordIndex::build(builder, &index_path).unwrap();
+        let index = WordIndex::build(builder, dir.path()).unwrap();
 
         assert!(index.word_dir().is_empty());
         let refs = index.find_references("anything").unwrap();
@@ -934,80 +724,58 @@ mod tests {
     #[test]
     fn unicode_words() {
         let dir = tempfile::tempdir().unwrap();
-        let index_path = dir.path().join("unicode.qlsp");
 
         let mut builder = WordIndexBuilder::new();
         builder.add(IndexEntry {
             word: "über_config".to_string(),
             path: PathBuf::from("/src/main.rs"),
-            line: 0,
-            col: 3,
-            len: 13, // UTF-8 byte length
+            line: 0, col: 3, len: 13,
         });
 
-        let index = WordIndex::build(builder, &index_path).unwrap();
+        let index = WordIndex::build(builder, dir.path()).unwrap();
         let refs = index.find_references("über_config").unwrap();
         assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0].word, "über_config");
+        assert_eq!(refs[0].len, 13);
+
+        let loaded = WordIndex::load(dir.path()).unwrap();
+        let refs = loaded.find_references("über_config").unwrap();
+        assert_eq!(refs.len(), 1);
     }
 
     #[test]
-    fn merge_multiple_sorted_runs() {
-        // Verify that flushing runs and merging produces the same result
-        // as the in-memory path.
+    fn many_files_many_words() {
         let dir = tempfile::tempdir().unwrap();
 
-        // Build with runs (external merge path)
-        let merge_path = dir.path().join("merged.qlsp");
         let mut builder = WordIndexBuilder::new();
+        for i in 0..100 {
+            let path = PathBuf::from(format!("/src/file_{}.rs", i));
+            builder.add(IndexEntry {
+                word: "shared".to_string(),
+                path: path.clone(),
+                line: i, col: 0, len: 6,
+            });
+            builder.add(IndexEntry {
+                word: format!("unique_{}", i),
+                path,
+                line: i + 1, col: 0, len: 8,
+            });
+        }
 
-        // Run 1: entries for "foo" and "bar"
-        builder.add(IndexEntry {
-            word: "foo".to_string(), path: PathBuf::from("/a.rs"), line: 1, col: 0, len: 3,
-        });
-        builder.add(IndexEntry {
-            word: "bar".to_string(), path: PathBuf::from("/a.rs"), line: 2, col: 0, len: 3,
-        });
-        builder.flush_sorted_run().unwrap();
+        let index = WordIndex::build(builder, dir.path()).unwrap();
 
-        // Run 2: more entries for "foo" and a new word "zap"
-        builder.add(IndexEntry {
-            word: "foo".to_string(), path: PathBuf::from("/b.rs"), line: 5, col: 0, len: 3,
-        });
-        builder.add(IndexEntry {
-            word: "zap".to_string(), path: PathBuf::from("/b.rs"), line: 6, col: 0, len: 3,
-        });
-        builder.flush_sorted_run().unwrap();
+        let refs = index.find_references("shared").unwrap();
+        assert_eq!(refs.len(), 100);
 
-        // Run 3: bar again in a different file
-        builder.add(IndexEntry {
-            word: "bar".to_string(), path: PathBuf::from("/c.rs"), line: 10, col: 0, len: 3,
-        });
-        builder.flush_sorted_run().unwrap();
+        let refs = index.find_references("unique_42").unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].line, 43);
 
-        assert_eq!(builder.entry_count(), 5);
-        let merged = WordIndex::build(builder, &merge_path).unwrap();
+        let refs = index.find_references("nonexistent").unwrap();
+        assert!(refs.is_empty());
 
-        // Verify results
-        let foo_refs = merged.find_references("foo").unwrap();
-        assert_eq!(foo_refs.len(), 2);
-        assert_eq!(foo_refs[0].path, PathBuf::from("/a.rs"));
-        assert_eq!(foo_refs[1].path, PathBuf::from("/b.rs"));
-
-        let bar_refs = merged.find_references("bar").unwrap();
-        assert_eq!(bar_refs.len(), 2);
-        assert_eq!(bar_refs[0].path, PathBuf::from("/a.rs"));
-        assert_eq!(bar_refs[1].path, PathBuf::from("/c.rs"));
-
-        let zap_refs = merged.find_references("zap").unwrap();
-        assert_eq!(zap_refs.len(), 1);
-        assert_eq!(zap_refs[0].path, PathBuf::from("/b.rs"));
-
-        // Reload from disk to verify persistence
-        let reloaded = WordIndex::load(&merge_path).unwrap();
-        assert_eq!(reloaded.find_references("foo").unwrap().len(), 2);
-        assert_eq!(reloaded.find_references("bar").unwrap().len(), 2);
-        assert_eq!(reloaded.find_references("zap").unwrap().len(), 1);
-        assert!(reloaded.find_references("missing").unwrap().is_empty());
+        // Reload
+        let loaded = WordIndex::load(dir.path()).unwrap();
+        let refs = loaded.find_references("shared").unwrap();
+        assert_eq!(refs.len(), 100);
     }
 }

@@ -25,8 +25,8 @@ use crate::fuzzy::deletion_neighborhood::DeletionIndex;
 use crate::parsing::symbols::Symbol;
 use crate::parsing::tokenizer::{self, LangFamily, Occurrence};
 use crate::word_index::{
-    IndexMeta, WordIndex, WordIndexBuilder, collect_file_mtimes, compute_content_hash,
-    index_dir_for_project, index_filename,
+    IndexMeta, WordIndex, WordIndexBuilder, collect_file_mtimes,
+    index_dir_for_project,
 };
 
 /// A symbol definition with its file location.
@@ -222,7 +222,12 @@ impl Workspace {
     /// Write a pre-populated word index builder to disk and store the result.
     ///
     /// Index is stored in the XDG cache directory: `~/.cache/quicklsp/<project-hash>/`
-    fn finish_word_index(&self, root: &Path, content_hash: u64, builder: WordIndexBuilder) {
+    fn finish_word_index(
+        &self,
+        root: &Path,
+        file_mtimes: &[(PathBuf, std::time::SystemTime)],
+        builder: WordIndexBuilder,
+    ) {
         let index_dir = match index_dir_for_project(root) {
             Some(d) => d,
             None => {
@@ -234,91 +239,62 @@ impl Workspace {
             tracing::warn!("Failed to create index cache directory: {}", index_dir.display());
             return;
         }
-        let index_path = index_dir.join(index_filename());
-
-        // Write to a PID-tagged temp file, then atomic-rename to the final path.
-        // This avoids clobbering if multiple processes index the same project
-        // concurrently — each writes its own temp file, last rename wins.
-        let tmp_name = format!("{}.{}.tmp", index_filename(), std::process::id());
-        let tmp_path = index_dir.join(&tmp_name);
 
         let entry_count = builder.entry_count();
-        match WordIndex::build(builder, &tmp_path) {
+        match WordIndex::build(builder, &index_dir) {
             Ok(index) => {
-                // Atomic rename: tmp → final. On POSIX this is atomic.
-                // If another process renames at the same time, last writer wins
-                // (both produce valid indexes for the same content hash).
-                if let Err(e) = std::fs::rename(&tmp_path, &index_path) {
-                    tracing::warn!("Failed to rename temp index to final path: {e}");
-                    let _ = std::fs::remove_file(&tmp_path);
-                    return;
-                }
-
-                let dir_size = index.word_dir().len();
-                tracing::info!(
-                    "Word index built: {} entries, {} unique words, dir memory ~{} KB, path: {}",
-                    entry_count,
-                    dir_size,
-                    index.word_dir().memory_usage() / 1024,
-                    index_path.display(),
-                );
-
                 // Save metadata for warm startup
                 let meta = IndexMeta {
                     version: crate::word_index::persistence::CURRENT_VERSION,
                     file_count: self.files.len() as u64,
                     entry_count: entry_count as u64,
-                    word_count: dir_size as u64,
+                    word_count: index.word_dir().len() as u64,
                     built_at: std::time::SystemTime::now()
                         .duration_since(std::time::SystemTime::UNIX_EPOCH)
                         .map(|d| d.as_secs())
                         .unwrap_or(0),
-                    content_hash,
+                    file_mtimes: IndexMeta::build_mtime_map(file_mtimes),
                 };
                 if let Err(e) = meta.save(&index_dir) {
                     tracing::warn!("Failed to save index metadata: {e}");
                 }
 
-                // Re-open from the renamed path so the stored path is correct.
-                match WordIndex::load(&index_path) {
-                    Ok(loaded) => *self.word_index.write().unwrap() = Some(loaded),
-                    Err(e) => tracing::warn!("Failed to reload renamed index: {e}"),
-                }
+                *self.word_index.write().unwrap() = Some(index);
             }
             Err(e) => {
                 tracing::warn!("Failed to build word index: {e}");
-                let _ = std::fs::remove_file(&tmp_path);
             }
         }
     }
 
     /// Try to load a persisted word index if it's still fresh.
     /// Returns true if warm startup succeeded.
-    fn try_warm_startup(&self, root: &Path, content_hash: u64) -> bool {
+    fn try_warm_startup(
+        &self,
+        root: &Path,
+        file_mtimes: &[(PathBuf, std::time::SystemTime)],
+    ) -> bool {
         let index_dir = match index_dir_for_project(root) {
             Some(d) => d,
             None => return false,
         };
-        let index_path = index_dir.join(index_filename());
 
-        // Check if meta.json exists and is fresh
         let meta = match IndexMeta::load(&index_dir) {
             Ok(m) => m,
             Err(_) => return false,
         };
 
-        if !meta.is_fresh(content_hash) {
+        if !meta.is_fresh(file_mtimes) {
             tracing::info!("Index stale, will re-index");
             return false;
         }
 
-        // Load the word index from disk
-        match WordIndex::load(&index_path) {
+        match WordIndex::load(&index_dir) {
             Ok(index) => {
                 tracing::info!(
                     "Warm startup: loaded index with {} words from {}",
                     index.word_dir().len(),
-                    index_path.display(),
+                    index_dir.display(),
                 );
                 *self.word_index.write().unwrap() = Some(index);
                 true
@@ -340,12 +316,9 @@ impl Workspace {
     ///
     /// Files already in the index (e.g., from a prior `did_open`) are skipped.
     pub fn scan_directory(&self, root: &Path) -> ScanStats {
-        // Phase 0: compute content hash for freshness checking
+        // Phase 0: collect file mtimes and try warm startup
         let file_mtimes = collect_file_mtimes(root, &should_skip_dir);
-        let content_hash = compute_content_hash(&file_mtimes);
-
-        // Try warm startup: load persisted index if it's fresh
-        let warm = self.try_warm_startup(root, content_hash);
+        let warm = self.try_warm_startup(root, &file_mtimes);
 
         // Phase 1: collect file paths (sequential — just readdir syscalls)
         let mut paths = Vec::new();
@@ -417,7 +390,7 @@ impl Workspace {
                 "Word index builder ready: {} entries, {}",
                 b.entry_count(), Self::rss_summary()
             );
-            self.finish_word_index(root, content_hash, b);
+            self.finish_word_index(root, &file_mtimes, b);
             tracing::info!("Word index written, {}", Self::rss_summary());
         }
 

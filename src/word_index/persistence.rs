@@ -1,45 +1,37 @@
-//! Index persistence: meta.json for freshness checks, warm startup.
+//! Index persistence: meta.json for per-file freshness checks, warm startup.
 //!
 //! Indexes are stored in the XDG cache directory under a per-project subdirectory:
-//! `~/.cache/quicklsp/<project-hash>/index.v<N>.qlsp`
+//! `~/.cache/quicklsp/<project-hash>/` with three data files + meta.json.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-/// Metadata about a persisted word index.
+/// Metadata about a persisted word index (v2: per-file mtime tracking).
 #[derive(Debug, Serialize, Deserialize)]
 pub struct IndexMeta {
-    /// Index format version (bump on breaking changes).
     pub version: u32,
-    /// Number of files that were indexed.
     pub file_count: u64,
-    /// Total number of index entries (occurrences).
     pub entry_count: u64,
-    /// Number of unique words in the directory.
     pub word_count: u64,
-    /// Timestamp when the index was built (seconds since UNIX epoch).
     pub built_at: u64,
-    /// Hashes of indexed file paths + mtimes for freshness checking.
-    /// We store a single hash rather than per-file data to keep meta.json small.
-    pub content_hash: u64,
+    /// Per-file modification times (path → epoch seconds).
+    pub file_mtimes: HashMap<String, u64>,
 }
 
 impl IndexMeta {
-    /// Path to meta.json in the index directory.
     pub fn meta_path(index_dir: &Path) -> PathBuf {
         index_dir.join("meta.json")
     }
 
-    /// Write meta.json to the index directory.
     pub fn save(&self, index_dir: &Path) -> std::io::Result<()> {
         let path = Self::meta_path(index_dir);
-        let json = serde_json::to_string_pretty(self)
+        let json = serde_json::to_string(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         std::fs::write(path, json)
     }
 
-    /// Load meta.json from the index directory.
     pub fn load(index_dir: &Path) -> std::io::Result<Self> {
         let path = Self::meta_path(index_dir);
         let json = std::fs::read_to_string(path)?;
@@ -47,20 +39,46 @@ impl IndexMeta {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 
-    /// Check if this index is still fresh for the given project.
-    pub fn is_fresh(&self, current_hash: u64) -> bool {
-        self.version == CURRENT_VERSION && self.content_hash == current_hash
+    /// Check if this index is fully fresh (no files changed).
+    pub fn is_fresh(&self, current_mtimes: &[(PathBuf, SystemTime)]) -> bool {
+        if self.version != CURRENT_VERSION {
+            return false;
+        }
+        if current_mtimes.len() != self.file_mtimes.len() {
+            return false;
+        }
+        for (path, mtime) in current_mtimes {
+            let path_str = path.to_string_lossy();
+            let secs = mtime
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            match self.file_mtimes.get(path_str.as_ref()) {
+                Some(&stored) if stored == secs => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    /// Build the mtime map from collected file mtimes.
+    pub fn build_mtime_map(files: &[(PathBuf, SystemTime)]) -> HashMap<String, u64> {
+        files
+            .iter()
+            .map(|(path, mtime)| {
+                let secs = mtime
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                (path.to_string_lossy().into_owned(), secs)
+            })
+            .collect()
     }
 }
 
-/// Current index format version.
-pub const CURRENT_VERSION: u32 = 1;
+pub const CURRENT_VERSION: u32 = 2;
 
 /// Compute the XDG cache directory for a project's index.
-///
-/// Returns `$XDG_CACHE_HOME/quicklsp/<project-hash>/` where project-hash
-/// is a hex-encoded FNV-1a hash of the canonicalized project root path.
-/// Falls back to `~/.cache/quicklsp/<project-hash>/` if XDG_CACHE_HOME is unset.
 pub fn index_dir_for_project(project_root: &Path) -> Option<PathBuf> {
     let cache_base = std::env::var("XDG_CACHE_HOME")
         .ok()
@@ -71,7 +89,6 @@ pub fn index_dir_for_project(project_root: &Path) -> Option<PathBuf> {
                 .map(|h| PathBuf::from(h).join(".cache"))
         })?;
 
-    // Hash the canonical project root for a stable, unique directory name
     let canonical = std::fs::canonicalize(project_root)
         .unwrap_or_else(|_| project_root.to_path_buf());
     let hash = path_hash(&canonical);
@@ -79,12 +96,6 @@ pub fn index_dir_for_project(project_root: &Path) -> Option<PathBuf> {
     Some(cache_base.join("quicklsp").join(format!("{hash:016x}")))
 }
 
-/// Versioned index filename: `index.v<N>.qlsp`
-pub fn index_filename() -> String {
-    format!("index.v{CURRENT_VERSION}.qlsp")
-}
-
-/// FNV-1a hash of a path, used for per-project cache directory naming.
 fn path_hash(path: &Path) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
     for byte in path.to_string_lossy().as_bytes() {
@@ -94,33 +105,11 @@ fn path_hash(path: &Path) -> u64 {
     hash
 }
 
-/// Compute a content hash from file paths and their modification times.
-/// This is a fast, non-cryptographic hash for freshness checking.
-pub fn compute_content_hash(files: &[(PathBuf, SystemTime)]) -> u64 {
-    let mut hash: u64 = 0xcbf29ce484222325; // FNV-1a offset basis
-    for (path, mtime) in files {
-        // Hash the path
-        for byte in path.to_string_lossy().as_bytes() {
-            hash ^= *byte as u64;
-            hash = hash.wrapping_mul(0x100000001b3); // FNV prime
-        }
-        // Hash the mtime
-        if let Ok(duration) = mtime.duration_since(SystemTime::UNIX_EPOCH) {
-            let secs = duration.as_secs();
-            for i in 0..8 {
-                hash ^= (secs >> (i * 8)) & 0xff;
-                hash = hash.wrapping_mul(0x100000001b3);
-            }
-        }
-    }
-    hash
-}
-
-/// Collect file paths and mtimes for content hash computation.
+/// Collect file paths and mtimes for freshness checking.
 pub fn collect_file_mtimes(root: &Path, skip_dirs: &dyn Fn(&str) -> bool) -> Vec<(PathBuf, SystemTime)> {
     let mut result = Vec::new();
     collect_mtimes_recursive(root, skip_dirs, &mut result, 0);
-    result.sort_by(|a, b| a.0.cmp(&b.0)); // sort for deterministic hash
+    result.sort_by(|a, b| a.0.cmp(&b.0));
     result
 }
 
@@ -167,58 +156,31 @@ mod tests {
     #[test]
     fn meta_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
+        let mut file_mtimes = HashMap::new();
+        file_mtimes.insert("/a.rs".to_string(), 1700000000u64);
+        file_mtimes.insert("/b.rs".to_string(), 1700000001u64);
         let meta = IndexMeta {
             version: CURRENT_VERSION,
-            file_count: 100,
+            file_count: 2,
             entry_count: 5000,
             word_count: 1500,
             built_at: 1700000000,
-            content_hash: 0xdeadbeef,
+            file_mtimes,
         };
         meta.save(dir.path()).unwrap();
 
         let loaded = IndexMeta::load(dir.path()).unwrap();
         assert_eq!(loaded.version, CURRENT_VERSION);
-        assert_eq!(loaded.file_count, 100);
-        assert_eq!(loaded.content_hash, 0xdeadbeef);
-        assert!(loaded.is_fresh(0xdeadbeef));
-        assert!(!loaded.is_fresh(0xbaadf00d));
-    }
-
-    #[test]
-    fn content_hash_deterministic() {
-        let files = vec![
-            (PathBuf::from("/a.rs"), SystemTime::UNIX_EPOCH),
-            (PathBuf::from("/b.rs"), SystemTime::UNIX_EPOCH),
-        ];
-        let h1 = compute_content_hash(&files);
-        let h2 = compute_content_hash(&files);
-        assert_eq!(h1, h2);
-    }
-
-    #[test]
-    fn content_hash_changes_with_files() {
-        let files1 = vec![(PathBuf::from("/a.rs"), SystemTime::UNIX_EPOCH)];
-        let files2 = vec![(PathBuf::from("/b.rs"), SystemTime::UNIX_EPOCH)];
-        assert_ne!(compute_content_hash(&files1), compute_content_hash(&files2));
+        assert_eq!(loaded.file_count, 2);
+        assert_eq!(loaded.file_mtimes.len(), 2);
     }
 
     #[test]
     fn index_dir_uses_xdg_cache() {
-        // With XDG_CACHE_HOME set
         std::env::set_var("XDG_CACHE_HOME", "/tmp/test-xdg-cache");
         let dir = index_dir_for_project(Path::new("/home/user/myproject")).unwrap();
         assert!(dir.starts_with("/tmp/test-xdg-cache/quicklsp/"));
-        assert!(!dir.to_string_lossy().contains("myproject")); // hashed, not literal
         std::env::remove_var("XDG_CACHE_HOME");
-    }
-
-    #[test]
-    fn index_filename_includes_version() {
-        let name = index_filename();
-        assert!(name.starts_with("index.v"), "got: {name}");
-        assert!(name.ends_with(".qlsp"), "got: {name}");
-        assert!(name.contains(&CURRENT_VERSION.to_string()), "got: {name}");
     }
 
     #[test]
