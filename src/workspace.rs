@@ -358,7 +358,8 @@ impl Workspace {
                 })
                 .collect();
 
-            // Lock builder once for the entire chunk.
+            // Lock builder once for the entire chunk, drain occurrences,
+            // then flush entries to disk so peak memory stays bounded.
             if let Some(ref mtx) = builder {
                 let mut b = mtx.lock().unwrap();
                 for (path, source) in &chunk_data {
@@ -366,6 +367,9 @@ impl Workspace {
                         let occurrences = std::mem::take(&mut entry.value_mut().occurrences);
                         b.drain_file_occurrences(path, occurrences, source);
                     }
+                }
+                if let Err(e) = b.flush_to_disk() {
+                    tracing::warn!("Failed to flush word index chunk to disk: {e}");
                 }
             } else {
                 for (path, _) in &chunk_data {
