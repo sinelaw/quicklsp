@@ -235,9 +235,24 @@ impl Workspace {
         }
         let index_path = index_dir.join(index_filename());
 
+        // Write to a PID-tagged temp file, then atomic-rename to the final path.
+        // This avoids clobbering if multiple processes index the same project
+        // concurrently — each writes its own temp file, last rename wins.
+        let tmp_name = format!("{}.{}.tmp", index_filename(), std::process::id());
+        let tmp_path = index_dir.join(&tmp_name);
+
         let entry_count = builder.entry_count();
-        match WordIndex::build(builder, &index_path) {
+        match WordIndex::build(builder, &tmp_path) {
             Ok(index) => {
+                // Atomic rename: tmp → final. On POSIX this is atomic.
+                // If another process renames at the same time, last writer wins
+                // (both produce valid indexes for the same content hash).
+                if let Err(e) = std::fs::rename(&tmp_path, &index_path) {
+                    tracing::warn!("Failed to rename temp index to final path: {e}");
+                    let _ = std::fs::remove_file(&tmp_path);
+                    return;
+                }
+
                 let dir_size = index.word_dir().len();
                 tracing::info!(
                     "Word index built: {} entries, {} unique words, dir memory ~{} KB, path: {}",
@@ -263,10 +278,15 @@ impl Workspace {
                     tracing::warn!("Failed to save index metadata: {e}");
                 }
 
-                *self.word_index.write().unwrap() = Some(index);
+                // Re-open from the renamed path so the stored path is correct.
+                match WordIndex::load(&index_path) {
+                    Ok(loaded) => *self.word_index.write().unwrap() = Some(loaded),
+                    Err(e) => tracing::warn!("Failed to reload renamed index: {e}"),
+                }
             }
             Err(e) => {
                 tracing::warn!("Failed to build word index: {e}");
+                let _ = std::fs::remove_file(&tmp_path);
             }
         }
     }
@@ -364,7 +384,8 @@ impl Workspace {
                 crate::parsing::tokenizer::stats::flush();
             });
 
-            // Drain this batch's occurrences immediately to free memory
+            // Drain this batch's occurrences and flush a sorted run to disk.
+            // This keeps peak memory bounded to one batch instead of all files.
             if let Some(ref mut b) = builder {
                 for path in batch {
                     if let Some(mut entry) = self.files.get_mut(path) {
@@ -372,8 +393,11 @@ impl Workspace {
                         b.drain_file_occurrences(path, occurrences);
                     }
                 }
+                if let Err(e) = b.flush_sorted_run() {
+                    tracing::warn!("Failed to flush sorted run for batch {}: {e}", batch_idx);
+                }
                 tracing::info!(
-                    "batch {}: indexed {} files, builder has {} entries, {}",
+                    "batch {}: indexed {} files, {} entries flushed, {}",
                     batch_idx, batch.len(), b.entry_count(), Self::rss_summary()
                 );
             } else {
