@@ -275,46 +275,69 @@ time. Periodically compact the overlay into the base.
 
 This is the same principle as LSM-trees (LevelDB, RocksDB, Lucene).
 
+#### Key insight: one format for everything
+
+The base index and the overlay don't need to be separate formats.
+Both are sequences of "here are the occurrences for file X." The
+only difference is whether the data was written during cold indexing
+or during an incremental edit.
+
+So the entire index — base and overlay — can be a single append-only
+log. Cold indexing appends all files. Incremental edits append
+changed files. Compaction rewrites the log without dead entries.
+
+The log is the write format. At load time, a sequential scan builds
+in-memory query structures (word directory, posting lists, per-file
+occurrence table). Queries are served from memory, never hitting
+disk (for moderate codebases). For huge codebases where all
+occurrences can't fit in memory, the compacted base stays as the
+current seekable three-file format, and only the overlay is a log.
+
 #### On-disk layout
 
 ```
 ~/.cache/quicklsp/<project>/
-  words.v2.bin      ← base string tables (word_id → word, path_id → path)
-  files.v2.bin      ← base per-file occurrences
-  index.v2.bin      ← base posting lists
-  meta.json          ← base metadata + per-file mtimes
-  symbols.bin        ← base symbol cache
-
-  overlay.log        ← NEW: append-only change log
+  index.log          ← single append-only file (replaces all v2 files)
+  meta.json          ← per-file mtimes for change detection
 ```
 
-#### overlay.log format (append-only)
+For the hybrid approach (huge codebases):
 
-The overlay is a sequential log of tagged entries. Each file change
-appends one or more entries to the end. No seeking, no rewriting of
-earlier data. The file is never modified in-place — only appended to
-or replaced wholesale during compaction.
+```
+~/.cache/quicklsp/<project>/
+  words.v2.bin      ← compacted base string tables
+  files.v2.bin      ← compacted base per-file occurrences (seekable)
+  index.v2.bin      ← compacted base posting lists
+  meta.json          ← per-file mtimes
+  overlay.log        ← append-only overlay for recent changes
+```
+
+#### index.log / overlay.log format (append-only)
+
+A sequential log of tagged entries. Cold indexing writes all files in
+one pass. Incremental edits append to the end. The file is never
+modified in-place — only appended to, or replaced during compaction.
 
 ```
 [header: 12 bytes]
-  magic(8) = "QLSO\x01\x00\x00\x00"
-  base_word_count(u32)         — word_table.len() when base was built
+  magic(8) = "QLSL\x01\x00\x00\x00"
+  reserved(u32)
 
 [repeated entries, append-only]:
 
-  TAG 0x01 — new word
+  TAG 0x01 — define word
     tag(u8) = 0x01
     len(u16)
     word_bytes(len)
-    — assigns word_id = base_word_count + (sequential counter)
+    — assigns word_id sequentially (0, 1, 2, ...)
 
-  TAG 0x02 — new path
+  TAG 0x02 — define path
     tag(u8) = 0x02
     len(u32)
     path_bytes(len)
-    — assigns path_id = base_path_count + (sequential counter)
+    — assigns path_id sequentially (0, 1, 2, ...)
 
-  TAG 0x03 — file patch (replaces all occurrences for a file)
+  TAG 0x03 — file occurrences (replaces any earlier entry for this path_id)
     tag(u8) = 0x03
     path_id(u32)
     mtime(u64)                 — unix seconds, for freshness checks
@@ -326,6 +349,7 @@ or replaced wholesale during compaction.
   TAG 0x04 — file removed
     tag(u8) = 0x04
     path_id(u32)
+    — removes this file's occurrences, symbols, and definitions
     — logically removes this file from the index
 
   TAG 0x05 — symbol update (for a single file)
@@ -356,134 +380,131 @@ mtimes (in TAG 0x03) and removed files (TAG 0x04). On load, scan
 the log to reconstruct the overlay state. The log is small, so this
 scan is fast.
 
-#### Loading the overlay (startup)
+#### Loading (startup)
 
-Read overlay.log sequentially from start to end:
+Read the log sequentially from start to end:
 
-1. For each TAG 0x01: append word to `new_words` vec.
-2. For each TAG 0x02: append path to `new_paths` vec.
-3. For each TAG 0x03: insert/replace in `patched_files[path_id]`.
-   Record mtime.
-4. For each TAG 0x04: insert into `removed_files` set.
-5. For each TAG 0x05: update cached symbols for the file.
+1. For each TAG 0x01: append word to `word_table`.
+2. For each TAG 0x02: append path to `path_table`.
+3. For each TAG 0x03: insert/replace in `file_occs[path_id]`.
+4. For each TAG 0x04: delete from `file_occs` and `symbols`, add to `removed`.
+5. For each TAG 0x05: insert/replace in `symbols[path_id]`.
 
-Build the in-memory `word_to_files` reverse index from patched
-files' occurrences.
+Then build query structures from `file_occs`:
+- Posting lists: for each live file, collect unique word_ids → file_id.
+- Word directory: sorted word lookup for binary search.
 
-Cost: O(log size). The log is bounded by compaction threshold, so
-this is fast — typically under 1 MB even after hundreds of edits.
+A truncated trailing entry (from crash) is detected by checking
+remaining bytes before parsing. Discard and continue.
 
-#### Query path: merge base + overlay
+Cost: O(log size). One sequential read. For 100K files with ~3M
+entries, the log is ~42 MB → ~20ms read + ~50ms to build postings.
+
+For the hybrid approach: load the compacted base via the existing
+three-file reader, then scan overlay.log (which is small) to apply
+patches on top.
+
+#### Query path
+
+All queries use in-memory structures built at load time.
 
 **find_references(word):**
+1. Look up word_id in word directory (binary search).
+2. Get posting list: `postings[word_id]` → file_ids.
+3. For each file_id: get occurrences from `file_occs[file_id]`.
+4. Filter for matching word_id. Return results.
 
-1. Look up `word` in base `word_dir` → `(posting_offset, posting_count)`.
-   Also check if word is in the overlay's new words (small hash map
-   lookup — overlay is tiny).
+For the pure log approach: all data is in memory, no disk I/O per
+query. Faster than the current design which seeks into files.v2.bin.
 
-2. Read base posting list: file_ids that contain this word.
-
-3. Filter out file_ids that are patched or removed in the overlay.
-
-4. For surviving base file_ids: read occurrences from base
-   `files.v2.bin` (existing code path, unchanged).
-
-5. For patched file_ids: read occurrences from in-memory overlay
-   (loaded at startup from overlay.log).
-
-6. For new file_ids (added files in overlay): scan their overlay
-   occurrences for the word.
-
-7. Merge results.
-
-Cost: O(base postings for word + overlay size). The overlay is small
-(only changed files), so this adds negligible overhead to queries.
-
-**Per-file occurrences (for files.v2.bin reads):**
-
-- If file_id is NOT in overlay → read from base files.v2.bin (unchanged)
-- If file_id IS in overlay → read from in-memory overlay
-- This is a simple branch before the existing seek+read logic.
+For the hybrid approach: base posting lists read from disk (existing
+code), patched files served from in-memory overlay. A branch before
+the existing seek+read logic checks whether the file_id is patched.
 
 #### Update path: O(changed file's entries)
 
-When a file changes:
+When a file changes (did_save, did_change, or scan detects modified
+mtime):
 
-1. **Tokenize** the changed file → occurrences.
+1. **Tokenize** the file → occurrences + symbols.
 
-2. **Intern new words**: Check each word against the base word table
-   + existing overlay words (both in memory). Words not found get new
-   IDs. Append TAG 0x01 entries to the log for each new word.
+2. **Intern new words**: Check each word against the in-memory word
+   table. New words get IDs appended sequentially. Append TAG 0x01
+   entries to the log for each.
 
-3. **Append TAG 0x03** to overlay.log: path_id + mtime + occurrences.
+3. **Append TAG 0x02** if it's a brand-new file.
 
-4. **Append TAG 0x05** to overlay.log: updated symbols for this file.
+4. **Append TAG 0x03** with the file's occurrences.
 
-5. **Update in-memory overlay**: replace entry in `patched_files`,
-   rebuild `word_to_files` for this file.
+5. **Append TAG 0x05** with the file's updated symbols.
 
-Cost: O(entries in changed file). One append write. No reading or
-rewriting of base index or other overlay entries.
+6. **Update in-memory structures**: replace `file_occs[path_id]`,
+   update posting lists (remove old word→file mappings, add new).
+   Replace symbols for this file. Remove old definitions from the
+   definitions DashMap, insert new ones.
 
-#### Compaction: amortized O(total)
+Cost: O(entries in changed file). One sequential append. No reading
+or rewriting of any other data.
 
-When the overlay grows beyond a threshold (e.g., >5% of base size
-or >1000 patched files), compact by rebuilding the full base index:
+When a file is deleted: append TAG 0x04. Remove from in-memory
+`file_occs`, posting lists, symbols, and definitions.
 
-1. The current cold-index path already produces fresh base files.
-2. Delete overlay.log.
-3. The new base incorporates all overlay changes.
+#### Compaction
 
-This is the current full rebuild, but it happens infrequently.
-Amortized cost per update: O(1) average, O(total) worst case.
+When the log has too much dead space (>30% dead, or log > 2× live
+data), rewrite:
 
-Compaction can be triggered:
-- At startup if overlay is large.
-- In background during idle periods.
-- Never during active editing (to avoid blocking).
+1. Scan log, keep only live entries (last TAG 0x03 per path_id,
+   excluding removed files).
+2. Write a new log with only live entries.
+3. Atomic rename new → old.
+
+For the hybrid approach: compact overlay into the base three-file
+format (current cold-index path), delete overlay.log.
+
+Triggers: startup if over threshold, background during idle, never
+during active editing.
 
 #### In-memory structures
 
-After loading base + overlay:
-
 ```
 WordIndex {
-    // Base index (existing)
-    index_dir: PathBuf,
-    word_dir: WordDirectory,        // base word directory
-    file_table: Vec<(u64, u32)>,    // base file table
-    path_table: Vec<String>,
+    log_path: PathBuf,
+
+    // String tables (from TAG 0x01 / 0x02 entries)
     word_table: Vec<String>,
+    word_lookup: HashMap<String, u32>,
+    path_table: Vec<String>,
+    path_lookup: HashMap<String, u32>,
 
-    // Overlay (new)
-    overlay: Option<Overlay>,
-}
+    // Per-file data (from TAG 0x03, last entry wins per path_id)
+    file_occs: HashMap<u32, Vec<OccEntry>>,
+    file_mtimes: HashMap<u32, u64>,
 
-Overlay {
-    patched_files: HashMap<u32, OverlayFile>,  // path_id → new occs
-    removed_files: HashSet<u32>,                // invalidated path_ids
-    new_words: Vec<String>,                     // IDs = base_word_count + i
-    new_paths: Vec<String>,                     // IDs = base_path_count + i
-    // Reverse posting index for overlay entries (small)
-    word_to_files: HashMap<u32, Vec<u32>>,      // word_id → [path_id]
-}
+    // Query structures (built from file_occs at load time)
+    postings: Vec<Vec<u32>>,          // word_id → [file_ids]
+    word_dir: WordDirectory,          // sorted binary search
 
-OverlayFile {
-    occurrences: Vec<(u32, u32, u32, u16)>,  // (word_id, line, col, len)
+    // For append writes
+    log_writer: Option<BufWriter<File>>,
 }
 ```
 
-Memory for the overlay: proportional to the number of changed files ×
-their avg occurrences. For 10 changed files × 500 entries: ~100 KB.
-Negligible.
+Memory for 100K files / ~3M occurrences:
+- word_table + path_table: ~7 MB
+- file_occs: ~3M × 14 bytes = ~42 MB
+- postings: ~100K words × avg 10 files × 4 bytes = ~4 MB
+- **Total: ~53 MB**
+
+For Linux kernel scale (47M entries): ~700 MB for file_occs, which
+needs the hybrid approach (compacted base on disk + small overlay
+in memory).
 
 ### What stays the same
 
-- Cold index path: unchanged. Builds base index from scratch.
-- FullyFresh warm startup: unchanged. Loads base index, no overlay.
-- All existing query methods: unchanged internally, just add an
-  overlay merge step.
-- Three-file format: unchanged. Overlay is an additional file.
+- All LSP operations: definitions, references, hover, completions.
+- Cold index as a fallback / compaction target.
+- The three-file format remains as an option for the hybrid approach.
 
 ### Implementation order
 
