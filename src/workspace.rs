@@ -24,6 +24,7 @@ use tower_lsp::lsp_types::Url;
 use crate::fuzzy::deletion_neighborhood::DeletionIndex;
 use crate::parsing::symbols::Symbol;
 use crate::parsing::tokenizer::{self, LangFamily, Occurrence};
+use crate::parsing::tree_sitter_parse::{self, TsParser};
 use crate::word_index::{
     IndexMeta, WordIndex, WordIndexBuilder, collect_file_mtimes,
     index_dir_for_project,
@@ -162,24 +163,22 @@ impl Workspace {
             .and_then(|e| e.to_str())
             .and_then(LangFamily::from_extension);
 
-        let (scan_result, def_contexts) = lang
-            .map(|l| tokenizer::scan_with_contexts(&source, l))
-            .unwrap_or_else(|| {
-                (
-                    tokenizer::ScanResult {
-                        tokens: Vec::new(),
-                        occurrences: Vec::new(),
-                    },
-                    Vec::new(),
-                )
-            });
-
-        let mut symbols = Symbol::from_tokens_with_contexts(&scan_result.tokens, &def_contexts);
-
-        // Enrich symbols with doc comments and signatures from the source text
-        if let Some(l) = lang {
-            Symbol::enrich_from_source(&mut symbols, &source, l);
-        }
+        let (symbols, occurrences) = match lang {
+            Some(LangFamily::CLike) => {
+                let result = tree_sitter_parse::c::CParser::parse(source);
+                let mut symbols = result.symbols;
+                Symbol::enrich_from_source(&mut symbols, source, LangFamily::CLike);
+                (symbols, result.occurrences)
+            }
+            Some(l) => {
+                let (scan_result, def_contexts) = tokenizer::scan_with_contexts(source, l);
+                let mut symbols =
+                    Symbol::from_tokens_with_contexts(&scan_result.tokens, &def_contexts);
+                Symbol::enrich_from_source(&mut symbols, source, l);
+                (symbols, scan_result.occurrences)
+            }
+            None => (Vec::new(), Vec::new()),
+        };
 
         // Remove old definitions for this file before inserting new ones
         self.remove_definitions_for_file(&path);
@@ -206,7 +205,6 @@ impl Workspace {
             }
         }
 
-        let occurrences = scan_result.occurrences;
         self.files.insert(path, FileEntry { symbols, lang, occurrences });
     }
 

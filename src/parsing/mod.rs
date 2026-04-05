@@ -8,3 +8,4 @@
 
 pub mod symbols;
 pub mod tokenizer;
+pub mod tree_sitter_parse;
