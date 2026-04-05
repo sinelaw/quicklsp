@@ -442,7 +442,11 @@ impl LanguageServer for QuickLspServer {
         }
     }
 
-    async fn did_close(&self, _params: DidCloseTextDocumentParams) {}
+    async fn did_close(&self, params: DidCloseTextDocumentParams) {
+        if let Ok(path) = params.text_document.uri.to_file_path() {
+            self.workspace.close_file(&path);
+        }
+    }
 
     async fn goto_definition(
         &self,

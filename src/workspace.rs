@@ -379,6 +379,14 @@ impl Workspace {
         self.index_file(path, source);
     }
 
+    /// Mark a file as closed by the editor.
+    ///
+    /// Removes the in-memory source text so we fall back to reading from disk,
+    /// but keeps the file's symbols and definitions indexed.
+    pub fn close_file(&self, path: &Path) {
+        self.open_sources.remove(path);
+    }
+
     /// Remove a file from all indices.
     pub fn remove_file(&self, path: &Path) {
         self.remove_definitions_for_file(path);
