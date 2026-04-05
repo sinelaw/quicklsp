@@ -149,6 +149,21 @@ impl DeletionIndex {
         self.symbols.is_empty()
     }
 
+    /// Access the symbol list (for memory profiling).
+    pub fn symbols(&self) -> &[String] {
+        &self.symbols
+    }
+
+    /// Number of trigram buckets.
+    pub fn trigram_count(&self) -> usize {
+        self.trigrams.len()
+    }
+
+    /// Total number of entries across all trigram buckets.
+    pub fn trigram_entry_count(&self) -> usize {
+        self.trigrams.values().map(|v| v.len()).sum()
+    }
+
     /// Clear the entire index.
     pub fn clear(&mut self) {
         self.symbols.clear();

@@ -269,4 +269,18 @@ fn run_all(root: &Path) {
     tracing::info!("fuzzy (deps, {} queries): {:.2?}", dep_fuzzy_count, t.elapsed());
 
     log_memory("end");
+
+    // Memory breakdown
+    tracing::info!("--- memory breakdown ---");
+    let breakdown = ws.memory_breakdown();
+    let mut total_measured = 0usize;
+    for (name, bytes) in &breakdown {
+        if name.starts_with("(count)") {
+            tracing::info!("  {}: {}", name, bytes);
+        } else {
+            tracing::info!("  {}: {}", name, fmt_bytes(*bytes));
+            total_measured += bytes;
+        }
+    }
+    tracing::info!("  TOTAL measured: {}", fmt_bytes(total_measured));
 }
