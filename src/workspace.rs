@@ -265,6 +265,11 @@ impl Workspace {
                     tracing::warn!("Failed to save index metadata: {e}");
                 }
 
+                // Save symbols for warm startup (avoid re-parsing all files).
+                if let Err(e) = save_symbols(&self.files, &index_dir) {
+                    tracing::warn!("Failed to save symbols: {e}");
+                }
+
                 *self.word_index.write().unwrap() = Some(index);
             }
             Err(e) => {
@@ -295,21 +300,38 @@ impl Workspace {
             return false;
         }
 
-        match WordIndex::load(&index_dir) {
-            Ok(index) => {
-                tracing::info!(
-                    "Warm startup: loaded index with {} words from {}",
-                    index.word_dir().len(),
-                    index_dir.display(),
-                );
-                *self.word_index.write().unwrap() = Some(index);
-                true
-            }
+        // Load word index.
+        let index = match WordIndex::load(&index_dir) {
+            Ok(idx) => idx,
             Err(e) => {
                 tracing::warn!("Failed to load word index: {e}");
-                false
+                return false;
             }
+        };
+
+        // Load symbols + definitions from disk (avoids re-parsing all files).
+        if let Err(e) = load_symbols(
+            &self.files,
+            &self.definitions,
+            &self.file_ids,
+            &self.id_to_path,
+            &index_dir,
+        ) {
+            tracing::warn!("Failed to load symbols: {e}");
+            return false;
         }
+
+        self.fuzzy_dirty.store(true, std::sync::atomic::Ordering::Release);
+
+        tracing::info!(
+            "Warm startup: loaded index with {} words, {} files, {} definitions from {}",
+            index.word_dir().len(),
+            self.files.len(),
+            self.definitions.len(),
+            index_dir.display(),
+        );
+        *self.word_index.write().unwrap() = Some(index);
+        true
     }
 
     /// Scan a directory tree and index all files with supported extensions.
@@ -326,6 +348,20 @@ impl Workspace {
         let file_mtimes = collect_file_mtimes(root, &should_skip_dir);
         let warm = self.try_warm_startup(root, &file_mtimes);
 
+        if warm {
+            // Everything loaded from disk — no need to re-parse any files.
+            let stats = ScanStats {
+                indexed: self.files.len(),
+                skipped: 0,
+                errors: 0,
+            };
+            tracing::info!(
+                "Workspace scan complete (warm): {} files loaded from cache",
+                stats.indexed,
+            );
+            return stats;
+        }
+
         // Phase 1: collect file paths (sequential — just readdir syscalls)
         let mut paths = Vec::new();
         let mut skipped = 0usize;
@@ -339,11 +375,7 @@ impl Workspace {
         let indexed = AtomicUsize::new(0);
         let errors = AtomicUsize::new(0);
 
-        let builder: Option<std::sync::Mutex<WordIndexBuilder>> = if !warm {
-            Some(std::sync::Mutex::new(WordIndexBuilder::new()))
-        } else {
-            None
-        };
+        let builder = std::sync::Mutex::new(WordIndexBuilder::new());
 
         const CHUNK_SIZE: usize = 100;
 
@@ -368,8 +400,8 @@ impl Workspace {
 
             // Lock builder once for the entire chunk, drain occurrences,
             // then flush entries to disk so peak memory stays bounded.
-            if let Some(ref mtx) = builder {
-                let mut b = mtx.lock().unwrap();
+            {
+                let mut b = builder.lock().unwrap();
                 for (path, source) in &chunk_data {
                     if let Some(mut entry) = self.files.get_mut(*path) {
                         let occurrences = std::mem::take(&mut entry.value_mut().occurrences);
@@ -378,12 +410,6 @@ impl Workspace {
                 }
                 if let Err(e) = b.flush_to_disk() {
                     tracing::warn!("Failed to flush word index chunk to disk: {e}");
-                }
-            } else {
-                for (path, _) in &chunk_data {
-                    if let Some(mut entry) = self.files.get_mut(*path) {
-                        entry.value_mut().occurrences = Vec::new();
-                    }
                 }
             }
 
@@ -394,8 +420,8 @@ impl Workspace {
         self.fuzzy_dirty.store(true, std::sync::atomic::Ordering::Release);
 
         // Phase 4: write the accumulated word index to disk
-        if let Some(mtx) = builder {
-            let b = mtx.into_inner().unwrap();
+        {
+            let b = builder.into_inner().unwrap();
             tracing::info!(
                 "Word index builder ready: {} entries, {}",
                 b.entry_count(), Self::rss_summary()
@@ -1010,6 +1036,273 @@ impl Workspace {
 impl Default for Workspace {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ── Symbol persistence for warm startup ───────────────────────────────
+
+use crate::parsing::symbols::SymbolKind;
+use crate::parsing::tokenizer::Visibility;
+use std::io::{BufReader, BufWriter, Read as IoRead, Write as IoWrite};
+
+const SYMBOLS_MAGIC: &[u8; 8] = b"QLSY\x01\x00\x00\x00";
+
+/// Save all file symbols + definitions to a compact binary file.
+/// Excludes doc_comment and signature (already stripped).
+fn save_symbols(
+    files: &DashMap<PathBuf, FileEntry>,
+    index_dir: &Path,
+) -> std::io::Result<()> {
+    let path = index_dir.join("symbols.bin");
+    let mut w = BufWriter::with_capacity(1 << 20, std::fs::File::create(&path)?);
+
+    w.write_all(SYMBOLS_MAGIC)?;
+    let file_count = files.len() as u32;
+    w.write_all(&file_count.to_le_bytes())?;
+
+    for entry in files.iter() {
+        let path_bytes = entry.key().to_string_lossy();
+        let path_bytes = path_bytes.as_bytes();
+        w.write_all(&(path_bytes.len() as u32).to_le_bytes())?;
+        w.write_all(path_bytes)?;
+
+        let lang_byte = match entry.value().lang {
+            None => 0u8,
+            Some(LangFamily::CLike) => 1,
+            Some(LangFamily::Rust) => 2,
+            Some(LangFamily::Python) => 3,
+            Some(LangFamily::JsTs) => 4,
+            Some(LangFamily::Go) => 5,
+            Some(LangFamily::JavaCSharp) => 6,
+            Some(LangFamily::Ruby) => 7,
+        };
+        w.write_all(&[lang_byte])?;
+
+        let sym_count = entry.value().symbols.len() as u32;
+        w.write_all(&sym_count.to_le_bytes())?;
+
+        for sym in &entry.value().symbols {
+            // name
+            w.write_all(&(sym.name.len() as u16).to_le_bytes())?;
+            w.write_all(sym.name.as_bytes())?;
+            // kind
+            w.write_all(&[symbol_kind_to_u8(sym.kind)])?;
+            // line, col
+            w.write_all(&(sym.line as u32).to_le_bytes())?;
+            w.write_all(&(sym.col as u32).to_le_bytes())?;
+            // def_keyword
+            w.write_all(&(sym.def_keyword.len() as u16).to_le_bytes())?;
+            w.write_all(sym.def_keyword.as_bytes())?;
+            // visibility
+            w.write_all(&[visibility_to_u8(sym.visibility)])?;
+            // container
+            match &sym.container {
+                Some(c) => {
+                    w.write_all(&[1u8])?;
+                    w.write_all(&(c.len() as u16).to_le_bytes())?;
+                    w.write_all(c.as_bytes())?;
+                }
+                None => w.write_all(&[0u8])?,
+            }
+            // depth
+            w.write_all(&(sym.depth as u32).to_le_bytes())?;
+        }
+    }
+    w.flush()?;
+    Ok(())
+}
+
+/// Load symbols from disk and populate files, definitions, file_ids, id_to_path.
+fn load_symbols(
+    files: &DashMap<PathBuf, FileEntry>,
+    definitions: &DashMap<String, Vec<SymbolRef>>,
+    file_ids: &DashMap<PathBuf, FileId>,
+    id_to_path: &std::sync::RwLock<Vec<PathBuf>>,
+    index_dir: &Path,
+) -> std::io::Result<()> {
+    let path = index_dir.join("symbols.bin");
+    let mut r = BufReader::with_capacity(1 << 20, std::fs::File::open(&path)?);
+
+    let mut magic = [0u8; 8];
+    r.read_exact(&mut magic)?;
+    if &magic != SYMBOLS_MAGIC {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bad symbols magic"));
+    }
+
+    let mut buf4 = [0u8; 4];
+    r.read_exact(&mut buf4)?;
+    let file_count = u32::from_le_bytes(buf4);
+
+    let mut id_table = id_to_path.write().unwrap();
+
+    for _ in 0..file_count {
+        // path
+        r.read_exact(&mut buf4)?;
+        let path_len = u32::from_le_bytes(buf4) as usize;
+        let mut path_bytes = vec![0u8; path_len];
+        r.read_exact(&mut path_bytes)?;
+        let file_path = PathBuf::from(String::from_utf8_lossy(&path_bytes).into_owned());
+
+        // lang
+        let mut lang_byte = [0u8; 1];
+        r.read_exact(&mut lang_byte)?;
+        let lang = match lang_byte[0] {
+            1 => Some(LangFamily::CLike),
+            2 => Some(LangFamily::Rust),
+            3 => Some(LangFamily::Python),
+            4 => Some(LangFamily::JsTs),
+            5 => Some(LangFamily::Go),
+            6 => Some(LangFamily::JavaCSharp),
+            7 => Some(LangFamily::Ruby),
+            _ => None,
+        };
+
+        // sym_count
+        r.read_exact(&mut buf4)?;
+        let sym_count = u32::from_le_bytes(buf4) as usize;
+
+        // Assign file_id
+        let fid = FileId(id_table.len() as u32);
+        id_table.push(file_path.clone());
+        file_ids.insert(file_path.clone(), fid);
+
+        let mut symbols = Vec::with_capacity(sym_count);
+        for sym_idx in 0..sym_count {
+            let sym = read_symbol(&mut r)?;
+
+            // Insert into definitions
+            let sym_ref = SymbolRef {
+                file_id: fid,
+                symbol_idx: sym_idx as u32,
+            };
+            definitions
+                .entry(sym.name.clone())
+                .or_default()
+                .push(sym_ref);
+
+            symbols.push(sym);
+        }
+
+        files.insert(file_path, FileEntry {
+            symbols,
+            lang,
+            occurrences: Vec::new(),
+        });
+    }
+
+    Ok(())
+}
+
+fn read_symbol(r: &mut impl IoRead) -> std::io::Result<Symbol> {
+    let mut buf2 = [0u8; 2];
+    let mut buf4 = [0u8; 4];
+    let mut buf1 = [0u8; 1];
+
+    // name
+    r.read_exact(&mut buf2)?;
+    let name_len = u16::from_le_bytes(buf2) as usize;
+    let mut name_bytes = vec![0u8; name_len];
+    r.read_exact(&mut name_bytes)?;
+    let name = String::from_utf8_lossy(&name_bytes).into_owned();
+
+    // kind
+    r.read_exact(&mut buf1)?;
+    let kind = u8_to_symbol_kind(buf1[0]);
+
+    // line, col
+    r.read_exact(&mut buf4)?;
+    let line = u32::from_le_bytes(buf4) as usize;
+    r.read_exact(&mut buf4)?;
+    let col = u32::from_le_bytes(buf4) as usize;
+
+    // def_keyword
+    r.read_exact(&mut buf2)?;
+    let kw_len = u16::from_le_bytes(buf2) as usize;
+    let mut kw_bytes = vec![0u8; kw_len];
+    r.read_exact(&mut kw_bytes)?;
+    let def_keyword = String::from_utf8_lossy(&kw_bytes).into_owned();
+
+    // visibility
+    r.read_exact(&mut buf1)?;
+    let visibility = u8_to_visibility(buf1[0]);
+
+    // container
+    r.read_exact(&mut buf1)?;
+    let container = if buf1[0] == 1 {
+        r.read_exact(&mut buf2)?;
+        let c_len = u16::from_le_bytes(buf2) as usize;
+        let mut c_bytes = vec![0u8; c_len];
+        r.read_exact(&mut c_bytes)?;
+        Some(String::from_utf8_lossy(&c_bytes).into_owned())
+    } else {
+        None
+    };
+
+    // depth
+    r.read_exact(&mut buf4)?;
+    let depth = u32::from_le_bytes(buf4) as usize;
+
+    Ok(Symbol {
+        name,
+        kind,
+        line,
+        col,
+        def_keyword,
+        doc_comment: None,
+        signature: None,
+        visibility,
+        container,
+        depth,
+    })
+}
+
+fn symbol_kind_to_u8(k: SymbolKind) -> u8 {
+    match k {
+        SymbolKind::Function => 0,
+        SymbolKind::Method => 1,
+        SymbolKind::Class => 2,
+        SymbolKind::Struct => 3,
+        SymbolKind::Enum => 4,
+        SymbolKind::Interface => 5,
+        SymbolKind::Constant => 6,
+        SymbolKind::Variable => 7,
+        SymbolKind::Module => 8,
+        SymbolKind::TypeAlias => 9,
+        SymbolKind::Trait => 10,
+        SymbolKind::Unknown => 255,
+    }
+}
+
+fn u8_to_symbol_kind(b: u8) -> SymbolKind {
+    match b {
+        0 => SymbolKind::Function,
+        1 => SymbolKind::Method,
+        2 => SymbolKind::Class,
+        3 => SymbolKind::Struct,
+        4 => SymbolKind::Enum,
+        5 => SymbolKind::Interface,
+        6 => SymbolKind::Constant,
+        7 => SymbolKind::Variable,
+        8 => SymbolKind::Module,
+        9 => SymbolKind::TypeAlias,
+        10 => SymbolKind::Trait,
+        _ => SymbolKind::Unknown,
+    }
+}
+
+fn visibility_to_u8(v: Visibility) -> u8 {
+    match v {
+        Visibility::Public => 0,
+        Visibility::Private => 1,
+        Visibility::Unknown => 2,
+    }
+}
+
+fn u8_to_visibility(b: u8) -> Visibility {
+    match b {
+        0 => Visibility::Public,
+        1 => Visibility::Private,
+        _ => Visibility::Unknown,
     }
 }
 
