@@ -401,7 +401,7 @@ fn bug2_workspace_has_definitions_but_dep_index_reports_zero() {
 fn bug2_scan_directory_populates_definitions_not_counted_in_progress() {
     let ws = Workspace::new();
     let fixture_dir = fixtures_dir();
-    ws.scan_directory(&fixture_dir);
+    ws.scan_directory(&fixture_dir, None);
 
     let def_count = ws.definition_count();
     let file_count = ws.file_count();

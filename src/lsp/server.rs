@@ -338,17 +338,41 @@ impl LanguageServer for QuickLspServer {
                 .await;
             }
 
+            // Phase 1: scan workspace with progress reporting via channel.
+            let (scan_tx, mut scan_rx) =
+                tokio::sync::mpsc::unbounded_channel::<(usize, usize)>();
+
             let ws = workspace.clone();
             let scan_root = root.clone();
-            tokio::task::spawn_blocking(move || {
-                ws.scan_directory(&scan_root);
-            })
-            .await
-            .ok();
+            let scan_handle = tokio::task::spawn_blocking(move || {
+                ws.scan_directory(&scan_root, Some(&|done, total| {
+                    let _ = scan_tx.send((done, total));
+                }));
+            });
+
+            // Forward scan progress to client.
+            while let Some((done, total)) = scan_rx.recv().await {
+                if progress_supported {
+                    let pct = if total > 0 {
+                        ((done as u64 * 100) / total as u64) as u32
+                    } else {
+                        0
+                    };
+                    send_progress(
+                        &client,
+                        &token,
+                        WorkDoneProgress::Report(WorkDoneProgressReport {
+                            message: Some(format!("Scanning: {done}/{total} files")),
+                            cancellable: Some(false),
+                            percentage: Some(pct),
+                        }),
+                    )
+                    .await;
+                }
+            }
+            scan_handle.await.ok();
 
             // Phase 2: index dependency packages with progress reporting.
-            // Use a channel so the blocking indexer can report per-package
-            // progress back to this async task, which forwards it to the client.
             if progress_supported {
                 send_progress(
                     &client,

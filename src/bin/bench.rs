@@ -118,7 +118,7 @@ fn run_index(root: &Path) {
     log_memory("start");
     let ws = Workspace::new();
     let t = Instant::now();
-    let stats = ws.scan_directory(root);
+    let stats = ws.scan_directory(root, None);
     let elapsed = t.elapsed();
     tracing::info!(
         "index: {} files, {} skipped, {} errors in {:.2?}",
@@ -154,7 +154,7 @@ fn run_deps(root: &Path) {
 fn run_query(root: &Path) {
     // Index first
     let ws = Workspace::new();
-    let stats = ws.scan_directory(root);
+    let stats = ws.scan_directory(root, None);
     tracing::info!("indexed {} files for query phase", stats.indexed);
 
     let names = ws.sample_symbol_names(500);
@@ -197,7 +197,7 @@ fn run_all(root: &Path) {
     // Index once, reuse for queries
     let ws = Workspace::new();
     let t = Instant::now();
-    let stats = ws.scan_directory(root);
+    let stats = ws.scan_directory(root, None);
     tracing::info!(
         "index: {} files, {} skipped, {} errors in {:.2?}",
         stats.indexed, stats.skipped, stats.errors, t.elapsed()

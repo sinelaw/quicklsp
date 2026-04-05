@@ -8,7 +8,7 @@ fn main() {
     
     // Index our workspace (like scan_directory does)
     let root = Path::new("/home/user/quicklsp");
-    ws.scan_directory(root);
+    ws.scan_directory(root, None);
     
     // Index deps
     dep.detect_and_resolve(root);

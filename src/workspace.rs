@@ -354,7 +354,13 @@ impl Workspace {
     /// Phase 4: Build on-disk word index from all occurrences.
     ///
     /// Files already in the index (e.g., from a prior `did_open`) are skipped.
-    pub fn scan_directory(&self, root: &Path) -> ScanStats {
+    /// Scan a directory, index all files, and write the log index.
+    /// The optional `progress` callback receives `(files_done, total_files)`.
+    pub fn scan_directory(
+        &self,
+        root: &Path,
+        progress: Option<&(dyn Fn(usize, usize) + Send + Sync)>,
+    ) -> ScanStats {
         // Phase 0: collect file mtimes and try warm startup
         let file_mtimes = collect_file_mtimes(root, &should_skip_dir);
         let warm_result = self.try_warm_startup(root, &file_mtimes);
@@ -454,9 +460,11 @@ impl Workspace {
             }))
         };
 
-        // Parallel scan: parse files, store symbols, send occurrences to writer.
+        // Parallel scan: parse files, send to writer.
+        let total_files = paths.len();
         let indexed = AtomicUsize::new(0);
         let errors = AtomicUsize::new(0);
+        let last_progress = AtomicUsize::new(0);
 
         paths.par_chunks(100).for_each(|chunk| {
             for path in chunk {
@@ -465,7 +473,6 @@ impl Workspace {
                         let (symbols, word_hashes, lang) = Self::parse_file(path, &source);
                         let mtime = mtime_map.get(&path.to_string_lossy().into_owned())
                             .copied().unwrap_or(0);
-                        // Move symbols + hashes to writer — nothing stored in workspace.
                         let _ = tx.send(LogWriteMsg {
                             path: path.clone(),
                             word_hashes,
@@ -473,7 +480,16 @@ impl Workspace {
                             lang,
                             mtime,
                         });
-                        indexed.fetch_add(1, Relaxed);
+                        let count = indexed.fetch_add(1, Relaxed) + 1;
+                        // Report progress every 500 files.
+                        if let Some(cb) = progress {
+                            let prev = last_progress.load(Relaxed);
+                            if count >= prev + 500 || count == total_files {
+                                if last_progress.compare_exchange(prev, count, Relaxed, Relaxed).is_ok() {
+                                    cb(count, total_files);
+                                }
+                            }
+                        }
                     }
                     Err(_) => {
                         errors.fetch_add(1, Relaxed);
@@ -1956,7 +1972,7 @@ mod tests {
         let ws = Workspace::new();
 
         // Phase 1: scan indexes both files from disk
-        ws.scan_directory(dir.path());
+        ws.scan_directory(dir.path(), None);
         assert_eq!(ws.find_definitions("alpha").len(), 1);
         assert_eq!(ws.find_definitions("beta").len(), 1);
 
@@ -1980,7 +1996,7 @@ mod tests {
         assert_eq!(ws.find_definitions("alpha_edited").len(), 1);
 
         // Phase 2: scan runs — should SKIP a.rs (already in index)
-        let stats = ws.scan_directory(dir.path());
+        let stats = ws.scan_directory(dir.path(), None);
         assert_eq!(stats.skipped, 1); // a.rs skipped
         assert_eq!(stats.indexed, 1); // b.rs indexed
 
@@ -1997,7 +2013,7 @@ mod tests {
         let ws = Workspace::new();
 
         // Phase 1: scan indexes from disk
-        ws.scan_directory(dir.path());
+        ws.scan_directory(dir.path(), None);
         assert_eq!(ws.find_definitions("alpha").len(), 1);
         let info = ws.hover_info("alpha");
         assert!(info.is_some());
@@ -2016,7 +2032,7 @@ mod tests {
         let ws = Workspace::new();
 
         // No files opened via didOpen — scan is the only source
-        ws.scan_directory(dir.path());
+        ws.scan_directory(dir.path(), None);
 
         // Both files indexed from scan
         assert_eq!(ws.find_definitions("alpha").len(), 1);
@@ -2051,7 +2067,7 @@ mod tests {
         std::fs::write(git.join("hook.rs"), "fn hook() {}").unwrap();
 
         let ws = Workspace::new();
-        ws.scan_directory(dir.path());
+        ws.scan_directory(dir.path(), None);
 
         assert_eq!(ws.find_definitions("real").len(), 1);
         assert_eq!(ws.find_definitions("generated").len(), 0);
@@ -2175,7 +2191,7 @@ mod tests {
         }
 
         let ws = Workspace::new();
-        let stats = ws.scan_directory(dir.path());
+        let stats = ws.scan_directory(dir.path(), None);
 
         assert_eq!(stats.indexed, file_count);
         assert_eq!(stats.errors, 0);
@@ -2235,7 +2251,7 @@ mod tests {
         }
 
         let ws = Workspace::new();
-        ws.scan_directory(dir.path());
+        ws.scan_directory(dir.path(), None);
 
         // find_references reads from the on-disk word index built by scan_directory.
         // This exercises the full compact entry pipeline.
@@ -2281,7 +2297,7 @@ mod tests {
         ).unwrap();
 
         let ws = Workspace::new();
-        ws.scan_directory(dir.path());
+        ws.scan_directory(dir.path(), None);
 
         // All three words should be findable via the word index
         let refs_alpha = ws.find_references("alpha");
@@ -2310,7 +2326,7 @@ mod tests {
         ).unwrap();
 
         let ws = Workspace::new();
-        let stats = ws.scan_directory(dir.path());
+        let stats = ws.scan_directory(dir.path(), None);
         assert_eq!(stats.indexed, 1);
 
         let defs = ws.find_definitions("sole_function");
