@@ -664,3 +664,162 @@ fn cross_language_shared_concepts() {
         server_defs.len()
     );
 }
+
+// =========================================================================
+// Bugs found during vim testing on the Linux kernel (2026-04-05)
+//
+// go-to-definition (gd) jumps to wrong locations for C code.
+// The tokenizer doesn't recognize C function definitions, #define
+// constants, or enum values as definition sites, so find_definitions
+// returns wrong or empty results.
+//
+// find_references (gr) works correctly via the word index.
+// =========================================================================
+
+/// C function definitions (void f, int f, static void f, etc.) should be
+/// found by find_definitions. Currently the tokenizer only has struct/enum/
+/// typedef/union as CLike def_keywords, so functions are never indexed.
+#[test]
+#[ignore = "Bug: C function definitions not indexed — return types not in def_keywords"]
+fn c_function_go_to_definition() {
+    let ws = Workspace::new();
+    let fixture = fixtures_dir().join("sample_c.c");
+    let source = std::fs::read_to_string(&fixture).unwrap();
+    ws.index_file(fixture, source);
+
+    // These are all C function definitions in sample_c.c
+    for name in &[
+        "init_config",
+        "validate_port",
+        "process_request",
+        "server_init",
+        "server_run",
+        "server_stop",
+        "server_log",
+        "sanitize_input",
+        "main",
+    ] {
+        let defs = ws.find_definitions(name);
+        assert!(
+            !defs.is_empty(),
+            "C function '{}' should be found by find_definitions, got 0 results",
+            name
+        );
+    }
+}
+
+/// C #define constants should be found by find_definitions.
+/// Currently #define is not a def_keyword so they're not indexed.
+#[test]
+#[ignore = "Bug: C #define constants not indexed"]
+fn c_define_go_to_definition() {
+    let ws = Workspace::new();
+    let fixture = fixtures_dir().join("sample_c.c");
+    let source = std::fs::read_to_string(&fixture).unwrap();
+    ws.index_file(fixture, source);
+
+    for name in &["MAX_RETRIES", "DEFAULT_TIMEOUT"] {
+        let defs = ws.find_definitions(name);
+        assert!(
+            !defs.is_empty(),
+            "C #define '{}' should be found by find_definitions, got 0 results",
+            name
+        );
+    }
+}
+
+/// C enum values should be found by find_definitions.
+/// The enum keyword is in def_keywords, but individual enum VALUES
+/// (STATUS_ACTIVE, etc.) are not indexed — only the enum name (Status) is.
+#[test]
+#[ignore = "Bug: C enum values not indexed as individual definitions"]
+fn c_enum_values_go_to_definition() {
+    let ws = Workspace::new();
+    let fixture = fixtures_dir().join("sample_c.c");
+    let source = std::fs::read_to_string(&fixture).unwrap();
+    ws.index_file(fixture, source);
+
+    for name in &["STATUS_ACTIVE", "STATUS_INACTIVE", "STATUS_ERROR"] {
+        let defs = ws.find_definitions(name);
+        assert!(
+            !defs.is_empty(),
+            "C enum value '{}' should be found by find_definitions, got 0 results",
+            name
+        );
+    }
+}
+
+/// C typedef names should be found by find_definitions.
+/// typedef IS in def_keywords, but the tokenizer only grabs the
+/// NEXT identifier after the keyword. For `typedef unsigned int StatusCode`,
+/// it grabs `unsigned` not `StatusCode`. For `typedef struct Config ServerConfig`,
+/// it grabs `Config` not `ServerConfig`.
+#[test]
+#[ignore = "Bug: typedef grabs wrong identifier — takes first token after keyword, not the alias name"]
+fn c_typedef_go_to_definition() {
+    let ws = Workspace::new();
+    let fixture = fixtures_dir().join("sample_c.c");
+    let source = std::fs::read_to_string(&fixture).unwrap();
+    ws.index_file(fixture, source);
+
+    for name in &["StatusCode", "ServerConfig"] {
+        let defs = ws.find_definitions(name);
+        assert!(
+            !defs.is_empty(),
+            "C typedef '{}' should be found by find_definitions, got 0 results",
+            name
+        );
+    }
+}
+
+/// C struct definitions should be found by find_definitions.
+/// struct IS in def_keywords, so these should work.
+#[test]
+fn c_struct_go_to_definition() {
+    let ws = Workspace::new();
+    let fixture = fixtures_dir().join("sample_c.c");
+    let source = std::fs::read_to_string(&fixture).unwrap();
+    ws.index_file(fixture, source);
+
+    for name in &["Config", "Server"] {
+        let defs = ws.find_definitions(name);
+        assert!(
+            !defs.is_empty(),
+            "C struct '{}' should be found by find_definitions, got 0 results",
+            name
+        );
+    }
+}
+
+/// find_references should work for all C identifiers via the word index,
+/// even when find_definitions fails. This was confirmed working in vim.
+#[test]
+fn c_find_references_works_for_all_identifiers() {
+    let ws = Workspace::new();
+    let fixture = fixtures_dir().join("sample_c.c");
+    let source = std::fs::read_to_string(&fixture).unwrap();
+    ws.index_file(fixture.clone(), source);
+
+    // Scan directory to build word index (find_references needs it)
+    // For a single file, use the fallback text search instead
+    let refs = ws.find_references("Config");
+    assert!(
+        refs.len() >= 5,
+        "Config should appear many times in sample_c.c, got {} refs",
+        refs.len()
+    );
+
+    let refs = ws.find_references("server_init");
+    assert!(
+        refs.len() >= 2,
+        "server_init should appear at definition + call site, got {} refs",
+        refs.len()
+    );
+
+    let refs = ws.find_references("MAX_RETRIES");
+    assert!(
+        refs.len() >= 2,
+        "MAX_RETRIES should appear at #define + usage, got {} refs",
+        refs.len()
+    );
+}
