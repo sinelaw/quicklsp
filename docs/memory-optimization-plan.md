@@ -239,14 +239,196 @@ limited only by disk space and time. The current architecture requires RAM
 proportional to total occurrences; the bounded architecture requires RAM
 proportional to chunk size (configurable).
 
-## Plan
+## Step 5: Truly incremental word index updates
+
+### Problem
+
+When any file changes, the entire word index is rebuilt from scratch.
+All 6030 files are re-read, re-tokenized, and re-merged — even if only
+one file changed. On our test corpus this takes 2.3s. On the full Linux
+kernel it would take much longer.
+
+The symbol cache (symbols.bin) already avoids re-extracting definitions
+for unchanged files. But the word index rebuild re-tokenizes every file
+because it needs occurrences (word_id, line, col, len) from every file
+to produce the three output files.
+
+### Key insight: files.v2.bin is already seekable per-file
+
+The existing on-disk format stores occurrences grouped by file_id with
+a file table for random access:
+
+```
+file_table[file_id] = (occ_offset: u64, occ_count: u32)
+```
+
+We can read back any unchanged file's occurrences by seeking to
+`occ_offset` and reading `occ_count × 14` bytes. No source text or
+tokenization needed. The `find_references()` query path already does
+exactly this.
+
+### Approach
+
+When the PartiallyStale path detects N changed files out of F total:
+
+#### Phase A: Read unchanged occurrences from disk
+
+For each unchanged file_id:
+1. Look up `(occ_offset, occ_count)` from the old file table
+   (already in memory as `WordIndex.file_table`).
+2. Seek into old `files.v2.bin`, read `occ_count × 14` bytes.
+3. Parse into CompactEntry values using the existing word_id/path_id
+   namespace (word and path tables from the old index).
+4. Feed these entries into the builder as a sorted chunk (they're
+   already sorted by (word_id, line) within each file).
+
+This is O(unchanged_entries) in I/O but zero CPU for tokenization.
+
+#### Phase B: Re-tokenize changed files
+
+For each changed file:
+1. Read source from disk.
+2. Tokenize to get occurrences.
+3. Intern words — some may be new (not in old word table), some
+   existing. The builder's intern tables handle this naturally.
+4. Intern path — may be a new file (new path_id) or existing.
+5. Feed entries into the builder.
+
+For removed files: skip them (don't read from old files.v2.bin,
+don't tokenize).
+
+For added files: tokenize them (they won't be in old files.v2.bin).
+
+#### Phase C: Build new word index
+
+The builder now has entries from both sources (disk + fresh tokenize).
+Proceed with the normal build path: flush to disk, k-way merge,
+write new files.v2.bin + index.v2.bin + words.v2.bin.
+
+#### Handling word_id / path_id identity
+
+The old word index has a word_table and path_table baked into
+words.v2.bin. When reading unchanged occurrences, the word_ids
+refer to this old table. The new builder has its own intern tables.
+
+Two options:
+
+**Option A: Seed builder with old tables.**
+
+Before processing any files, seed the builder's intern tables with
+the old word_table and path_table (loaded from words.v2.bin during
+warm startup — already in `WordIndex.word_table` / `path_table`).
+This ensures old word_ids and path_ids are valid in the new builder.
+New words from changed files get new IDs appended to the end.
+
+This is the simplest approach. The builder's `intern_word` /
+`intern_path` already deduplicate, so seeding just pre-fills the
+tables. Old CompactEntry values can be fed directly without
+re-interning.
+
+**Option B: Remap IDs.**
+
+Build fresh intern tables and remap old entries' word_id/path_id
+to new IDs. More complex, no benefit.
+
+**Verdict: Option A.** Seed the builder from the old index.
+
+### What changes
+
+1. **New method: `WordIndexBuilder::seed_from_index(word_table, path_table)`**
+   — Pre-fills intern tables so old IDs remain valid.
+
+2. **New method: `WordIndexBuilder::ingest_unchanged_file(file_id, occurrences)`**
+   — Accepts pre-parsed occurrences from disk (already has valid IDs).
+
+3. **New function: `read_file_occurrences(files_bin_path, file_table, file_id) → Vec<CompactEntry>`**
+   — Reads one file's occurrences from files.v2.bin using the seekable
+   file table.
+
+4. **PartiallyStale path in `scan_directory`:**
+   ```
+   // 1. Seed builder from old index
+   builder.seed_from_index(&old_word_table, &old_path_table);
+
+   // 2. Read unchanged files' occurrences from disk
+   for file_id in 0..old_file_count {
+       let path = &old_path_table[file_id];
+       if !changed_set.contains(path) {
+           let occs = read_file_occurrences(&files_bin, &file_table, file_id);
+           builder.ingest_unchanged_file(file_id, occs);
+       }
+   }
+
+   // 3. Re-tokenize changed files only
+   for path in &changed_files {
+       let source = read_to_string(path)?;
+       index_file_core(path, &source, false);  // updates symbols
+       let occs = take(&mut files[path].occurrences);
+       builder.drain_file_occurrences(path, occs, &source);
+   }
+
+   // 4. Build new index (same as cold path)
+   builder.flush_to_disk()?;
+   finish_word_index(root, &file_mtimes, builder);
+   ```
+
+5. **`scan_directory` no longer calls par_chunks for PartiallyStale.**
+   The reading-from-disk loop replaces the parallel tokenize loop for
+   unchanged files. Only changed files are read + tokenized.
+
+### Expected performance
+
+If 1 file out of 6030 changes:
+- Read ~1.7M occurrences from files.v2.bin: sequential I/O, ~33 MB
+  at 14 bytes/entry. On SSD: ~50ms. On warm OS page cache: ~10ms.
+- Tokenize 1 file: <1ms.
+- Build new word index from seeded builder: ~150ms (same as cold).
+- **Total: ~200ms** vs current 2.3s for the full re-tokenize.
+
+If 100 files change: ~200ms + ~50ms tokenize = ~250ms.
+
+The dominant cost is always the k-way merge + write, which is O(total
+entries) regardless. Reading unchanged occurrences from disk is much
+faster than reading + tokenizing source files.
+
+### Tradeoffs
+
+- **Disk I/O vs CPU**: Reading 33 MB from files.v2.bin replaces
+  reading ~hundreds of MB of source files + tokenizing each one.
+  Net I/O is much less; CPU savings are large.
+- **Complexity**: The seed-from-old-index path is a new code path
+  that must maintain word_id/path_id consistency. Bugs here would
+  produce corrupted indexes.
+- **New files with new words**: Handled naturally by the builder's
+  intern tables — new words get IDs after the seeded range.
+- **Removed files**: Their old entries are simply not read from disk.
+  Their word_ids may become orphaned (no entries reference them), but
+  this is harmless — the word table just has a few unused entries.
+
+### Verification
+
+- Run the full test suite.
+- Benchmark: cold index, then modify 1 file, measure incremental.
+- Verify that `find_references("word_in_unchanged_file")` still works.
+- Verify that `find_references("word_in_changed_file")` reflects the
+  new content.
+- Verify that `find_references("new_word_only_in_changed_file")` works.
+- Compare output of incremental build vs full rebuild to verify they
+  produce identical index files.
+
+## Completed steps
 
 1. ~~Implement in-place sort in `WordIndexBuilder::build()`.~~ **DONE**
 2. ~~Refactor `write_files_bin` and posting-list builder to accept sorted
    slices instead of `Vec<Vec<CompactEntry>>`.~~ **DONE**
-3. Measure on full kernel to get post-Step-1 peak RSS.
-4. Implement Step 2 (stream entries to disk + external merge sort).
-5. Implement Step 3 (lazy fuzzy index).
-6. Implement Step 4 (externalize symbols).
-7. After each step, measure peak RSS empirically on the full kernel.
-8. Run the full test suite after each step to verify correctness.
+3. ~~Implement Step 2 (stream entries to disk + external merge sort).~~ **DONE**
+4. ~~Implement Step 3 (lazy fuzzy index).~~ **DONE**
+5. ~~Implement Step 4 (strip doc_comment/signature from symbols).~~ **DONE**
+6. ~~Persist symbols to disk for instant warm startup.~~ **DONE**
+7. ~~Detect modified files and re-parse only changed ones.~~ **DONE**
+
+## Next steps
+
+8. Implement Step 5 (truly incremental word index from disk).
+9. Measure incremental update time empirically.
+10. Run the full test suite after to verify correctness.
