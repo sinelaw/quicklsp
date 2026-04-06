@@ -1,8 +1,11 @@
-//! Tree-sitter based C parser.
+//! Tree-sitter based C parser using SCM queries + procedural helpers.
 //!
-//! Extracts accurate definitions (functions, structs, enums, enum values,
-//! typedefs, #defines, file-scope globals) and all identifier occurrences
-//! from a single AST walk.
+//! Uses SCM queries for main definitions (functions, structs, enums,
+//! typedefs, #defines) and procedural code for:
+//! - Preprocessor conditional walking (#ifdef/#if/#ifndef)
+//! - Local variable extraction from function bodies
+//! - Complex C declarator unwinding (function pointers, nested declarators)
+//! - Function parameter extraction
 
 use tree_sitter::Node;
 
@@ -10,189 +13,293 @@ use crate::parsing::symbols::{Symbol, SymbolKind};
 use crate::parsing::tokenizer::Visibility;
 
 use super::common::{
-    self, make_contained_symbol, make_symbol, node_text,
-    walk_preproc_conditionals,
+    self, find_child_by_kind, make_contained_symbol, make_symbol, node_text,
+    walk_preproc_conditionals, QueryParseConfig,
 };
 use super::{ParseResult, TsParser};
 
-/// Identifier node kinds used for occurrence collection in C.
 const C_IDENT_KINDS: &[&str] = &["identifier", "type_identifier", "field_identifier"];
+
+/// SCM query for C symbol extraction.
+///
+/// Handles the straightforward cases declaratively. Complex cases
+/// (typedefs with function pointers, preprocessor conditionals, locals)
+/// are handled in post-processing.
+const C_QUERY: &str = r#"
+; ── Function definitions ─────────────────────────────────────────────────
+(function_definition
+  declarator: (function_declarator
+    declarator: (identifier) @name)) @definition.function
+
+; ── Function definitions with pointer return ─────────────────────────────
+(function_definition
+  declarator: (pointer_declarator
+    declarator: (function_declarator
+      declarator: (identifier) @name))) @definition.function
+
+; ── Named structs with body ──────────────────────────────────────────────
+(struct_specifier
+  name: (type_identifier) @name
+  body: (_)) @definition.struct
+
+; ── Named unions with body ───────────────────────────────────────────────
+(declaration
+  type: (union_specifier
+    name: (type_identifier) @name
+    body: (_))) @definition.struct
+
+; ── Named enums ──────────────────────────────────────────────────────────
+(enum_specifier
+  name: (type_identifier) @name) @definition.enum
+
+; ── Enumerators ──────────────────────────────────────────────────────────
+(enumerator
+  name: (identifier) @name) @definition.constant
+
+; ── Typedefs ─────────────────────────────────────────────────────────────
+(type_definition
+  declarator: (type_identifier) @name) @definition.type
+
+; ── #define ──────────────────────────────────────────────────────────────
+(preproc_def
+  name: (identifier) @name) @definition.constant
+
+; ── #define function-like macros ─────────────────────────────────────────
+(preproc_function_def
+  name: (identifier) @name) @definition.constant
+
+; ── Struct fields ────────────────────────────────────────────────────────
+(struct_specifier
+  name: (type_identifier) @container
+  body: (field_declaration_list
+    (field_declaration
+      declarator: (field_identifier) @name) @definition.field))
+
+; ── Struct fields with pointer declarators ───────────────────────────────
+(struct_specifier
+  name: (type_identifier) @container
+  body: (field_declaration_list
+    (field_declaration
+      declarator: (pointer_declarator
+        declarator: (field_identifier) @name)) @definition.field))
+"#;
 
 pub struct CParser;
 
 impl TsParser for CParser {
     fn parse(source: &str) -> ParseResult {
         let lang: tree_sitter::Language = tree_sitter_c::LANGUAGE.into();
-        common::run_parse(source, &lang, C_IDENT_KINDS, |root, src, syms| {
-            walk_preproc_conditionals(root, src, syms, extract_definition);
-        })
+
+        // Use query-based parsing for main definitions
+        let mut result = common::run_query_parse(source, &QueryParseConfig {
+            language: lang,
+            query_source: C_QUERY,
+            identifier_kinds: C_IDENT_KINDS,
+            def_keyword: c_def_keyword,
+            visibility: c_visibility,
+            post_process: Some(c_post_process),
+        });
+
+        result
     }
 }
 
-/// Extract a definition from a node, if it represents one.
-fn extract_definition(node: Node, source: &str, symbols: &mut Vec<Symbol>) {
-    match node.kind() {
-        "function_definition" => {
-            let func_name = if let Some((name, line, col)) = extract_function_name(node, source) {
-                let is_static = common::has_child_with_kind_and_text(
-                    node, "storage_class_specifier", "static", source,
-                );
-                let n = name.clone();
-                symbols.push(make_symbol(
-                    name,
-                    SymbolKind::Function,
-                    line,
-                    col,
-                    "function",
-                    if is_static { Visibility::Private } else { Visibility::Public },
-                ));
-                Some(n)
-            } else {
-                None
-            };
-            // Extract function parameters
-            if let Some(ref fname) = func_name {
-                extract_function_params(node, source, symbols, fname);
-            }
-            // Extract local variable declarations from the function body
-            if let Some(body) = node.child_by_field_name("body") {
-                let body_end = body.end_position().row;
-                extract_locals_from_compound(body, source, symbols, func_name.as_deref(), 1, body_end);
-            }
-        }
-        "declaration" => {
-            // File-scope variable declarations (not inside function bodies)
-            extract_file_scope_declaration(node, source, symbols);
-        }
-        "struct_specifier" | "union_specifier" => {
-            let struct_name = node
-                .child_by_field_name("name")
-                .map(|n| node_text(n, source).to_string());
-            // Only index if it has a body — it's a definition, not just a reference
-            if node.child_by_field_name("body").is_some() {
-                if let Some(name_node) = node.child_by_field_name("name") {
-                    let name = node_text(name_node, source).to_string();
-                    let kw = if node.kind() == "struct_specifier" { "struct" } else { "union" };
-                    symbols.push(make_symbol(
-                        name,
-                        SymbolKind::Struct,
-                        name_node.start_position().row,
-                        name_node.start_position().column,
-                        kw,
-                        Visibility::Unknown,
-                    ));
-                }
-                // Extract struct/union fields
-                if let Some(body) = node.child_by_field_name("body") {
-                    extract_struct_fields(body, source, symbols, struct_name.as_deref());
-                }
-            }
-        }
-        "enum_specifier" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = node_text(name_node, source).to_string();
-                symbols.push(make_symbol(
-                    name,
-                    SymbolKind::Enum,
-                    name_node.start_position().row,
-                    name_node.start_position().column,
-                    "enum",
-                    Visibility::Unknown,
-                ));
-            }
-            // Index individual enumerators
-            if let Some(body) = node.child_by_field_name("body") {
-                let mut body_cursor = body.walk();
-                for child in body.children(&mut body_cursor) {
-                    if child.kind() == "enumerator" {
-                        if let Some(name_node) = child.child_by_field_name("name") {
-                            let name = node_text(name_node, source).to_string();
+fn c_def_keyword(_kind: SymbolKind, suffix: &str) -> &'static str {
+    match suffix {
+        "function" => "function",
+        "struct" => "struct",
+        "enum" => "enum",
+        "constant" => "enum",
+        "type" => "typedef",
+        "field" => "field",
+        "variable" => "variable",
+        _ => "function",
+    }
+}
+
+fn c_visibility(node: Node, source: &str) -> Visibility {
+    if common::has_child_with_kind_and_text(node, "storage_class_specifier", "static", source) {
+        Visibility::Private
+    } else if node.kind() == "function_definition" {
+        Visibility::Public
+    } else {
+        Visibility::Unknown
+    }
+}
+
+/// Post-process: handle typedef function pointers, local variables,
+/// function parameters, and file-scope declarations.
+fn c_post_process(root: Node, source: &str, symbols: &mut Vec<Symbol>) {
+    // Handle typedef function pointers (complex declarators)
+    extract_typedef_function_ptrs(root, source, symbols);
+    // Handle typedef struct/union fields (anonymous structs)
+    extract_typedef_inner_defs(root, source, symbols);
+    // Handle file-scope variable declarations
+    extract_file_scope_vars(root, source, symbols);
+    // Handle function parameters and local variables
+    extract_params_and_locals(root, source, symbols);
+}
+
+/// Extract typedef function pointers like `typedef void (*Handler)(int)`.
+/// The query matches `(type_definition declarator: (type_identifier) @name)`
+/// but function pointer typedefs have the name nested deeper.
+fn extract_typedef_function_ptrs(node: Node, source: &str, symbols: &mut Vec<Symbol>) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "type_definition" => {
+                if let Some(decl) = child.child_by_field_name("declarator") {
+                    // If the declarator is not a simple type_identifier, the query
+                    // may not have matched it. Handle function pointer typedefs.
+                    if decl.kind() != "type_identifier" {
+                        let name_node = innermost_declarator_name(decl);
+                        let name = node_text(name_node, source);
+                        let line = name_node.start_position().row;
+                        let col = name_node.start_position().column;
+                        // Check if already extracted by query
+                        if !symbols.iter().any(|s| s.line == line && s.col == col) {
                             symbols.push(make_symbol(
-                                name,
-                                SymbolKind::Constant,
-                                name_node.start_position().row,
-                                name_node.start_position().column,
-                                "enum",
+                                name.to_string(),
+                                SymbolKind::TypeAlias,
+                                line,
+                                col,
+                                "typedef",
                                 Visibility::Unknown,
                             ));
                         }
                     }
                 }
             }
-        }
-        "type_definition" => {
-            if let Some(decl) = node.child_by_field_name("declarator") {
-                let name_node = innermost_declarator_name(decl);
-                let name = node_text(name_node, source).to_string();
-                symbols.push(make_symbol(
-                    name,
-                    SymbolKind::TypeAlias,
-                    name_node.start_position().row,
-                    name_node.start_position().column,
-                    "typedef",
-                    Visibility::Unknown,
-                ));
+            "preproc_ifdef" | "preproc_if" | "preproc_elif" | "preproc_else"
+            | "preproc_ifndef" => {
+                extract_typedef_function_ptrs(child, source, symbols);
             }
-            // For `typedef enum { ... } Name` or `typedef struct { ... } Name`,
-            // also extract the inner definitions (enum values, struct fields).
-            if let Some(type_node) = node.child_by_field_name("type") {
-                match type_node.kind() {
-                    "enum_specifier" => {
-                        // Extract enumerators from the anonymous enum
-                        if let Some(body) = type_node.child_by_field_name("body") {
-                            let mut body_cursor = body.walk();
-                            for child in body.children(&mut body_cursor) {
-                                if child.kind() == "enumerator" {
-                                    if let Some(name_node) = child.child_by_field_name("name") {
-                                        let name = node_text(name_node, source).to_string();
-                                        symbols.push(make_symbol(
-                                            name,
-                                            SymbolKind::Constant,
-                                            name_node.start_position().row,
-                                            name_node.start_position().column,
-                                            "enum",
-                                            Visibility::Unknown,
-                                        ));
+            _ => {}
+        }
+    }
+}
+
+/// Extract inner definitions from typedef structs/enums (anonymous).
+fn extract_typedef_inner_defs(node: Node, source: &str, symbols: &mut Vec<Symbol>) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "type_definition" => {
+                if let Some(type_node) = child.child_by_field_name("type") {
+                    match type_node.kind() {
+                        "enum_specifier" => {
+                            // Enumerators inside typedef enum might already be captured
+                            // by the query, but let's make sure
+                            if let Some(body) = type_node.child_by_field_name("body") {
+                                let mut body_cursor = body.walk();
+                                for bc in body.children(&mut body_cursor) {
+                                    if bc.kind() == "enumerator" {
+                                        if let Some(name_node) = bc.child_by_field_name("name") {
+                                            let line = name_node.start_position().row;
+                                            let col = name_node.start_position().column;
+                                            if !symbols.iter().any(|s| s.line == line && s.col == col) {
+                                                symbols.push(make_symbol(
+                                                    node_text(name_node, source).to_string(),
+                                                    SymbolKind::Constant,
+                                                    line, col,
+                                                    "enum",
+                                                    Visibility::Unknown,
+                                                ));
+                                            }
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
-                    "struct_specifier" | "union_specifier" => {
-                        // Extract fields from the anonymous struct/union
-                        if let Some(body) = type_node.child_by_field_name("body") {
-                            let typedef_name = node.child_by_field_name("declarator")
-                                .map(|d| node_text(innermost_declarator_name(d), source));
-                            extract_struct_fields(body, source, symbols, typedef_name);
+                        "struct_specifier" | "union_specifier" => {
+                            if let Some(body) = type_node.child_by_field_name("body") {
+                                let typedef_name = child.child_by_field_name("declarator")
+                                    .map(|d| node_text(innermost_declarator_name(d), source));
+                                extract_struct_fields(body, source, symbols, typedef_name);
+                            }
                         }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
-        }
-        "preproc_def" | "preproc_function_def" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = node_text(name_node, source).to_string();
-                symbols.push(make_symbol(
-                    name,
-                    SymbolKind::Constant,
-                    name_node.start_position().row,
-                    name_node.start_position().column,
-                    "define",
-                    Visibility::Unknown,
-                ));
+            "preproc_ifdef" | "preproc_if" | "preproc_elif" | "preproc_else"
+            | "preproc_ifndef" => {
+                extract_typedef_inner_defs(child, source, symbols);
             }
+            _ => {}
         }
-        _ => {}
     }
 }
 
-/// Extract function name from a function_definition node.
-fn extract_function_name(node: Node, source: &str) -> Option<(String, usize, usize)> {
-    let declarator = node.child_by_field_name("declarator")?;
-    let name_node = innermost_declarator_name(declarator);
-    let name = node_text(name_node, source).to_string();
-    Some((name, name_node.start_position().row, name_node.start_position().column))
+/// Extract file-scope variable declarations (not function prototypes).
+fn extract_file_scope_vars(node: Node, source: &str, symbols: &mut Vec<Symbol>) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "declaration" => {
+                let declarator = match child.child_by_field_name("declarator") {
+                    Some(d) => d,
+                    None => continue,
+                };
+                if is_function_prototype(&declarator) {
+                    continue;
+                }
+                let name_node = innermost_declarator_name(declarator);
+                if name_node.kind() == "identifier" || name_node.kind() == "type_identifier" {
+                    let name = node_text(name_node, source).to_string();
+                    let line = name_node.start_position().row;
+                    let col = name_node.start_position().column;
+                    if !symbols.iter().any(|s| s.line == line && s.col == col) {
+                        let is_static = common::has_child_with_kind_and_text(
+                            child, "storage_class_specifier", "static", source,
+                        );
+                        symbols.push(make_symbol(
+                            name,
+                            SymbolKind::Variable,
+                            line, col,
+                            "variable",
+                            if is_static { Visibility::Private } else { Visibility::Unknown },
+                        ));
+                    }
+                }
+            }
+            "preproc_ifdef" | "preproc_if" | "preproc_elif" | "preproc_else"
+            | "preproc_ifndef" => {
+                extract_file_scope_vars(child, source, symbols);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Extract function parameters and local variables.
+fn extract_params_and_locals(node: Node, source: &str, symbols: &mut Vec<Symbol>) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "function_definition" => {
+                let func_name = child.child_by_field_name("declarator")
+                    .and_then(|d| {
+                        let n = innermost_declarator_name(d);
+                        if n.kind() == "identifier" { Some(node_text(n, source).to_string()) } else { None }
+                    });
+                // Extract parameters
+                if let Some(ref fname) = func_name {
+                    extract_function_params(child, source, symbols, fname);
+                }
+                // Extract locals from body
+                if let Some(body) = child.child_by_field_name("body") {
+                    let body_end = body.end_position().row;
+                    extract_locals_from_compound(body, source, symbols, func_name.as_deref(), 1, body_end);
+                }
+            }
+            "preproc_ifdef" | "preproc_if" | "preproc_elif" | "preproc_else"
+            | "preproc_ifndef" => {
+                extract_params_and_locals(child, source, symbols);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Drill into nested declarators to find the actual identifier node.
@@ -204,10 +311,8 @@ fn innermost_declarator_name(mut node: Node) -> Node {
                 if let Some(decl) = node.child_by_field_name("declarator") {
                     node = decl;
                 } else {
-                    // parenthesized_declarator may not have a "declarator" field;
-                    // look for the first named child that is a declarator-like node
-                    let mut found = false;
                     let mut cursor = node.walk();
+                    let mut found = false;
                     for child in node.named_children(&mut cursor) {
                         match child.kind() {
                             "identifier" | "type_identifier" | "field_identifier"
@@ -220,9 +325,7 @@ fn innermost_declarator_name(mut node: Node) -> Node {
                             _ => {}
                         }
                     }
-                    if !found {
-                        break;
-                    }
+                    if !found { break; }
                 }
             }
             _ => break,
@@ -231,35 +334,7 @@ fn innermost_declarator_name(mut node: Node) -> Node {
     node
 }
 
-/// Extract file-scope variable declarations.
-fn extract_file_scope_declaration(node: Node, source: &str, symbols: &mut Vec<Symbol>) {
-    let declarator = match node.child_by_field_name("declarator") {
-        Some(d) => d,
-        None => return,
-    };
-
-    if is_function_prototype(&declarator) {
-        return;
-    }
-
-    let name_node = innermost_declarator_name(declarator);
-    if name_node.kind() == "identifier" || name_node.kind() == "type_identifier" {
-        let name = node_text(name_node, source).to_string();
-        let is_static = common::has_child_with_kind_and_text(
-            node, "storage_class_specifier", "static", source,
-        );
-        symbols.push(make_symbol(
-            name,
-            SymbolKind::Variable,
-            name_node.start_position().row,
-            name_node.start_position().column,
-            "variable",
-            if is_static { Visibility::Private } else { Visibility::Unknown },
-        ));
-    }
-}
-
-/// Extract function parameters from a function_definition node.
+/// Extract function parameters.
 fn extract_function_params(func_node: Node, source: &str, symbols: &mut Vec<Symbol>, func_name: &str) {
     let declarator = match func_node.child_by_field_name("declarator") {
         Some(d) => d,
@@ -311,7 +386,7 @@ fn find_function_declarator(mut node: Node) -> Option<Node> {
     }
 }
 
-/// Extract local variable declarations from a compound_statement.
+/// Extract local variables from compound statements.
 fn extract_locals_from_compound(
     node: Node,
     source: &str,
@@ -326,11 +401,7 @@ fn extract_locals_from_compound(
             "declaration" => {
                 extract_local_declaration(child, source, symbols, func_name, depth, scope_end);
             }
-            "compound_statement" => {
-                let inner_end = child.end_position().row;
-                extract_locals_from_compound(child, source, symbols, func_name, depth + 1, inner_end);
-            }
-            "if_statement" | "for_statement" | "while_statement"
+            "compound_statement" | "if_statement" | "for_statement" | "while_statement"
             | "do_statement" | "switch_statement" | "case_statement" => {
                 let inner_end = child.end_position().row;
                 extract_locals_from_compound(child, source, symbols, func_name, depth + 1, inner_end);
@@ -358,28 +429,23 @@ fn extract_local_declaration(
 
     if let Some(declarator) = node.child_by_field_name("declarator") {
         if !is_function_prototype(&declarator) {
-            extract_local_var_from_declarator(
-                declarator, source, symbols, func_name, depth, type_text.as_deref(), scope_end,
-            );
+            extract_local_var(declarator, source, symbols, func_name, depth, type_text.as_deref(), scope_end);
             return;
         }
     }
-
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "init_declarator" {
             if let Some(decl) = child.child_by_field_name("declarator") {
                 if !is_function_prototype(&decl) {
-                    extract_local_var_from_declarator(
-                        decl, source, symbols, func_name, depth, type_text.as_deref(), scope_end,
-                    );
+                    extract_local_var(decl, source, symbols, func_name, depth, type_text.as_deref(), scope_end);
                 }
             }
         }
     }
 }
 
-fn extract_local_var_from_declarator(
+fn extract_local_var(
     declarator: Node,
     source: &str,
     symbols: &mut Vec<Symbol>,
@@ -415,21 +481,24 @@ fn extract_struct_fields(body: Node, source: &str, symbols: &mut Vec<Symbol>, st
                 let name_node = innermost_declarator_name(decl);
                 if name_node.kind() == "field_identifier" || name_node.kind() == "identifier" {
                     let name = node_text(name_node, source).to_string();
-                    let type_text = child
-                        .child_by_field_name("type")
-                        .map(|t| node_text(t, source).to_string());
-                    symbols.push(make_contained_symbol(
-                        name,
-                        SymbolKind::Variable,
-                        name_node.start_position().row,
-                        name_node.start_position().column,
-                        "field",
-                        Visibility::Unknown,
-                        struct_name,
-                        1,
-                        None,
-                        type_text,
-                    ));
+                    let line = name_node.start_position().row;
+                    let col = name_node.start_position().column;
+                    if !symbols.iter().any(|s| s.line == line && s.col == col) {
+                        let type_text = child
+                            .child_by_field_name("type")
+                            .map(|t| node_text(t, source).to_string());
+                        symbols.push(make_contained_symbol(
+                            name,
+                            SymbolKind::Variable,
+                            line, col,
+                            "field",
+                            Visibility::Unknown,
+                            struct_name,
+                            1,
+                            None,
+                            type_text,
+                        ));
+                    }
                 }
             }
         }
@@ -504,7 +573,7 @@ int main() {
         assert!(names.contains(&"helper"), "should find static function helper, got: {:?}", names);
         assert!(names.contains(&"main"), "should find function main, got: {:?}", names);
 
-        // Local variable SHOULD now be indexed (with depth > 0)
+        // Local variable SHOULD be indexed (with depth > 0)
         assert!(names.contains(&"local"), "local variables should be indexed, got: {:?}", names);
         let local_sym = result.symbols.iter().find(|s| s.name == "local").unwrap();
         assert!(local_sym.depth > 0, "local variable should have depth > 0");

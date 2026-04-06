@@ -1,121 +1,87 @@
-//! Tree-sitter based Python parser.
+//! Tree-sitter based Python parser using SCM queries.
 //!
 //! Extracts: functions, classes, methods, decorators, and module-level assignments.
 
 use tree_sitter::Node;
 
-use crate::parsing::symbols::{Symbol, SymbolKind};
+use crate::parsing::symbols::SymbolKind;
 use crate::parsing::tokenizer::Visibility;
 
-use super::common::{self, make_contained_symbol, make_symbol, node_text};
+use super::common::{self, QueryParseConfig};
 use super::{ParseResult, TsParser};
 
 const PYTHON_IDENT_KINDS: &[&str] = &["identifier"];
+
+const PYTHON_QUERY: &str = r#"
+; ── Functions ────────────────────────────────────────────────────────────
+(function_definition
+  name: (identifier) @name) @definition.function
+
+; ── Methods inside classes ───────────────────────────────────────────────
+(class_definition
+  name: (identifier) @container
+  body: (block
+    (function_definition
+      name: (identifier) @name) @definition.method))
+
+; ── Decorated methods inside classes ─────────────────────────────────────
+(class_definition
+  name: (identifier) @container
+  body: (block
+    (decorated_definition
+      definition: (function_definition
+        name: (identifier) @name) @definition.method)))
+
+; ── Classes ──────────────────────────────────────────────────────────────
+(class_definition
+  name: (identifier) @name) @definition.class
+
+; ── Decorated functions (top-level) ──────────────────────────────────────
+(decorated_definition
+  definition: (function_definition
+    name: (identifier) @name) @definition.function)
+
+; ── Module-level assignments ─────────────────────────────────────────────
+(module
+  (expression_statement
+    (assignment
+      left: (identifier) @name) @definition.variable))
+"#;
 
 pub struct PythonParser;
 
 impl TsParser for PythonParser {
     fn parse(source: &str) -> ParseResult {
-        let lang: tree_sitter::Language = tree_sitter_python::LANGUAGE.into();
-        common::run_parse(source, &lang, PYTHON_IDENT_KINDS, collect_definitions)
+        let mut result = common::run_query_parse(source, &QueryParseConfig {
+            language: tree_sitter_python::LANGUAGE.into(),
+            query_source: PYTHON_QUERY,
+            identifier_kinds: PYTHON_IDENT_KINDS,
+            def_keyword: python_def_keyword,
+            visibility: |_node: Node, _source: &str| Visibility::Unknown,
+            post_process: None,
+        });
+        // Post-process: apply name-based visibility and constant detection
+        for sym in &mut result.symbols {
+            sym.visibility = python_visibility(&sym.name);
+            if sym.kind == SymbolKind::Variable
+                && sym.container.is_none()
+                && sym.name.chars().all(|c| c.is_uppercase() || c == '_')
+            {
+                sym.kind = SymbolKind::Constant;
+                sym.def_keyword = "const".to_string();
+            }
+        }
+        result
     }
 }
 
-fn collect_definitions(root: Node, source: &str, symbols: &mut Vec<Symbol>) {
-    collect_definitions_recursive(root, source, symbols, None);
-}
-
-fn collect_definitions_recursive(
-    node: Node,
-    source: &str,
-    symbols: &mut Vec<Symbol>,
-    container: Option<&str>,
-) {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        extract_definition(child, source, symbols, container);
-    }
-}
-
-fn extract_definition(node: Node, source: &str, symbols: &mut Vec<Symbol>, container: Option<&str>) {
-    match node.kind() {
-        "function_definition" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = node_text(name_node, source).to_string();
-                let vis = python_visibility(&name);
-                let (kind, kw) = if container.is_some() {
-                    (SymbolKind::Method, "method")
-                } else {
-                    (SymbolKind::Function, "def")
-                };
-                if let Some(c) = container {
-                    symbols.push(make_contained_symbol(
-                        name, kind,
-                        name_node.start_position().row, name_node.start_position().column,
-                        kw, vis, Some(c), 1, None, None,
-                    ));
-                } else {
-                    symbols.push(make_symbol(
-                        name, kind,
-                        name_node.start_position().row, name_node.start_position().column,
-                        kw, vis,
-                    ));
-                }
-            }
-        }
-        "class_definition" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = node_text(name_node, source).to_string();
-                let vis = python_visibility(&name);
-                symbols.push(make_symbol(
-                    name.clone(), SymbolKind::Class,
-                    name_node.start_position().row, name_node.start_position().column,
-                    "class", vis,
-                ));
-                // Class body is in the "body" field (a block node)
-                if let Some(body) = node.child_by_field_name("body") {
-                    collect_definitions_recursive(body, source, symbols, Some(&name));
-                }
-            }
-        }
-        "decorated_definition" => {
-            // Recurse into the actual definition inside the decorator
-            if let Some(def) = node.child_by_field_name("definition") {
-                extract_definition(def, source, symbols, container);
-            }
-        }
-        "expression_statement" => {
-            // Module-level assignments: `x = 5` at top level (only when no container)
-            if container.is_none() {
-                // expression_statement has a single child
-                let mut cursor = node.walk();
-                for child in node.children(&mut cursor) {
-                    if child.kind() == "assignment" {
-                        extract_assignment(child, source, symbols);
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-fn extract_assignment(node: Node, source: &str, symbols: &mut Vec<Symbol>) {
-    if let Some(left) = node.child_by_field_name("left") {
-        if left.kind() == "identifier" {
-            let name = node_text(left, source).to_string();
-            let vis = python_visibility(&name);
-            let (kind, kw) = if name.chars().all(|c| c.is_uppercase() || c == '_') {
-                (SymbolKind::Constant, "const")
-            } else {
-                (SymbolKind::Variable, "variable")
-            };
-            symbols.push(make_symbol(
-                name, kind,
-                left.start_position().row, left.start_position().column,
-                kw, vis,
-            ));
-        }
+fn python_def_keyword(_kind: SymbolKind, suffix: &str) -> &'static str {
+    match suffix {
+        "function" => "def",
+        "method" => "method",
+        "class" => "class",
+        "variable" => "variable",
+        _ => "def",
     }
 }
 
@@ -188,5 +154,65 @@ class _PrivateClass:
         assert_eq!(max_sym.kind, SymbolKind::Constant);
 
         assert!(!result.occurrences.is_empty());
+    }
+
+    #[test]
+    fn test_python_parser_fixture() {
+        let source = include_str!("../../../tests/fixtures/sample_python.py");
+        let result = PythonParser::parse(source);
+        let names: Vec<&str> = result.symbols.iter().map(|s| s.name.as_str()).collect();
+
+        // Constants
+        assert!(names.contains(&"MAX_RETRIES"), "got: {:?}", names);
+        assert!(names.contains(&"DEFAULT_TIMEOUT"));
+
+        // Classes
+        assert!(names.contains(&"Config"));
+        assert!(names.contains(&"Server"));
+        assert!(names.contains(&"Handler"));
+
+        // Methods
+        let init = result.symbols.iter().find(|s| s.name == "__init__" && s.container.as_deref() == Some("Config"));
+        assert!(init.is_some(), "should find Config.__init__");
+
+        let display = result.symbols.iter().find(|s| s.name == "display" && s.container.as_deref() == Some("Config"));
+        assert!(display.is_some(), "should find Config.display");
+
+        let add_handler = result.symbols.iter().find(|s| s.name == "add_handler" && s.container.as_deref() == Some("Server"));
+        assert!(add_handler.is_some(), "should find Server.add_handler");
+
+        // Functions
+        assert!(names.contains(&"process_request"));
+        assert!(names.contains(&"validate_input"));
+    }
+
+    #[test]
+    fn test_python_empty_file() {
+        let result = PythonParser::parse("");
+        assert!(result.symbols.is_empty());
+    }
+
+    #[test]
+    fn test_python_decorated_class_method() {
+        let source = r#"
+class MyClass:
+    @staticmethod
+    def static_method():
+        pass
+
+    @classmethod
+    def class_method(cls):
+        pass
+
+    @property
+    def prop(self):
+        return self._prop
+"#;
+        let result = PythonParser::parse(source);
+        let names: Vec<&str> = result.symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"MyClass"));
+        assert!(names.contains(&"static_method"), "got: {:?}", names);
+        assert!(names.contains(&"class_method"), "got: {:?}", names);
+        assert!(names.contains(&"prop"), "got: {:?}", names);
     }
 }

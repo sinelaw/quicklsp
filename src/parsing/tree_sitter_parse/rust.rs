@@ -1,202 +1,139 @@
-//! Tree-sitter based Rust parser.
+//! Tree-sitter based Rust parser using SCM queries.
 //!
 //! Extracts: functions, structs, enums, traits, type aliases, constants,
 //! statics, modules, impl methods, enum variants, and struct fields.
 
 use tree_sitter::Node;
 
-use crate::parsing::symbols::{Symbol, SymbolKind};
+use crate::parsing::symbols::SymbolKind;
 use crate::parsing::tokenizer::Visibility;
 
-use super::common::{self, find_child_by_kind, make_contained_symbol, make_symbol, node_text};
+use super::common::{self, node_text, find_child_by_kind, QueryParseConfig};
 use super::{ParseResult, TsParser};
 
 const RUST_IDENT_KINDS: &[&str] = &["identifier", "type_identifier", "field_identifier"];
+
+/// SCM query for Rust symbol extraction.
+///
+/// Captures:
+///   @name          — the identifier node (symbol name + position)
+///   @definition.*  — the definition node (determines SymbolKind)
+///   @container     — parent type/class name for contained symbols
+const RUST_QUERY: &str = r#"
+; ── Top-level functions ──────────────────────────────────────────────────
+; Match functions NOT inside declaration_list (top-level or in mod bodies)
+(function_item
+  name: (identifier) @name) @definition.function
+
+; ── Impl methods ─────────────────────────────────────────────────────────
+(impl_item
+  type: (_) @container
+  body: (declaration_list
+    (function_item
+      name: (identifier) @name) @definition.method))
+
+; ── Impl constants ───────────────────────────────────────────────────────
+(impl_item
+  type: (_) @container
+  body: (declaration_list
+    (const_item
+      name: (identifier) @name) @definition.constant))
+
+; ── Trait methods (with body) ────────────────────────────────────────────
+(trait_item
+  name: (type_identifier) @container
+  body: (declaration_list
+    (function_item
+      name: (identifier) @name) @definition.method))
+
+; ── Trait method signatures (no body) ────────────────────────────────────
+(trait_item
+  name: (type_identifier) @container
+  body: (declaration_list
+    (function_signature_item
+      name: (identifier) @name) @definition.method))
+
+; ── Structs ──────────────────────────────────────────────────────────────
+(struct_item
+  name: (type_identifier) @name) @definition.struct
+
+; ── Struct fields ────────────────────────────────────────────────────────
+(struct_item
+  name: (type_identifier) @container
+  body: (field_declaration_list
+    (field_declaration
+      name: (field_identifier) @name) @definition.field))
+
+; ── Enums ────────────────────────────────────────────────────────────────
+(enum_item
+  name: (type_identifier) @name) @definition.enum
+
+; ── Enum variants ────────────────────────────────────────────────────────
+(enum_item
+  name: (type_identifier) @container
+  body: (enum_variant_list
+    (enum_variant
+      name: (identifier) @name) @definition.variant))
+
+; ── Traits ───────────────────────────────────────────────────────────────
+(trait_item
+  name: (type_identifier) @name) @definition.trait
+
+; ── Type aliases ─────────────────────────────────────────────────────────
+(type_item
+  name: (type_identifier) @name) @definition.type
+
+; ── Top-level constants ──────────────────────────────────────────────────
+(const_item
+  name: (identifier) @name) @definition.constant
+
+; ── Statics ──────────────────────────────────────────────────────────────
+(static_item
+  name: (identifier) @name) @definition.variable
+
+; ── Modules ──────────────────────────────────────────────────────────────
+(mod_item
+  name: (identifier) @name) @definition.module
+
+; ── Macros ───────────────────────────────────────────────────────────────
+(macro_definition
+  name: (identifier) @name) @definition.macro
+"#;
 
 pub struct RustParser;
 
 impl TsParser for RustParser {
     fn parse(source: &str) -> ParseResult {
-        let lang: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
-        common::run_parse(source, &lang, RUST_IDENT_KINDS, collect_definitions)
+        common::run_query_parse(source, &QueryParseConfig {
+            language: tree_sitter_rust::LANGUAGE.into(),
+            query_source: RUST_QUERY,
+            identifier_kinds: RUST_IDENT_KINDS,
+            def_keyword: rust_def_keyword,
+            visibility: rust_visibility,
+            post_process: None,
+        })
     }
 }
 
-fn collect_definitions(root: Node, source: &str, symbols: &mut Vec<Symbol>) {
-    collect_definitions_recursive(root, source, symbols, None);
-}
-
-fn collect_definitions_recursive(
-    node: Node,
-    source: &str,
-    symbols: &mut Vec<Symbol>,
-    container: Option<&str>,
-) {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        extract_definition(child, source, symbols, container);
+fn rust_def_keyword(kind: SymbolKind, suffix: &str) -> &'static str {
+    match suffix {
+        "function" => "fn",
+        "method" => "method",
+        "struct" => "struct",
+        "enum" => "enum",
+        "trait" => "trait",
+        "type" => "type",
+        "constant" => "const",
+        "variable" => "static",
+        "module" => "mod",
+        "macro" => "macro",
+        "field" => "field",
+        "variant" => "variant",
+        _ => common::default_def_keyword(kind, suffix),
     }
 }
 
-fn extract_definition(node: Node, source: &str, symbols: &mut Vec<Symbol>, container: Option<&str>) {
-    match node.kind() {
-        "function_item" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = node_text(name_node, source).to_string();
-                let vis = detect_visibility(node, source);
-                let kind = if container.is_some() { SymbolKind::Method } else { SymbolKind::Function };
-                let kw = if container.is_some() { "method" } else { "fn" };
-                if let Some(c) = container {
-                    symbols.push(make_contained_symbol(
-                        name, kind,
-                        name_node.start_position().row, name_node.start_position().column,
-                        kw, vis, Some(c), 1, None, None,
-                    ));
-                } else {
-                    symbols.push(make_symbol(
-                        name, kind,
-                        name_node.start_position().row, name_node.start_position().column,
-                        kw, vis,
-                    ));
-                }
-            }
-        }
-        // Trait method signatures (declarations without body)
-        "function_signature_item" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = node_text(name_node, source).to_string();
-                let vis = detect_visibility(node, source);
-                symbols.push(make_contained_symbol(
-                    name, SymbolKind::Method,
-                    name_node.start_position().row, name_node.start_position().column,
-                    "method", vis, container, 1, None, None,
-                ));
-            }
-        }
-        "struct_item" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = node_text(name_node, source).to_string();
-                let vis = detect_visibility(node, source);
-                symbols.push(make_symbol(
-                    name.clone(), SymbolKind::Struct,
-                    name_node.start_position().row, name_node.start_position().column,
-                    "struct", vis,
-                ));
-                // Extract fields from field_declaration_list
-                if let Some(body) = find_child_by_kind(node, "field_declaration_list") {
-                    extract_struct_fields(body, source, symbols, &name);
-                }
-            }
-        }
-        "enum_item" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = node_text(name_node, source).to_string();
-                let vis = detect_visibility(node, source);
-                symbols.push(make_symbol(
-                    name.clone(), SymbolKind::Enum,
-                    name_node.start_position().row, name_node.start_position().column,
-                    "enum", vis,
-                ));
-                // Extract variants from enum_variant_list
-                if let Some(body) = find_child_by_kind(node, "enum_variant_list") {
-                    extract_enum_variants(body, source, symbols, &name);
-                }
-            }
-        }
-        "trait_item" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = node_text(name_node, source).to_string();
-                let vis = detect_visibility(node, source);
-                symbols.push(make_symbol(
-                    name.clone(), SymbolKind::Trait,
-                    name_node.start_position().row, name_node.start_position().column,
-                    "trait", vis,
-                ));
-                // Recurse into declaration_list for trait methods
-                if let Some(body) = find_child_by_kind(node, "declaration_list") {
-                    collect_definitions_recursive(body, source, symbols, Some(&name));
-                }
-            }
-        }
-        "impl_item" => {
-            // impl blocks: extract the type name as the container for methods
-            let impl_name = node.child_by_field_name("type")
-                .map(|t| node_text(t, source).to_string());
-            if let Some(body) = find_child_by_kind(node, "declaration_list") {
-                collect_definitions_recursive(body, source, symbols, impl_name.as_deref());
-            }
-        }
-        "type_item" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = node_text(name_node, source).to_string();
-                let vis = detect_visibility(node, source);
-                symbols.push(make_symbol(
-                    name, SymbolKind::TypeAlias,
-                    name_node.start_position().row, name_node.start_position().column,
-                    "type", vis,
-                ));
-            }
-        }
-        "const_item" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = node_text(name_node, source).to_string();
-                let vis = detect_visibility(node, source);
-                if let Some(c) = container {
-                    symbols.push(make_contained_symbol(
-                        name, SymbolKind::Constant,
-                        name_node.start_position().row, name_node.start_position().column,
-                        "const", vis, Some(c), 1, None, None,
-                    ));
-                } else {
-                    symbols.push(make_symbol(
-                        name, SymbolKind::Constant,
-                        name_node.start_position().row, name_node.start_position().column,
-                        "const", vis,
-                    ));
-                }
-            }
-        }
-        "static_item" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = node_text(name_node, source).to_string();
-                let vis = detect_visibility(node, source);
-                symbols.push(make_symbol(
-                    name, SymbolKind::Variable,
-                    name_node.start_position().row, name_node.start_position().column,
-                    "static", vis,
-                ));
-            }
-        }
-        "mod_item" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = node_text(name_node, source).to_string();
-                let vis = detect_visibility(node, source);
-                symbols.push(make_symbol(
-                    name, SymbolKind::Module,
-                    name_node.start_position().row, name_node.start_position().column,
-                    "mod", vis,
-                ));
-                // Recurse into inline module body (declaration_list)
-                if let Some(body) = find_child_by_kind(node, "declaration_list") {
-                    collect_definitions_recursive(body, source, symbols, None);
-                }
-            }
-        }
-        "macro_definition" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = node_text(name_node, source).to_string();
-                symbols.push(make_symbol(
-                    name, SymbolKind::Function,
-                    name_node.start_position().row, name_node.start_position().column,
-                    "macro", Visibility::Unknown,
-                ));
-            }
-        }
-        _ => {}
-    }
-}
-
-fn detect_visibility(node: Node, source: &str) -> Visibility {
+fn rust_visibility(node: Node, source: &str) -> Visibility {
     if let Some(vis) = find_child_by_kind(node, "visibility_modifier") {
         let text = node_text(vis, source);
         if text.starts_with("pub") {
@@ -209,44 +146,10 @@ fn detect_visibility(node: Node, source: &str) -> Visibility {
     }
 }
 
-fn extract_struct_fields(body: Node, source: &str, symbols: &mut Vec<Symbol>, struct_name: &str) {
-    let mut cursor = body.walk();
-    for child in body.children(&mut cursor) {
-        if child.kind() == "field_declaration" {
-            if let Some(name_node) = child.child_by_field_name("name") {
-                let name = node_text(name_node, source).to_string();
-                let vis = detect_visibility(child, source);
-                let type_text = child.child_by_field_name("type")
-                    .map(|t| node_text(t, source).to_string());
-                symbols.push(make_contained_symbol(
-                    name, SymbolKind::Variable,
-                    name_node.start_position().row, name_node.start_position().column,
-                    "field", vis, Some(struct_name), 1, None, type_text,
-                ));
-            }
-        }
-    }
-}
-
-fn extract_enum_variants(body: Node, source: &str, symbols: &mut Vec<Symbol>, enum_name: &str) {
-    let mut cursor = body.walk();
-    for child in body.children(&mut cursor) {
-        if child.kind() == "enum_variant" {
-            if let Some(name_node) = child.child_by_field_name("name") {
-                let name = node_text(name_node, source).to_string();
-                symbols.push(make_contained_symbol(
-                    name, SymbolKind::Constant,
-                    name_node.start_position().row, name_node.start_position().column,
-                    "variant", Visibility::Unknown, Some(enum_name), 1, None, None,
-                ));
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parsing::symbols::SymbolKind;
 
     #[test]
     fn test_rust_parser_basic() {
@@ -316,5 +219,118 @@ macro_rules! my_macro {
         assert_eq!(new_sym.container.as_deref(), Some("Config"));
 
         assert!(!result.occurrences.is_empty(), "should have occurrences");
+    }
+
+    #[test]
+    fn test_rust_parser_fixture() {
+        let source = include_str!("../../../tests/fixtures/sample_rust.rs");
+        let result = RustParser::parse(source);
+        let names: Vec<&str> = result.symbols.iter().map(|s| s.name.as_str()).collect();
+
+        // Constants
+        assert!(names.contains(&"MAX_RETRIES"));
+        assert!(names.contains(&"DEFAULT_TIMEOUT"));
+        assert!(names.contains(&"FINAL_STATUS"));
+
+        // Structs
+        assert!(names.contains(&"Config"));
+        assert!(names.contains(&"Request"));
+        assert!(names.contains(&"Response"));
+        assert!(names.contains(&"Server"));
+
+        // Struct fields
+        assert!(names.contains(&"host"));
+        assert!(names.contains(&"port"));
+        assert!(names.contains(&"method"));
+
+        // Enum
+        assert!(names.contains(&"Status"));
+        assert!(names.contains(&"Active"));
+        assert!(names.contains(&"Inactive"));
+
+        // Trait
+        assert!(names.contains(&"Handler"));
+
+        // Functions
+        assert!(names.contains(&"create_config"));
+        assert!(names.contains(&"process_request"));
+        assert!(names.contains(&"validate_request"));
+
+        // Impl methods
+        let new_sym = result.symbols.iter().find(|s| s.name == "new" && s.container.as_deref() == Some("Server")).unwrap();
+        assert_eq!(new_sym.kind, SymbolKind::Method);
+
+        let add_handler = result.symbols.iter().find(|s| s.name == "add_handler").unwrap();
+        assert_eq!(add_handler.container.as_deref(), Some("Server"));
+
+        // Module
+        assert!(names.contains(&"utils"));
+
+        // Type aliases
+        assert!(names.contains(&"StatusCode"));
+        assert!(names.contains(&"HandlerResult"));
+
+        // Static
+        assert!(names.contains(&"GLOBAL_COUNTER"));
+
+        // Unicode identifiers
+        assert!(names.contains(&"données_utilisateur"));
+        assert!(names.contains(&"Über"));
+    }
+
+    #[test]
+    fn test_rust_empty_file() {
+        let result = RustParser::parse("");
+        assert!(result.symbols.is_empty());
+        assert!(result.occurrences.is_empty());
+    }
+
+    #[test]
+    fn test_rust_comments_only() {
+        let result = RustParser::parse("// just a comment\n/* block comment */\n");
+        assert!(result.symbols.is_empty());
+    }
+
+    #[test]
+    fn test_rust_nested_impl_blocks() {
+        let source = r#"
+struct A;
+struct B;
+
+impl A {
+    fn foo(&self) {}
+    fn bar(&self) {}
+}
+
+impl B {
+    fn foo(&self) {}
+    fn baz(&self) {}
+}
+"#;
+        let result = RustParser::parse(source);
+        let a_foo = result.symbols.iter().find(|s| s.name == "foo" && s.container.as_deref() == Some("A"));
+        let b_foo = result.symbols.iter().find(|s| s.name == "foo" && s.container.as_deref() == Some("B"));
+        assert!(a_foo.is_some(), "should find A::foo");
+        assert!(b_foo.is_some(), "should find B::foo");
+    }
+
+    #[test]
+    fn test_rust_visibility_variants() {
+        let source = r#"
+pub fn public_fn() {}
+fn private_fn() {}
+pub(crate) fn crate_fn() {}
+pub struct PubStruct;
+struct PrivStruct;
+"#;
+        let result = RustParser::parse(source);
+        let pub_fn = result.symbols.iter().find(|s| s.name == "public_fn").unwrap();
+        assert_eq!(pub_fn.visibility, Visibility::Public);
+
+        let priv_fn = result.symbols.iter().find(|s| s.name == "private_fn").unwrap();
+        assert_eq!(priv_fn.visibility, Visibility::Unknown);
+
+        let crate_fn = result.symbols.iter().find(|s| s.name == "crate_fn").unwrap();
+        assert_eq!(crate_fn.visibility, Visibility::Public);
     }
 }
