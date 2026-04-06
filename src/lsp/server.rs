@@ -174,6 +174,68 @@ impl QuickLspServer {
         }
         Some(chars[q_start..q_end].iter().collect())
     }
+
+    /// Detect the identifier context at the cursor position.
+    ///
+    /// Returns a hint about what kind of identifier the cursor is on:
+    /// - `IdentKind::Field` if preceded by `->` or `.` (struct member access)
+    /// - `IdentKind::Type` if preceded by `struct`/`enum`/`union`/`typedef`
+    /// - `IdentKind::Plain` otherwise
+    pub fn ident_kind_at_position(content: &str, line_idx: usize, col: usize) -> IdentKind {
+        let line = match content.lines().nth(line_idx) {
+            Some(l) => l,
+            None => return IdentKind::Plain,
+        };
+        let chars: Vec<char> = line.chars().collect();
+        if col > chars.len() {
+            return IdentKind::Plain;
+        }
+
+        // Find start of the current word
+        let mut word_start = col;
+        while word_start > 0 && is_ident_char(chars[word_start - 1]) {
+            word_start -= 1;
+        }
+
+        // Check for `->` or `.` before the word → field access
+        if word_start >= 2 && chars[word_start - 2] == '-' && chars[word_start - 1] == '>' {
+            return IdentKind::Field;
+        }
+        if word_start >= 1 && chars[word_start - 1] == '.' {
+            return IdentKind::Field;
+        }
+
+        // Check for type-introducing keywords before the word
+        // Skip whitespace before the identifier
+        let mut before = word_start;
+        while before > 0 && chars[before - 1] == ' ' {
+            before -= 1;
+        }
+        // Extract the preceding word
+        let kw_end = before;
+        while before > 0 && is_ident_char(chars[before - 1]) {
+            before -= 1;
+        }
+        if before < kw_end {
+            let kw: String = chars[before..kw_end].iter().collect();
+            if matches!(kw.as_str(), "struct" | "enum" | "union" | "typedef") {
+                return IdentKind::Type;
+            }
+        }
+
+        IdentKind::Plain
+    }
+}
+
+/// Hint about what kind of identifier the cursor is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentKind {
+    /// Struct field access (after `->` or `.`)
+    Field,
+    /// Type name (after `struct`, `enum`, `union`, `typedef`)
+    Type,
+    /// No special context
+    Plain,
 }
 
 fn is_ident_char(ch: char) -> bool {
@@ -490,22 +552,52 @@ impl LanguageServer for QuickLspServer {
             None => return Ok(None),
         };
         let qualifier = Self::qualifier_at_position(&source, pos.line as usize, char_col);
+        let ident_kind = Self::ident_kind_at_position(&source, pos.line as usize, char_col);
         let current_file = uri.to_file_path().ok();
-        let mut defs = self.workspace.find_definitions(&symbol);
-        if defs.is_empty() {
-            defs = self.dep_index.find_definitions(&symbol);
-        }
-        // Fall back to file-local definitions (locals, params, struct fields),
-        // using scope-aware lookup to handle shadowed variables correctly.
-        if defs.is_empty() {
-            if let Some(ref path) = current_file {
-                if let Some(local) = self.workspace.find_local_definition_at(
-                    &symbol, path, pos.line as usize,
-                ) {
-                    defs.push(local);
+
+        let mut defs = match ident_kind {
+            IdentKind::Field => {
+                // For field access (ctx->field, obj.field), look for struct field
+                // definitions first, then fall back to global definitions.
+                let mut field_defs = Vec::new();
+                if let Some(ref path) = current_file {
+                    field_defs = self.workspace.find_local_definitions(&symbol, path)
+                        .into_iter()
+                        .filter(|d| d.symbol.def_keyword == "field")
+                        .collect();
+                }
+                if field_defs.is_empty() {
+                    // Fall back to global (e.g., field name is also a global symbol)
+                    self.workspace.find_definitions(&symbol)
+                } else {
+                    field_defs
                 }
             }
-        }
+            IdentKind::Type => {
+                // For type positions (struct Foo, enum Bar), only look at global
+                // type definitions — skip locals.
+                self.workspace.find_definitions(&symbol)
+            }
+            IdentKind::Plain => {
+                let mut d = self.workspace.find_definitions(&symbol);
+                if d.is_empty() {
+                    d = self.dep_index.find_definitions(&symbol);
+                }
+                // Fall back to file-local definitions (locals, params, struct fields),
+                // using scope-aware lookup to handle shadowed variables correctly.
+                if d.is_empty() {
+                    if let Some(ref path) = current_file {
+                        if let Some(local) = self.workspace.find_local_definition_at(
+                            &symbol, path, pos.line as usize,
+                        ) {
+                            d.push(local);
+                        }
+                    }
+                }
+                d
+            }
+        };
+
         self.workspace
             .rank_definitions(&mut defs, current_file.as_deref(), qualifier.as_deref());
         if let Some(def) = defs.first() {
@@ -676,24 +768,47 @@ impl LanguageServer for QuickLspServer {
             None => return Ok(None),
         };
 
-        // Find definitions and rank them by context (qualifier + same-file)
+        // Find definitions and rank them by context (qualifier + same-file + ident kind)
         let qualifier = Self::qualifier_at_position(&source, pos.line as usize, char_col);
+        let ident_kind = Self::ident_kind_at_position(&source, pos.line as usize, char_col);
         let current_file = uri.to_file_path().ok();
-        let mut defs = self.workspace.find_definitions(&symbol);
-        if defs.is_empty() {
-            defs = self.dep_index.find_definitions(&symbol);
-        }
-        // Fall back to file-local definitions (locals, params, struct fields),
-        // using scope-aware lookup to handle shadowed variables correctly.
-        if defs.is_empty() {
-            if let Some(ref path) = current_file {
-                if let Some(local) = self.workspace.find_local_definition_at(
-                    &symbol, path, pos.line as usize,
-                ) {
-                    defs.push(local);
+
+        let mut defs = match ident_kind {
+            IdentKind::Field => {
+                let mut field_defs = Vec::new();
+                if let Some(ref path) = current_file {
+                    field_defs = self.workspace.find_local_definitions(&symbol, path)
+                        .into_iter()
+                        .filter(|d| d.symbol.def_keyword == "field")
+                        .collect();
+                }
+                if field_defs.is_empty() {
+                    self.workspace.find_definitions(&symbol)
+                } else {
+                    field_defs
                 }
             }
-        }
+            IdentKind::Type => {
+                self.workspace.find_definitions(&symbol)
+            }
+            IdentKind::Plain => {
+                let mut d = self.workspace.find_definitions(&symbol);
+                if d.is_empty() {
+                    d = self.dep_index.find_definitions(&symbol);
+                }
+                if d.is_empty() {
+                    if let Some(ref path) = current_file {
+                        if let Some(local) = self.workspace.find_local_definition_at(
+                            &symbol, path, pos.line as usize,
+                        ) {
+                            d.push(local);
+                        }
+                    }
+                }
+                d
+            }
+        };
+
         self.workspace
             .rank_definitions(&mut defs, current_file.as_deref(), qualifier.as_deref());
 
