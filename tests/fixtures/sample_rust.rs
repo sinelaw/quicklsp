@@ -56,7 +56,7 @@ fn create_config() -> Config { // @mark create_config_DEF
 /// Process an incoming request with the given configuration.
 ///
 /// Routes the request and generates an appropriate response.
-fn process_request(config: &Config, request: &Request) -> Response { // @mark process_request_DEF
+fn process_request(config: &Config, request: &Request) -> Response { // @mark process_request_DEF @mark USE_Config_param @mark USE_Request_param
     let status = if request.method == "GET" {
         Status::Active // @mark USE_Status_Active
     } else {

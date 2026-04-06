@@ -183,6 +183,17 @@ impl LspServer {
         }));
     }
 
+    pub fn did_change(&mut self, uri: &str, version: i32, text: &str) {
+        self.send(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didChange",
+            "params": {
+                "textDocument": { "uri": uri, "version": version },
+                "contentChanges": [{ "text": text }]
+            }
+        }));
+    }
+
     pub fn hover(&mut self, uri: &str, line: u32, col: u32) -> serde_json::Value {
         let id = self.alloc_id();
         self.send(&serde_json::json!({
