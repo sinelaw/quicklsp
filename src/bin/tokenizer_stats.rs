@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-use quicklsp::parsing::tokenizer::{self, LangFamily, stats as tok_stats};
+use quicklsp::parsing::tokenizer::{self, stats as tok_stats, LangFamily};
 use tracing_subscriber::EnvFilter;
 
 static FILES_SCANNED: AtomicU64 = AtomicU64::new(0);
@@ -71,12 +71,28 @@ const SOURCE_EXTENSIONS: &[&str] = &[
 ];
 
 fn collect_files(dir: &Path, files: &mut Vec<PathBuf>, depth: usize) {
-    if depth > 20 { return; }
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    if depth > 20 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if name.starts_with('.') || matches!(name, "node_modules" | "target" | "vendor" | "build" | "__pycache__" | "dist" | "third_party" | "testdata") {
+        if name.starts_with('.')
+            || matches!(
+                name,
+                "node_modules"
+                    | "target"
+                    | "vendor"
+                    | "build"
+                    | "__pycache__"
+                    | "dist"
+                    | "third_party"
+                    | "testdata"
+            )
+        {
             continue;
         }
         if path.is_dir() {

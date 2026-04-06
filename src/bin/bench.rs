@@ -14,7 +14,6 @@
 //! The binary is intentionally minimal so flamegraphs show real bottlenecks,
 //! not benchmark scaffolding.
 
-
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -46,7 +45,12 @@ fn fmt_bytes(b: usize) -> String {
 
 fn log_memory(label: &str) {
     if let Some((rss, vm)) = memory_rss() {
-        tracing::info!("memory [{}]: rss={}, vm={}", label, fmt_bytes(rss), fmt_bytes(vm));
+        tracing::info!(
+            "memory [{}]: rss={}, vm={}",
+            label,
+            fmt_bytes(rss),
+            fmt_bytes(vm)
+        );
     }
 }
 
@@ -122,7 +126,10 @@ fn run_index(root: &Path) {
     let elapsed = t.elapsed();
     tracing::info!(
         "index: {} files, {} skipped, {} errors in {:.2?}",
-        stats.indexed, stats.skipped, stats.errors, elapsed
+        stats.indexed,
+        stats.skipped,
+        stats.errors,
+        elapsed
     );
     tracing::info!(
         "  {} definitions, {} unique symbols",
@@ -200,7 +207,10 @@ fn run_all(root: &Path) {
     let stats = ws.scan_directory(root, None);
     tracing::info!(
         "index: {} files, {} skipped, {} errors in {:.2?}",
-        stats.indexed, stats.skipped, stats.errors, t.elapsed()
+        stats.indexed,
+        stats.skipped,
+        stats.errors,
+        t.elapsed()
     );
     tracing::info!(
         "  {} definitions, {} unique symbols",
@@ -221,10 +231,7 @@ fn run_all(root: &Path) {
         }
     }));
     tracing::info!("deps index: {:.2?}", t.elapsed());
-    tracing::info!(
-        "  deps: {} definitions",
-        dep_index.definition_count()
-    );
+    tracing::info!("  deps: {} definitions", dep_index.definition_count());
     log_memory("after deps");
 
     let names = ws.sample_symbol_names(500);
@@ -253,7 +260,11 @@ fn run_all(root: &Path) {
             fuzzy_count += 1;
         }
     }
-    tracing::info!("fuzzy (local, {} queries): {:.2?}", fuzzy_count, t.elapsed());
+    tracing::info!(
+        "fuzzy (local, {} queries): {:.2?}",
+        fuzzy_count,
+        t.elapsed()
+    );
 
     // Fuzzy queries against dependency index
     let t = Instant::now();
@@ -267,7 +278,11 @@ fn run_all(root: &Path) {
             dep_fuzzy_count += 1;
         }
     }
-    tracing::info!("fuzzy (deps, {} queries): {:.2?}", dep_fuzzy_count, t.elapsed());
+    tracing::info!(
+        "fuzzy (deps, {} queries): {:.2?}",
+        dep_fuzzy_count,
+        t.elapsed()
+    );
 
     log_memory("end");
 

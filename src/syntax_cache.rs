@@ -126,8 +126,7 @@ impl SyntaxCache {
             let mut cursor = p.walk();
             for (i, child) in p.children(&mut cursor).enumerate() {
                 if child.id() == named.id() {
-                    return p.field_name_for_child(i as u32)
-                        .map(|s| s.to_string());
+                    return p.field_name_for_child(i as u32).map(|s| s.to_string());
                 }
             }
             None
@@ -197,9 +196,7 @@ impl SyntaxCache {
             .extension()
             .and_then(|e| e.to_str())
             .and_then(crate::parsing::tree_sitter_parse::language_for_extension)
-            .or_else(|| {
-                lang.and_then(crate::parsing::tree_sitter_parse::language_for_family)
-            })?;
+            .or_else(|| lang.and_then(crate::parsing::tree_sitter_parse::language_for_family))?;
         let mut parser = Parser::new();
         parser.set_language(&language).ok()?;
         parser.parse(source, None)
@@ -222,7 +219,11 @@ mod tests {
         // Find the column of "op_count"
         let col = source.find("op_count").unwrap();
         let ctx = cache.ident_context_at(&path, 0, col, source);
-        assert_eq!(ctx, IdentContext::FieldAccess, "ctx->op_count should be FieldAccess");
+        assert_eq!(
+            ctx,
+            IdentContext::FieldAccess,
+            "ctx->op_count should be FieldAccess"
+        );
     }
 
     #[test]
@@ -236,7 +237,11 @@ mod tests {
         let line1 = source.lines().nth(1).unwrap();
         let col = line1.find("Foo").unwrap();
         let ctx = cache.ident_context_at(&path, 1, col, source);
-        assert_eq!(ctx, IdentContext::TypeRef, "struct Foo in parameter should be TypeRef");
+        assert_eq!(
+            ctx,
+            IdentContext::TypeRef,
+            "struct Foo in parameter should be TypeRef"
+        );
     }
 
     #[test]
@@ -250,7 +255,11 @@ mod tests {
         let line1 = source.lines().nth(1).unwrap();
         let col = line1.find("foo").unwrap();
         let ctx = cache.ident_context_at(&path, 1, col, source);
-        assert_eq!(ctx, IdentContext::FunctionCall, "foo() should be FunctionCall");
+        assert_eq!(
+            ctx,
+            IdentContext::FunctionCall,
+            "foo() should be FunctionCall"
+        );
     }
 
     #[test]
@@ -276,7 +285,11 @@ mod tests {
         let line1 = source.lines().nth(1).unwrap();
         let col = line1.find("val").unwrap();
         let ctx = cache.ident_context_at(&path, 1, col, source);
-        assert_eq!(ctx, IdentContext::FieldAccess, "s.val should be FieldAccess");
+        assert_eq!(
+            ctx,
+            IdentContext::FieldAccess,
+            "s.val should be FieldAccess"
+        );
     }
 
     #[test]
@@ -372,6 +385,9 @@ mod tests {
             line: 0,
             col: 0,
         };
-        assert_eq!(SyntaxCache::classify_node(&info), IdentContext::FunctionCall);
+        assert_eq!(
+            SyntaxCache::classify_node(&info),
+            IdentContext::FunctionCall
+        );
     }
 }

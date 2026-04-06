@@ -100,7 +100,13 @@ pub mod stats {
             non_ident_skips += c.non_ident_unicode_skips;
         }
 
-        let pct = |n: u64, d: u64| if d == 0 { 0.0 } else { n as f64 / d as f64 * 100.0 };
+        let pct = |n: u64, d: u64| {
+            if d == 0 {
+                0.0
+            } else {
+                n as f64 / d as f64 * 100.0
+            }
+        };
 
         format!(
             "Scans: {}, Bytes: {} ({:.1} MB)\n\
@@ -108,11 +114,19 @@ pub mod stats {
              Idents: {} total, {} ascii ({:.1}%), {} unicode ({:.1}%), {} unicode chars\n\
              Non-ident unicode skips: {}",
             scan_calls,
-            total_bytes, total_bytes as f64 / 1_048_576.0,
-            comment, pct(comment, total_bytes), string, pct(string, total_bytes),
-            ident_calls, ident_ascii, pct(ident_ascii, ident_calls),
-            ident_unicode, pct(ident_unicode, ident_calls),
-            unicode_chars, non_ident_skips,
+            total_bytes,
+            total_bytes as f64 / 1_048_576.0,
+            comment,
+            pct(comment, total_bytes),
+            string,
+            pct(string, total_bytes),
+            ident_calls,
+            ident_ascii,
+            pct(ident_ascii, ident_calls),
+            ident_unicode,
+            pct(ident_unicode, ident_calls),
+            unicode_chars,
+            non_ident_skips,
         )
     }
 
@@ -134,20 +148,30 @@ pub mod stats {
         inc!(total_bytes, bytes);
     }
     #[inline(always)]
-    pub(super) fn comment_bytes(n: u64) { inc!(skipped_comment_bytes, n); }
+    pub(super) fn comment_bytes(n: u64) {
+        inc!(skipped_comment_bytes, n);
+    }
     #[inline(always)]
-    pub(super) fn string_bytes(n: u64) { inc!(skipped_string_bytes, n); }
+    pub(super) fn string_bytes(n: u64) {
+        inc!(skipped_string_bytes, n);
+    }
     #[inline(always)]
-    pub(super) fn ident_ascii() { inc!(ident_ascii_only, 1); }
+    pub(super) fn ident_ascii() {
+        inc!(ident_ascii_only, 1);
+    }
     #[inline(always)]
     pub(super) fn ident_unicode(chars: u64) {
         inc!(ident_hit_unicode, 1);
         inc!(ident_unicode_chars, chars);
     }
     #[inline(always)]
-    pub(super) fn ident_call() { inc!(ident_calls, 1); }
+    pub(super) fn ident_call() {
+        inc!(ident_calls, 1);
+    }
     #[inline(always)]
-    pub(super) fn non_ident_unicode_skip() { inc!(non_ident_unicode_skips, 1); }
+    pub(super) fn non_ident_unicode_skip() {
+        inc!(non_ident_unicode_skips, 1);
+    }
 }
 
 /// A token extracted by the scanner.
@@ -433,7 +457,10 @@ pub fn scan_full(source: &str, lang: LangFamily) -> (ScanResult, Vec<DefContext>
             // Pop scopes that have ended (dedented)
             while indent_stack.len() > 1 && indent <= indent_stack[indent_stack.len() - 1] {
                 indent_stack.pop();
-                if let Some(pos) = container_stack.iter().rposition(|(_,d)| *d >= indent_stack.len()) {
+                if let Some(pos) = container_stack
+                    .iter()
+                    .rposition(|(_, d)| *d >= indent_stack.len())
+                {
                     container_stack.truncate(pos);
                 }
             }
@@ -699,7 +726,13 @@ pub fn scan_full(source: &str, lang: LangFamily) -> (ScanResult, Vec<DefContext>
         i += 1;
     }
 
-    (ScanResult { tokens, occurrences }, def_contexts)
+    (
+        ScanResult {
+            tokens,
+            occurrences,
+        },
+        def_contexts,
+    )
 }
 
 /// Alias for scan_full for backward compatibility.

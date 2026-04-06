@@ -85,14 +85,17 @@ pub struct JsParser;
 
 impl TsParser for JsParser {
     fn parse(source: &str) -> ParseResult {
-        let mut result = common::run_query_parse(source, &QueryParseConfig {
-            language: tree_sitter_javascript::LANGUAGE.into(),
-            query_source: JS_QUERY,
-            identifier_kinds: JS_IDENT_KINDS,
-            def_keyword: js_def_keyword,
-            visibility: |_node: Node, _source: &str| Visibility::Unknown,
-            post_process: Some(js_post_process),
-        });
+        let mut result = common::run_query_parse(
+            source,
+            &QueryParseConfig {
+                language: tree_sitter_javascript::LANGUAGE.into(),
+                query_source: JS_QUERY,
+                identifier_kinds: JS_IDENT_KINDS,
+                def_keyword: js_def_keyword,
+                visibility: |_node: Node, _source: &str| Visibility::Unknown,
+                post_process: Some(js_post_process),
+            },
+        );
         result
     }
 }
@@ -194,16 +197,48 @@ const handler = (x) => x + 1;
         let result = JsParser::parse(source);
         let names: Vec<&str> = result.symbols.iter().map(|s| s.name.as_str()).collect();
 
-        assert!(names.contains(&"hello"), "should find function hello, got: {:?}", names);
-        assert!(names.contains(&"MAX_SIZE"), "should find const MAX_SIZE, got: {:?}", names);
-        assert!(names.contains(&"counter"), "should find let counter, got: {:?}", names);
-        assert!(names.contains(&"Config"), "should find class Config, got: {:?}", names);
-        assert!(names.contains(&"getName"), "should find method getName, got: {:?}", names);
-        assert!(names.contains(&"exported"), "should find exported function, got: {:?}", names);
-        assert!(names.contains(&"handler"), "should find arrow function handler, got: {:?}", names);
+        assert!(
+            names.contains(&"hello"),
+            "should find function hello, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"MAX_SIZE"),
+            "should find const MAX_SIZE, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"counter"),
+            "should find let counter, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Config"),
+            "should find class Config, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"getName"),
+            "should find method getName, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"exported"),
+            "should find exported function, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"handler"),
+            "should find arrow function handler, got: {:?}",
+            names
+        );
 
         // Check exported visibility
-        let exported_sym = result.symbols.iter().find(|s| s.name == "exported").unwrap();
+        let exported_sym = result
+            .symbols
+            .iter()
+            .find(|s| s.name == "exported")
+            .unwrap();
         assert_eq!(exported_sym.visibility, Visibility::Public);
 
         // Check method container

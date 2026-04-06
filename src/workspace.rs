@@ -26,8 +26,7 @@ use crate::parsing::symbols::Symbol;
 use crate::parsing::tokenizer::{self, LangFamily};
 use crate::parsing::tree_sitter_parse;
 use crate::word_index::{
-    IndexMeta, LogIndex, LogWriter, word_hash,
-    collect_file_mtimes, index_dir_for_project,
+    collect_file_mtimes, index_dir_for_project, word_hash, IndexMeta, LogIndex, LogWriter,
 };
 
 /// A symbol definition with its file location.
@@ -167,7 +166,8 @@ impl Workspace {
 
     /// Index a file from the editor: tokenize, extract symbols, store source text.
     pub fn index_file(&self, path: PathBuf, source: String) {
-        let lang = path.extension()
+        let lang = path
+            .extension()
             .and_then(|e| e.to_str())
             .and_then(LangFamily::from_extension);
         self.syntax_cache.update(&path, &source, lang);
@@ -185,7 +185,9 @@ impl Workspace {
             .and_then(|e| e.to_str())
             .and_then(LangFamily::from_extension);
 
-        let (symbols, occurrences) = if let Some(result) = tree_sitter_parse::try_parse(path, source) {
+        let (symbols, occurrences) = if let Some(result) =
+            tree_sitter_parse::try_parse(path, source)
+        {
             // Tree-sitter grammar available — use AST-based parsing
             let mut symbols = result.symbols;
             if let Some(l) = lang {
@@ -195,18 +197,18 @@ impl Workspace {
         } else if let Some(l) = lang {
             // No tree-sitter grammar — fall back to hand-written tokenizer
             let (scan_result, def_contexts) = tokenizer::scan_with_contexts(source, l);
-            let mut symbols =
-                Symbol::from_tokens_with_contexts(&scan_result.tokens, &def_contexts);
+            let mut symbols = Symbol::from_tokens_with_contexts(&scan_result.tokens, &def_contexts);
             Symbol::enrich_from_source(&mut symbols, source, l);
             (symbols, scan_result.occurrences)
         } else {
             (Vec::new(), Vec::new())
         };
 
-        let mut hashes: Vec<u32> = occurrences.iter()
+        let mut hashes: Vec<u32> = occurrences
+            .iter()
             .map(|occ| {
-                let word = &source[occ.word_offset as usize
-                    ..(occ.word_offset as usize + occ.word_len as usize)];
+                let word = &source
+                    [occ.word_offset as usize..(occ.word_offset as usize + occ.word_len as usize)];
                 word_hash(word)
             })
             .collect();
@@ -254,7 +256,8 @@ impl Workspace {
         }
 
         if update_fuzzy {
-            self.fuzzy_dirty.store(true, std::sync::atomic::Ordering::Release);
+            self.fuzzy_dirty
+                .store(true, std::sync::atomic::Ordering::Release);
         }
 
         self.files.insert(path, FileEntry { symbols, lang });
@@ -274,7 +277,8 @@ impl Workspace {
         for entry in self.definitions.iter() {
             fuzzy.insert(entry.key());
         }
-        self.fuzzy_dirty.store(false, std::sync::atomic::Ordering::Release);
+        self.fuzzy_dirty
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 
     /// Try to load cached symbols from a persisted index.
@@ -315,22 +319,26 @@ impl Workspace {
 
         // Populate workspace files/definitions/file_ids from the loaded log.
         self.populate_from_log_index(&mut index);
-        self.fuzzy_dirty.store(true, std::sync::atomic::Ordering::Release);
+        self.fuzzy_dirty
+            .store(true, std::sync::atomic::Ordering::Release);
 
         let changed = changed_files(&meta, file_mtimes);
 
         if changed.is_empty() {
             tracing::info!(
                 "Warm startup: loaded {} hashes, {} files, {} definitions from {}",
-                index.unique_hash_count(), index.file_count(),
-                self.definitions.len(), index_dir.display(),
+                index.unique_hash_count(),
+                index.file_count(),
+                self.definitions.len(),
+                index_dir.display(),
             );
             *self.word_index.write().unwrap() = Some(index);
             WarmResult::FullyFresh
         } else {
             tracing::info!(
                 "Warm startup: {} cached files loaded, {} files changed",
-                index.file_count(), changed.len(),
+                index.file_count(),
+                changed.len(),
             );
             // Don't store the index — it will be rebuilt after re-parsing changed files.
             WarmResult::PartiallyStale(changed)
@@ -352,14 +360,23 @@ impl Workspace {
 
             // Insert symbols into definitions index.
             for (idx, sym) in fd.symbols.iter().enumerate() {
-                let sym_ref = SymbolRef { file_id: fid, symbol_idx: idx as u32 };
-                self.definitions.entry(sym.name.clone()).or_default().push(sym_ref);
+                let sym_ref = SymbolRef {
+                    file_id: fid,
+                    symbol_idx: idx as u32,
+                };
+                self.definitions
+                    .entry(sym.name.clone())
+                    .or_default()
+                    .push(sym_ref);
             }
 
-            self.files.insert(path, FileEntry {
-                symbols: fd.symbols,
-                lang: fd.lang,
-            });
+            self.files.insert(
+                path,
+                FileEntry {
+                    symbols: fd.symbols,
+                    lang: fd.lang,
+                },
+            );
         }
     }
 
@@ -427,8 +444,10 @@ impl Workspace {
         let mtime_map: std::collections::HashMap<String, u64> = file_mtimes
             .iter()
             .map(|(p, mt)| {
-                let secs = mt.duration_since(std::time::SystemTime::UNIX_EPOCH)
-                    .map(|d| d.as_secs()).unwrap_or(0);
+                let secs = mt
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
                 (p.to_string_lossy().into_owned(), secs)
             })
             .collect();
@@ -450,13 +469,22 @@ impl Workspace {
                 for msg in rx {
                     let path_id = w.intern_path(&msg.path)?;
                     total_hashes += msg.word_hashes.len();
-                    w.write_file_data(path_id, msg.mtime, &msg.word_hashes, &msg.symbols, msg.lang)?;
+                    w.write_file_data(
+                        path_id,
+                        msg.mtime,
+                        &msg.word_hashes,
+                        &msg.symbols,
+                        msg.lang,
+                    )?;
 
                     files_written += 1;
                     if files_written % 10000 == 0 {
                         tracing::info!(
                             "log writer progress: {}/{} files, {} hashes, {:.1}s, {}",
-                            files_written, "?", total_hashes, t0.elapsed().as_secs_f64(),
+                            files_written,
+                            "?",
+                            total_hashes,
+                            t0.elapsed().as_secs_f64(),
                             rss_summary(),
                         );
                     }
@@ -465,7 +493,9 @@ impl Workspace {
                 w.flush()?;
                 tracing::info!(
                     "log writer done: {} files, {} hashes, {:.1}s, {}",
-                    files_written, total_hashes, t0.elapsed().as_secs_f64(),
+                    files_written,
+                    total_hashes,
+                    t0.elapsed().as_secs_f64(),
                     rss_summary(),
                 );
                 Ok(())
@@ -489,8 +519,10 @@ impl Workspace {
                 match std::fs::read_to_string(path) {
                     Ok(source) => {
                         let (symbols, word_hashes, lang) = Self::parse_file(path, &source);
-                        let mtime = mtime_map.get(&path.to_string_lossy().into_owned())
-                            .copied().unwrap_or(0);
+                        let mtime = mtime_map
+                            .get(&path.to_string_lossy().into_owned())
+                            .copied()
+                            .unwrap_or(0);
                         let _ = tx.send(LogWriteMsg {
                             path: path.clone(),
                             word_hashes,
@@ -503,7 +535,10 @@ impl Workspace {
                         if let Some(cb) = progress {
                             let prev = last_progress.load(Relaxed);
                             if count >= prev + 500 || count == total_files {
-                                if last_progress.compare_exchange(prev, count, Relaxed, Relaxed).is_ok() {
+                                if last_progress
+                                    .compare_exchange(prev, count, Relaxed, Relaxed)
+                                    .is_ok()
+                                {
                                     cb(count, total_files);
                                 }
                             }
@@ -518,7 +553,11 @@ impl Workspace {
 
         // Close the channel and wait for writer to finish.
         drop(tx);
-        tracing::info!("Indexed {} files, waiting for log writer, {}", indexed.load(Relaxed), Self::rss_summary());
+        tracing::info!(
+            "Indexed {} files, waiting for log writer, {}",
+            indexed.load(Relaxed),
+            Self::rss_summary()
+        );
 
         if let Some(handle) = writer_handle {
             match handle.join() {
@@ -532,7 +571,9 @@ impl Workspace {
         // Rayon worker threads and the writer thread accumulate freed pages in
         // glibc's per-thread arenas that won't be returned without this.
         #[cfg(target_os = "linux")]
-        unsafe { libc::malloc_trim(0); }
+        unsafe {
+            libc::malloc_trim(0);
+        }
         tracing::info!("After malloc_trim (pre-reload): {}", Self::rss_summary());
 
         // Load the written log index.
@@ -547,7 +588,8 @@ impl Workspace {
                         word_count: index.unique_hash_count() as u64,
                         built_at: std::time::SystemTime::now()
                             .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                            .map(|d| d.as_secs()).unwrap_or(0),
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0),
                         file_mtimes: IndexMeta::build_mtime_map(&file_mtimes),
                     };
                     if let Err(e) = meta.save(idx_dir) {
@@ -557,8 +599,10 @@ impl Workspace {
                     self.populate_from_log_index(&mut index);
                     tracing::info!(
                         "Log index loaded: {} files, {} hashes, {:.1}s, {}",
-                        index.file_count(), index.unique_hash_count(),
-                        tl.elapsed().as_secs_f64(), Self::rss_summary(),
+                        index.file_count(),
+                        index.unique_hash_count(),
+                        tl.elapsed().as_secs_f64(),
+                        Self::rss_summary(),
                     );
                     *self.word_index.write().unwrap() = Some(index);
                 }
@@ -567,7 +611,8 @@ impl Workspace {
             }
         }
 
-        self.fuzzy_dirty.store(true, std::sync::atomic::Ordering::Release);
+        self.fuzzy_dirty
+            .store(true, std::sync::atomic::Ordering::Release);
         tracing::info!("Log index written, {}", Self::rss_summary());
 
         // Strip doc_comment and signature from symbols to reduce resident memory.
@@ -712,7 +757,9 @@ impl Workspace {
         self.files
             .get(file)
             .map(|entry| {
-                entry.symbols.iter()
+                entry
+                    .symbols
+                    .iter()
                     .filter(|s| s.depth > 0 && s.name == name)
                     .map(|s| SymbolLocation {
                         file: file.to_path_buf(),
@@ -746,7 +793,9 @@ impl Workspace {
         cursor_line: usize,
     ) -> Option<SymbolLocation> {
         self.files.get(file).and_then(|entry| {
-            entry.symbols.iter()
+            entry
+                .symbols
+                .iter()
                 .filter(|s| {
                     s.depth > 0
                         && s.name == name
@@ -900,7 +949,9 @@ impl Workspace {
         files_to_scan
             .into_iter()
             .flat_map(|path| {
-                let source = self.open_sources.get(&path)
+                let source = self
+                    .open_sources
+                    .get(&path)
                     .map(|s| s.clone())
                     .or_else(|| std::fs::read_to_string(&path).ok());
                 let mut refs = Vec::new();
@@ -1003,14 +1054,19 @@ impl Workspace {
 
         // Re-extract from source file.
         let source = std::fs::read_to_string(&loc.file).ok()?;
-        let lang = loc.file.extension()
+        let lang = loc
+            .file
+            .extension()
             .and_then(|e| e.to_str())
             .and_then(LangFamily::from_extension)?;
 
         let lines: Vec<&str> = source.lines().collect();
         let doc = crate::parsing::symbols::extract_doc_comment(&lines, loc.symbol.line, lang);
         let sig = crate::parsing::symbols::extract_signature(
-            &lines, loc.symbol.line, loc.symbol.col, lang,
+            &lines,
+            loc.symbol.line,
+            loc.symbol.col,
+            lang,
         );
         Some((sig, doc))
     }
@@ -1052,8 +1108,10 @@ impl Workspace {
         let mtime_map: std::collections::HashMap<String, u64> = file_mtimes
             .iter()
             .map(|(p, mt)| {
-                let secs = mt.duration_since(std::time::SystemTime::UNIX_EPOCH)
-                    .map(|d| d.as_secs()).unwrap_or(0);
+                let secs = mt
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
                 (p.to_string_lossy().into_owned(), secs)
             })
             .collect();
@@ -1085,9 +1143,15 @@ impl Workspace {
 
             let path_id = match w.intern_path(path) {
                 Ok(id) => id,
-                Err(e) => { tracing::warn!("intern_path failed: {e}"); continue; }
+                Err(e) => {
+                    tracing::warn!("intern_path failed: {e}");
+                    continue;
+                }
             };
-            let mtime = mtime_map.get(&path.to_string_lossy().into_owned()).copied().unwrap_or(0);
+            let mtime = mtime_map
+                .get(&path.to_string_lossy().into_owned())
+                .copied()
+                .unwrap_or(0);
 
             if let Err(e) = w.write_file_data(path_id, mtime, &word_hashes, &symbols, lang) {
                 tracing::warn!("Failed to write file data: {e}");
@@ -1114,7 +1178,8 @@ impl Workspace {
                     word_count: new_index.unique_hash_count() as u64,
                     built_at: std::time::SystemTime::now()
                         .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                        .map(|d| d.as_secs()).unwrap_or(0),
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
                     file_mtimes: IndexMeta::build_mtime_map(file_mtimes),
                 };
                 if let Err(e) = meta.save(&index_dir) {
@@ -1126,7 +1191,8 @@ impl Workspace {
             Err(e) => tracing::warn!("Failed to reload log: {e}"),
         }
 
-        self.fuzzy_dirty.store(true, std::sync::atomic::Ordering::Release);
+        self.fuzzy_dirty
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Re-extract doc_comment and signature from source if they were stripped.
@@ -1135,16 +1201,20 @@ impl Workspace {
             return;
         }
         if let Ok(source) = std::fs::read_to_string(&loc.file) {
-            let lang = loc.file.extension()
+            let lang = loc
+                .file
+                .extension()
                 .and_then(|e| e.to_str())
                 .and_then(LangFamily::from_extension);
             if let Some(lang) = lang {
                 let lines: Vec<&str> = source.lines().collect();
-                loc.symbol.doc_comment = crate::parsing::symbols::extract_doc_comment(
-                    &lines, loc.symbol.line, lang,
-                );
+                loc.symbol.doc_comment =
+                    crate::parsing::symbols::extract_doc_comment(&lines, loc.symbol.line, lang);
                 loc.symbol.signature = crate::parsing::symbols::extract_signature(
-                    &lines, loc.symbol.line, loc.symbol.col, lang,
+                    &lines,
+                    loc.symbol.line,
+                    loc.symbol.col,
+                    lang,
                 );
             }
         }
@@ -1286,7 +1356,11 @@ impl Workspace {
 
         // 3. fuzzy index
         let fuzzy_size = if let Ok(fuzzy) = self.fuzzy.read() {
-            let syms: usize = fuzzy.symbols().iter().map(|s| std::mem::size_of::<String>() + s.len()).sum();
+            let syms: usize = fuzzy
+                .symbols()
+                .iter()
+                .map(|s| std::mem::size_of::<String>() + s.len())
+                .sum();
             let trigrams: usize = fuzzy.trigram_count() * (3 + std::mem::size_of::<Vec<u32>>())
                 + fuzzy.trigram_entry_count() * std::mem::size_of::<u32>();
             syms + trigrams
@@ -1304,7 +1378,9 @@ impl Workspace {
         breakdown.push(("log index (postings)", word_index_size));
 
         // 5. open_sources (should be 0 for scan_directory benchmarks)
-        let open_sources_size: usize = self.open_sources.iter()
+        let open_sources_size: usize = self
+            .open_sources
+            .iter()
             .map(|e| e.key().as_os_str().len() + e.value().len())
             .sum();
         breakdown.push(("open sources", open_sources_size));
@@ -1318,7 +1394,9 @@ impl Workspace {
         breakdown
     }
 
-    fn rss_summary() -> String { rss_summary() }
+    fn rss_summary() -> String {
+        rss_summary()
+    }
 
     fn symbol_deep_size(sym: &Symbol) -> usize {
         std::mem::size_of::<Symbol>()
@@ -1380,7 +1458,7 @@ fn changed_files(
         let path_str = path.to_string_lossy();
         match meta.file_mtimes.get(path_str.as_ref()) {
             Some(&stored) if stored == secs => {} // unchanged
-            _ => changed.push(path.clone()),       // new or modified
+            _ => changed.push(path.clone()),      // new or modified
         }
     }
 
@@ -1408,10 +1486,7 @@ const SYMBOLS_MAGIC: &[u8; 8] = b"QLSY\x01\x00\x00\x00";
 
 /// Save all file symbols + definitions to a compact binary file.
 /// Excludes doc_comment and signature (already stripped).
-fn save_symbols(
-    files: &DashMap<PathBuf, FileEntry>,
-    index_dir: &Path,
-) -> std::io::Result<()> {
+fn save_symbols(files: &DashMap<PathBuf, FileEntry>, index_dir: &Path) -> std::io::Result<()> {
     let path = index_dir.join("symbols.bin");
     let mut w = BufWriter::with_capacity(1 << 20, std::fs::File::create(&path)?);
 
@@ -1485,7 +1560,10 @@ fn load_symbols(
     let mut magic = [0u8; 8];
     r.read_exact(&mut magic)?;
     if &magic != SYMBOLS_MAGIC {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bad symbols magic"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "bad symbols magic",
+        ));
     }
 
     let mut buf4 = [0u8; 4];
@@ -1542,10 +1620,7 @@ fn load_symbols(
             symbols.push(sym);
         }
 
-        files.insert(file_path, FileEntry {
-            symbols,
-            lang,
-        });
+        files.insert(file_path, FileEntry { symbols, lang });
     }
 
     Ok(())
@@ -2295,7 +2370,8 @@ mod tests {
             let name = format!("unique_{i}");
             let defs = ws.find_definitions(&name);
             assert_eq!(
-                defs.len(), 1,
+                defs.len(),
+                1,
                 "unique_{i} should have exactly 1 definition, got {}",
                 defs.len()
             );
@@ -2304,9 +2380,11 @@ mod tests {
         // shared_func defined in every file
         let shared_defs = ws.find_definitions("shared_func");
         assert_eq!(
-            shared_defs.len(), file_count,
+            shared_defs.len(),
+            file_count,
             "shared_func should have {} definitions, got {}",
-            file_count, shared_defs.len()
+            file_count,
+            shared_defs.len()
         );
 
         // References should find shared_func across files via word index
@@ -2314,7 +2392,8 @@ mod tests {
         assert!(
             refs.len() >= file_count,
             "shared_func should have >= {} references, got {}",
-            file_count, refs.len()
+            file_count,
+            refs.len()
         );
 
         // Fuzzy search should still work
@@ -2352,18 +2431,30 @@ mod tests {
         let refs = ws.find_references("cross_batch_name");
         // Each file has 2 occurrences of cross_batch_name (call + def)
         assert_eq!(
-            refs.len(), 510 * 2,
+            refs.len(),
+            510 * 2,
             "cross_batch_name should have {} references (2 per file), got {}",
-            510 * 2, refs.len()
+            510 * 2,
+            refs.len()
         );
 
         // Verify a function that only exists in batch 1 (file 505)
         let refs = ws.find_references("func_505");
-        assert_eq!(refs.len(), 1, "func_505 should have 1 reference, got {}", refs.len());
+        assert_eq!(
+            refs.len(),
+            1,
+            "func_505 should have 1 reference, got {}",
+            refs.len()
+        );
 
         // Verify a function from batch 0 (file 10)
         let refs = ws.find_references("func_10");
-        assert_eq!(refs.len(), 1, "func_10 should have 1 reference, got {}", refs.len());
+        assert_eq!(
+            refs.len(),
+            1,
+            "func_10 should have 1 reference, got {}",
+            refs.len()
+        );
 
         // Verify definitions work across batches too
         let defs = ws.find_definitions("func_505");
@@ -2381,14 +2472,12 @@ mod tests {
 
         // Create files with identifiers that have a different insertion order
         // than lexicographic order: "zebra" inserted before "alpha".
-        std::fs::write(
-            dir.path().join("first.rs"),
-            "fn zebra() {}\nfn alpha() {}",
-        ).unwrap();
+        std::fs::write(dir.path().join("first.rs"), "fn zebra() {}\nfn alpha() {}").unwrap();
         std::fs::write(
             dir.path().join("second.rs"),
             "fn middle() {}\nfn alpha() {}",
-        ).unwrap();
+        )
+        .unwrap();
 
         let ws = Workspace::new();
         ws.scan_directory(dir.path(), None);
@@ -2417,7 +2506,8 @@ mod tests {
         std::fs::write(
             dir.path().join("only.rs"),
             "fn sole_function() {}\nfn caller() { sole_function(); }",
-        ).unwrap();
+        )
+        .unwrap();
 
         let ws = Workspace::new();
         let stats = ws.scan_directory(dir.path(), None);

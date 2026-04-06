@@ -68,7 +68,14 @@ const _: () = assert!(std::mem::size_of::<CompactEntry>() == 20);
 
 impl CompactEntry {
     fn new(word_id: u32, path_id: u32, line: u32, col: u32, len: u16) -> Self {
-        Self { word_id, path_id, line, col, len, _pad: 0 }
+        Self {
+            word_id,
+            path_id,
+            line,
+            col,
+            len,
+            _pad: 0,
+        }
     }
 }
 
@@ -95,13 +102,21 @@ struct DirEntry {
 
 impl WordDirectory {
     pub fn new() -> Self {
-        Self { pool: String::new(), entries: Vec::new() }
+        Self {
+            pool: String::new(),
+            entries: Vec::new(),
+        }
     }
 
     fn insert(&mut self, word: &str, posting_offset: u32, posting_count: u32) {
         let pool_offset = self.pool.len() as u32;
         self.pool.push_str(word);
-        self.entries.push(DirEntry { pool_offset, word_len: word.len() as u16, posting_offset, posting_count });
+        self.entries.push(DirEntry {
+            pool_offset,
+            word_len: word.len() as u16,
+            posting_offset,
+            posting_count,
+        });
     }
 
     fn word_at(&self, e: &DirEntry) -> &str {
@@ -117,11 +132,20 @@ impl WordDirectory {
                     .cmp(word.as_bytes())
             })
             .ok()
-            .map(|i| (self.entries[i].posting_offset, self.entries[i].posting_count))
+            .map(|i| {
+                (
+                    self.entries[i].posting_offset,
+                    self.entries[i].posting_count,
+                )
+            })
     }
 
-    pub fn len(&self) -> usize { self.entries.len() }
-    pub fn is_empty(&self) -> bool { self.entries.is_empty() }
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 
     pub fn memory_usage(&self) -> usize {
         self.pool.len() + self.entries.len() * std::mem::size_of::<DirEntry>()
@@ -198,7 +222,9 @@ impl WordIndexBuilder {
     pub fn add(&mut self, entry: IndexEntry) {
         let word_id = self.intern_word_owned(entry.word);
         let path_id = self.intern_path(&entry.path);
-        self.entries.push(CompactEntry::new(word_id, path_id, entry.line, entry.col, entry.len));
+        self.entries.push(CompactEntry::new(
+            word_id, path_id, entry.line, entry.col, entry.len,
+        ));
     }
 
     /// Add entries from a file's occurrences, resolving byte offsets against `source`.
@@ -210,10 +236,15 @@ impl WordIndexBuilder {
     ) {
         let path_id = self.intern_path(path);
         for occ in occurrences {
-            let word = &source[occ.word_offset as usize..(occ.word_offset + occ.word_len as u32) as usize];
+            let word =
+                &source[occ.word_offset as usize..(occ.word_offset + occ.word_len as u32) as usize];
             let word_id = self.intern_word(word);
             self.entries.push(CompactEntry::new(
-                word_id, path_id, occ.line as u32, occ.col as u32, occ.word_len,
+                word_id,
+                path_id,
+                occ.line as u32,
+                occ.col as u32,
+                occ.word_len,
             ));
         }
     }
@@ -228,15 +259,22 @@ impl WordIndexBuilder {
         let path_id = self.intern_path(path);
         self.entries.reserve(occurrences.len());
         for occ in occurrences {
-            let word = &source[occ.word_offset as usize..(occ.word_offset + occ.word_len as u32) as usize];
+            let word =
+                &source[occ.word_offset as usize..(occ.word_offset + occ.word_len as u32) as usize];
             let word_id = self.intern_word(word);
             self.entries.push(CompactEntry::new(
-                word_id, path_id, occ.line as u32, occ.col as u32, occ.word_len,
+                word_id,
+                path_id,
+                occ.line as u32,
+                occ.col as u32,
+                occ.word_len,
             ));
         }
     }
 
-    pub fn entry_count(&self) -> usize { self.spilled_count + self.entries.len() }
+    pub fn entry_count(&self) -> usize {
+        self.spilled_count + self.entries.len()
+    }
 
     /// Sort the in-memory entries and flush them to a temp chunk file on disk.
     /// Clears the entries Vec afterward, freeing its memory.
@@ -253,7 +291,8 @@ impl WordIndexBuilder {
 
         // Sort this chunk by (path_id, word_id, line) — same order as final output.
         self.entries.sort_unstable_by(|a, b| {
-            a.path_id.cmp(&b.path_id)
+            a.path_id
+                .cmp(&b.path_id)
                 .then_with(|| a.word_id.cmp(&b.word_id))
                 .then_with(|| a.line.cmp(&b.line))
         });
@@ -351,8 +390,11 @@ impl WordIndexBuilder {
             });
 
             let result = write_index_bin(
-                &index_path, &sorted_word_ids, &word_postings,
-                &self.word_table, &mut word_dir,
+                &index_path,
+                &sorted_word_ids,
+                &word_postings,
+                &self.word_table,
+                &mut word_dir,
             );
             if let Err(e) = result {
                 tracing::warn!("Failed to write index.v2.bin: {e}");
@@ -364,21 +406,35 @@ impl WordIndexBuilder {
         }
 
         let t2 = Instant::now();
-        tracing::info!("word index build: index.v2.bin + words.v2.bin: {:.2?}", t2 - t1);
-        tracing::info!("word index build: total: {:.2?} ({} entries, {} words, {} files)",
-            t2 - t0, total_entries, word_count, path_count);
+        tracing::info!(
+            "word index build: index.v2.bin + words.v2.bin: {:.2?}",
+            t2 - t1
+        );
+        tracing::info!(
+            "word index build: total: {:.2?} ({} entries, {} words, {} files)",
+            t2 - t0,
+            total_entries,
+            word_count,
+            path_count
+        );
 
         Ok((word_dir, self.word_table, self.path_table))
     }
 }
 
 impl Default for WordIndexBuilder {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn log_rss(label: &str) {
     if let Ok(statm) = std::fs::read_to_string("/proc/self/statm") {
-        if let Some(rss_pages) = statm.split_whitespace().nth(1).and_then(|s| s.parse::<usize>().ok()) {
+        if let Some(rss_pages) = statm
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse::<usize>().ok())
+        {
             let rss_mb = rss_pages * 4096 / (1024 * 1024);
             tracing::info!("RSS [{}]: {} MB", label, rss_mb);
         }
@@ -390,7 +446,10 @@ fn log_rss(label: &str) {
 /// Read a chunk file into a Vec<CompactEntry>.
 fn read_chunk_file(path: &Path) -> io::Result<Vec<CompactEntry>> {
     let data = std::fs::read(path)?;
-    assert!(data.len() % ENTRY_SIZE == 0, "chunk file size not a multiple of entry size");
+    assert!(
+        data.len() % ENTRY_SIZE == 0,
+        "chunk file size not a multiple of entry size"
+    );
     let count = data.len() / ENTRY_SIZE;
     let mut entries = Vec::with_capacity(count);
     // SAFETY: CompactEntry is repr(C), 20 bytes, all fields are plain integers,
@@ -535,8 +594,12 @@ fn streaming_build_files_and_postings(
         if path_id != cur_path_id || cur_file_entries.is_empty() {
             if !cur_file_entries.is_empty() {
                 flush_file(
-                    &cur_file_entries, cur_path_id, &mut w, &mut occ_offset,
-                    &mut file_table, word_postings,
+                    &cur_file_entries,
+                    cur_path_id,
+                    &mut w,
+                    &mut occ_offset,
+                    &mut file_table,
+                    word_postings,
                 )?;
                 cur_file_entries.clear();
             }
@@ -548,8 +611,12 @@ fn streaming_build_files_and_postings(
     // Flush the last file.
     if !cur_file_entries.is_empty() {
         flush_file(
-            &cur_file_entries, cur_path_id, &mut w, &mut occ_offset,
-            &mut file_table, word_postings,
+            &cur_file_entries,
+            cur_path_id,
+            &mut w,
+            &mut occ_offset,
+            &mut file_table,
+            word_postings,
         )?;
     }
 
@@ -611,7 +678,11 @@ fn write_index_bin(
     for &word_id in sorted_word_ids {
         let postings = &word_postings[word_id as usize];
         dir_by_word_id[word_id as usize] = (posting_offset, postings.len() as u32);
-        word_dir.insert(&word_table[word_id as usize], posting_offset, postings.len() as u32);
+        word_dir.insert(
+            &word_table[word_id as usize],
+            posting_offset,
+            postings.len() as u32,
+        );
         for &file_id in postings {
             w.write_all(&file_id.to_le_bytes())?;
         }
@@ -692,7 +763,13 @@ impl WordIndex {
             dir.display(),
         );
 
-        Ok(Self { index_dir: dir.to_path_buf(), word_dir, file_table, path_table, word_table })
+        Ok(Self {
+            index_dir: dir.to_path_buf(),
+            word_dir,
+            file_table,
+            path_table,
+            word_table,
+        })
     }
 
     /// Load an existing word index from disk.
@@ -701,7 +778,13 @@ impl WordIndex {
         let file_table = Self::load_file_table(&dir.join("files.v2.bin"))?;
         let word_dir = Self::load_index_file(&dir.join("index.v2.bin"), &word_table)?;
 
-        Ok(Self { index_dir: dir.to_path_buf(), word_dir, file_table, path_table, word_table })
+        Ok(Self {
+            index_dir: dir.to_path_buf(),
+            word_dir,
+            file_table,
+            path_table,
+            word_table,
+        })
     }
 
     fn load_words_file(path: &Path) -> io::Result<(Vec<String>, Vec<String>)> {
@@ -709,7 +792,10 @@ impl WordIndex {
         let mut magic = [0u8; 8];
         r.read_exact(&mut magic)?;
         if magic != MAGIC_WORDS {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid words magic"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid words magic",
+            ));
         }
         let mut buf4 = [0u8; 4];
         r.read_exact(&mut buf4)?;
@@ -753,7 +839,10 @@ impl WordIndex {
         let mut magic = [0u8; 8];
         r.read_exact(&mut magic)?;
         if magic != MAGIC_FILES {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid files magic"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid files magic",
+            ));
         }
         let mut buf4 = [0u8; 4];
         r.read_exact(&mut buf4)?;
@@ -777,7 +866,10 @@ impl WordIndex {
         let mut magic = [0u8; 8];
         r.read_exact(&mut magic)?;
         if magic != MAGIC_INDEX {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid index magic"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid index magic",
+            ));
         }
         let mut buf4 = [0u8; 4];
         r.read_exact(&mut buf4)?;
@@ -846,8 +938,12 @@ impl WordIndex {
         // to match against the occurrence word_id field.
         // Since we have word_table, just scan for the word. For large tables
         // this could be optimized with a reverse map, but it's only done once per query.
-        let word_id = self.word_table.iter().position(|w| w == word)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "word not in table"))? as u32;
+        let word_id = self
+            .word_table
+            .iter()
+            .position(|w| w == word)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "word not in table"))?
+            as u32;
 
         let mut results = Vec::new();
         for &file_id in &file_ids {
@@ -892,8 +988,12 @@ impl WordIndex {
         Ok(results)
     }
 
-    pub fn word_dir(&self) -> &WordDirectory { &self.word_dir }
-    pub fn index_path(&self) -> &Path { &self.index_dir }
+    pub fn word_dir(&self) -> &WordDirectory {
+        &self.word_dir
+    }
+    pub fn index_path(&self) -> &Path {
+        &self.index_dir
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────
@@ -910,17 +1010,23 @@ mod tests {
         builder.add(IndexEntry {
             word: "foo".to_string(),
             path: PathBuf::from("/src/main.rs"),
-            line: 0, col: 3, len: 3,
+            line: 0,
+            col: 3,
+            len: 3,
         });
         builder.add(IndexEntry {
             word: "foo".to_string(),
             path: PathBuf::from("/src/lib.rs"),
-            line: 5, col: 10, len: 3,
+            line: 5,
+            col: 10,
+            len: 3,
         });
         builder.add(IndexEntry {
             word: "bar".to_string(),
             path: PathBuf::from("/src/main.rs"),
-            line: 2, col: 0, len: 3,
+            line: 2,
+            col: 0,
+            len: 3,
         });
 
         let index = WordIndex::build(builder, dir.path()).unwrap();
@@ -965,7 +1071,9 @@ mod tests {
         builder.add(IndexEntry {
             word: "über_config".to_string(),
             path: PathBuf::from("/src/main.rs"),
-            line: 0, col: 3, len: 13,
+            line: 0,
+            col: 3,
+            len: 13,
         });
 
         let index = WordIndex::build(builder, dir.path()).unwrap();
@@ -988,12 +1096,16 @@ mod tests {
             builder.add(IndexEntry {
                 word: "shared".to_string(),
                 path: path.clone(),
-                line: i, col: 0, len: 6,
+                line: i,
+                col: 0,
+                len: 6,
             });
             builder.add(IndexEntry {
                 word: format!("unique_{}", i),
                 path,
-                line: i + 1, col: 0, len: 8,
+                line: i + 1,
+                col: 0,
+                len: 8,
             });
         }
 

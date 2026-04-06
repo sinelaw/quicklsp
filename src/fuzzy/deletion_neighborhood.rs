@@ -344,15 +344,37 @@ mod tests {
     fn quality_against_realistic_symbol_set() {
         let mut idx = DeletionIndex::new();
         let symbols = &[
-            "HashMap", "HashSet", "BTreeMap", "BTreeSet", "Vec", "String",
-            "process_data", "process_event", "process_request",
-            "handle_connection", "handle_error", "handle_request",
-            "serialize", "deserialize", "Deserializer",
-            "Config", "Context", "Connection", "Controller",
-            "read_file", "read_line", "write_file", "write_line",
-            "TokenKind", "Token", "Tokenizer",
-            "SymbolKind", "SymbolLocation", "Symbol",
-            "Workspace", "DependencyIndex",
+            "HashMap",
+            "HashSet",
+            "BTreeMap",
+            "BTreeSet",
+            "Vec",
+            "String",
+            "process_data",
+            "process_event",
+            "process_request",
+            "handle_connection",
+            "handle_error",
+            "handle_request",
+            "serialize",
+            "deserialize",
+            "Deserializer",
+            "Config",
+            "Context",
+            "Connection",
+            "Controller",
+            "read_file",
+            "read_line",
+            "write_file",
+            "write_line",
+            "TokenKind",
+            "Token",
+            "Tokenizer",
+            "SymbolKind",
+            "SymbolLocation",
+            "Symbol",
+            "Workspace",
+            "DependencyIndex",
         ];
         for s in symbols {
             idx.insert(s);
@@ -379,7 +401,10 @@ mod tests {
 
         // Prefix typo (edit distance 1)
         let r = idx.resolve("derialize");
-        assert!(r.contains(&"serialize"), "missing char: derialize → serialize");
+        assert!(
+            r.contains(&"serialize"),
+            "missing char: derialize → serialize"
+        );
         assert!(r.contains(&"deserialize"), "missing char at different pos");
 
         // No false positives for distant strings
@@ -416,7 +441,10 @@ mod tests {
 
         // Missing accent (byte-level would overcount this)
         let r = idx.resolve("cafe");
-        assert!(r.contains(&"café"), "missing accent: cafe → café (edit dist 1)");
+        assert!(
+            r.contains(&"café"),
+            "missing accent: cafe → café (edit dist 1)"
+        );
 
         // Substitution in CJK
         let r = idx.resolve("名目");

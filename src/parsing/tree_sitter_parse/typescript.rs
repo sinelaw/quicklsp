@@ -149,14 +149,17 @@ impl TsParser for TsxParser {
 }
 
 fn parse_ts_common(source: &str, language: tree_sitter::Language) -> ParseResult {
-    let mut result = common::run_query_parse(source, &QueryParseConfig {
-        language,
-        query_source: TS_QUERY,
-        identifier_kinds: TS_IDENT_KINDS,
-        def_keyword: ts_def_keyword,
-        visibility: |_node: Node, _source: &str| Visibility::Unknown,
-        post_process: Some(ts_post_process),
-    });
+    let mut result = common::run_query_parse(
+        source,
+        &QueryParseConfig {
+            language,
+            query_source: TS_QUERY,
+            identifier_kinds: TS_IDENT_KINDS,
+            def_keyword: ts_def_keyword,
+            visibility: |_node: Node, _source: &str| Visibility::Unknown,
+            post_process: Some(ts_post_process),
+        },
+    );
     result
 }
 
@@ -198,7 +201,8 @@ fn walk_for_export_and_const(node: Node, source: &str, symbols: &mut Vec<Symbol>
                     let start_line = node.start_position().row;
                     let end_line = node.end_position().row;
                     for sym in symbols.iter_mut() {
-                        if sym.line >= start_line && sym.line <= end_line
+                        if sym.line >= start_line
+                            && sym.line <= end_line
                             && sym.kind == SymbolKind::Variable
                         {
                             sym.kind = SymbolKind::Constant;
@@ -259,18 +263,58 @@ const handler = (x: number): number => x + 1;
         let result = TypeScriptParser::parse(source);
         let names: Vec<&str> = result.symbols.iter().map(|s| s.name.as_str()).collect();
 
-        assert!(names.contains(&"hello"), "should find function hello, got: {:?}", names);
-        assert!(names.contains(&"MAX_SIZE"), "should find const MAX_SIZE, got: {:?}", names);
-        assert!(names.contains(&"Handler"), "should find interface Handler, got: {:?}", names);
-        assert!(names.contains(&"Config"), "should find class Config, got: {:?}", names);
-        assert!(names.contains(&"getName"), "should find method getName, got: {:?}", names);
-        assert!(names.contains(&"Result"), "should find type alias Result, got: {:?}", names);
-        assert!(names.contains(&"Status"), "should find enum Status, got: {:?}", names);
-        assert!(names.contains(&"exported"), "should find exported function, got: {:?}", names);
-        assert!(names.contains(&"handler"), "should find arrow function handler, got: {:?}", names);
+        assert!(
+            names.contains(&"hello"),
+            "should find function hello, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"MAX_SIZE"),
+            "should find const MAX_SIZE, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Handler"),
+            "should find interface Handler, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Config"),
+            "should find class Config, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"getName"),
+            "should find method getName, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Result"),
+            "should find type alias Result, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Status"),
+            "should find enum Status, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"exported"),
+            "should find exported function, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"handler"),
+            "should find arrow function handler, got: {:?}",
+            names
+        );
 
         // Check exported visibility
-        let exported_sym = result.symbols.iter().find(|s| s.name == "exported").unwrap();
+        let exported_sym = result
+            .symbols
+            .iter()
+            .find(|s| s.name == "exported")
+            .unwrap();
         assert_eq!(exported_sym.visibility, Visibility::Public);
 
         // Check interface method container
@@ -342,9 +386,21 @@ export default App;
 "#;
         let result = TsxParser::parse(source);
         let names: Vec<&str> = result.symbols.iter().map(|s| s.name.as_str()).collect();
-        assert!(names.contains(&"Props"), "should find interface Props, got: {:?}", names);
-        assert!(names.contains(&"Greeting"), "should find function Greeting, got: {:?}", names);
-        assert!(names.contains(&"App"), "should find const App, got: {:?}", names);
+        assert!(
+            names.contains(&"Props"),
+            "should find interface Props, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Greeting"),
+            "should find function Greeting, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"App"),
+            "should find const App, got: {:?}",
+            names
+        );
     }
 
     #[test]

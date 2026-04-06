@@ -80,7 +80,12 @@ impl LspServer {
             }
         });
 
-        LspServer { child, rx, _reader_thread: reader_thread, next_id: 100 }
+        LspServer {
+            child,
+            rx,
+            _reader_thread: reader_thread,
+            next_id: 100,
+        }
     }
 
     fn stdin(&mut self) -> &mut std::process::ChildStdin {
@@ -143,9 +148,11 @@ impl LspServer {
                 "capabilities": { "window": { "workDoneProgress": true } }
             }
         }));
-        let _ = self.wait_for(Duration::from_secs(5), |msg| {
-            msg.get("id").and_then(|v| v.as_u64()) == Some(1)
-        }).expect("No initialize response");
+        let _ = self
+            .wait_for(Duration::from_secs(5), |msg| {
+                msg.get("id").and_then(|v| v.as_u64()) == Some(1)
+            })
+            .expect("No initialize response");
         self.send(&serde_json::json!({
             "jsonrpc": "2.0", "method": "initialized", "params": {}
         }));
@@ -264,8 +271,7 @@ fn drain_until_progress_end(server: &mut LspServer) {
     while start.elapsed() < timeout {
         let remaining = timeout.saturating_sub(start.elapsed());
         if let Some(msg) = server.recv(remaining) {
-            if msg.get("method").and_then(|v| v.as_str())
-                == Some("window/workDoneProgress/create")
+            if msg.get("method").and_then(|v| v.as_str()) == Some("window/workDoneProgress/create")
             {
                 if let Some(id) = msg.get("id") {
                     server.send(&serde_json::json!({
@@ -307,7 +313,10 @@ struct TestResults {
 
 impl TestResults {
     fn new() -> Self {
-        TestResults { failures: Vec::new(), pass_count: 0 }
+        TestResults {
+            failures: Vec::new(),
+            pass_count: 0,
+        }
     }
 
     fn check(&mut self, ok: bool, msg: String) {
@@ -394,7 +403,12 @@ fn check_definition_found(t: &mut TestResults, resp: &serde_json::Value, ctx: &s
     }
 }
 
-fn check_definition_target(t: &mut TestResults, resp: &serde_json::Value, expected_file: &str, ctx: &str) {
+fn check_definition_target(
+    t: &mut TestResults,
+    resp: &serde_json::Value,
+    expected_file: &str,
+    ctx: &str,
+) {
     if resp.get("error").is_some() || resp["result"].is_null() {
         t.check(false, format!("{ctx}: definition error or null"));
         return;
@@ -406,13 +420,20 @@ fn check_definition_target(t: &mut TestResults, resp: &serde_json::Value, expect
         vec![result]
     };
     let found = locations.iter().any(|loc| {
-        let uri = loc["uri"].as_str().or_else(|| loc["targetUri"].as_str()).unwrap_or("");
+        let uri = loc["uri"]
+            .as_str()
+            .or_else(|| loc["targetUri"].as_str())
+            .unwrap_or("");
         uri.ends_with(expected_file)
     });
-    let uris: Vec<&str> = locations.iter().filter_map(|loc| {
-        loc["uri"].as_str().or_else(|| loc["targetUri"].as_str())
-    }).collect();
-    t.check(found, format!("{ctx}: expected definition in '{expected_file}', got: {uris:?}"));
+    let uris: Vec<&str> = locations
+        .iter()
+        .filter_map(|loc| loc["uri"].as_str().or_else(|| loc["targetUri"].as_str()))
+        .collect();
+    t.check(
+        found,
+        format!("{ctx}: expected definition in '{expected_file}', got: {uris:?}"),
+    );
 }
 
 fn check_references_ge(t: &mut TestResults, resp: &serde_json::Value, min: usize, ctx: &str) {
@@ -428,24 +449,33 @@ fn check_references_ge(t: &mut TestResults, resp: &serde_json::Value, min: usize
     );
 }
 
-fn check_references_include_file(t: &mut TestResults, resp: &serde_json::Value, filename: &str, ctx: &str) {
+fn check_references_include_file(
+    t: &mut TestResults,
+    resp: &serde_json::Value,
+    filename: &str,
+    ctx: &str,
+) {
     if resp.get("error").is_some() {
         t.check(false, format!("{ctx}: references error: {resp}"));
         return;
     }
     let empty = vec![];
     let refs = resp["result"].as_array().unwrap_or(&empty);
-    let found = refs.iter().any(|r| {
-        r["uri"].as_str().map_or(false, |u| u.ends_with(filename))
-    });
-    let files: Vec<&str> = refs.iter()
+    let found = refs
+        .iter()
+        .any(|r| r["uri"].as_str().map_or(false, |u| u.ends_with(filename)));
+    let files: Vec<&str> = refs
+        .iter()
         .filter_map(|r| r["uri"].as_str())
         .map(|u| u.rsplit('/').next().unwrap_or(u))
         .collect();
-    t.check(found, format!(
-        "{ctx}: expected refs to include '{filename}', got {} refs in files: {files:?}",
-        refs.len()
-    ));
+    t.check(
+        found,
+        format!(
+            "{ctx}: expected refs to include '{filename}', got {} refs in files: {files:?}",
+            refs.len()
+        ),
+    );
 }
 
 fn check_sighelp_found(t: &mut TestResults, resp: &serde_json::Value, ctx: &str) {
@@ -468,11 +498,15 @@ fn check_sighelp_found(t: &mut TestResults, resp: &serde_json::Value, ctx: &str)
 fn check_symbols_exclude_locals(t: &mut TestResults, resp: &serde_json::Value, ctx: &str) {
     let syms = match resp["result"].as_array() {
         Some(s) => s,
-        None => { t.check(false, format!("{ctx}: no symbols array")); return; }
+        None => {
+            t.check(false, format!("{ctx}: no symbols array"));
+            return;
+        }
     };
     // LSP SymbolKind: 12=Function, 13=Variable, 23=Struct, 10=Enum, 14=Constant
     // Local variables (kind=13) like `i`, `buf`, `h` are noise
-    let local_names: Vec<&str> = syms.iter()
+    let local_names: Vec<&str> = syms
+        .iter()
         .filter(|s| s["kind"].as_u64() == Some(13))
         .filter_map(|s| s["name"].as_str())
         .collect();
@@ -497,9 +531,9 @@ fn test_c_project_full_lsp() {
     s.initialize(&dir);
     drain_until_progress_end(&mut s);
 
-    let types_h  = std::fs::read_to_string(dir.join("types.h")).unwrap();
+    let types_h = std::fs::read_to_string(dir.join("types.h")).unwrap();
     let server_h = std::fs::read_to_string(dir.join("server.h")).unwrap();
-    let main_c   = std::fs::read_to_string(dir.join("main.c")).unwrap();
+    let main_c = std::fs::read_to_string(dir.join("main.c")).unwrap();
 
     let tu = format!("file://{}", dir.join("types.h").display());
     let su = format!("file://{}", dir.join("server.h").display());
@@ -520,10 +554,20 @@ fn test_c_project_full_lsp() {
         let syms = resp["result"].as_array().expect("symbols array");
         let names: Vec<&str> = syms.iter().filter_map(|s| s["name"].as_str()).collect();
         for expect in &[
-            "handle_request", "process_connections", "run_loop",
-            "server_run", "server_log", "buffer_init", "buffer_append",
-            "address_parse", "connection_init", "request_init",
-            "response_init", "main", "method_to_string", "hash_string",
+            "handle_request",
+            "process_connections",
+            "run_loop",
+            "server_run",
+            "server_log",
+            "buffer_init",
+            "buffer_append",
+            "address_parse",
+            "connection_init",
+            "request_init",
+            "response_init",
+            "main",
+            "method_to_string",
+            "hash_string",
             "process_batch",
         ] {
             t.check(
@@ -542,7 +586,12 @@ fn test_c_project_full_lsp() {
     // ── 3. Hover: enum value ─────────────────────────────────────
     {
         let (l, c) = mark(&types_h, "LOG_ERROR_DEF", "LOG_ERROR");
-        check_hover_contains(&mut t, &s.hover(&tu, l, c), "LOG_ERROR", "hover@LOG_ERROR_DEF");
+        check_hover_contains(
+            &mut t,
+            &s.hover(&tu, l, c),
+            "LOG_ERROR",
+            "hover@LOG_ERROR_DEF",
+        );
     }
 
     // ── 4. Hover: typedef name ───────────────────────────────────
@@ -554,31 +603,56 @@ fn test_c_project_full_lsp() {
     // ── 5. Hover: #define macro ──────────────────────────────────
     {
         let (l, c) = mark(&types_h, "MAX_CONNECTIONS_DEF", "MAX_CONNECTIONS");
-        check_hover_contains(&mut t, &s.hover(&tu, l, c), "MAX_CONNECTIONS", "hover@MAX_CONNECTIONS_DEF");
+        check_hover_contains(
+            &mut t,
+            &s.hover(&tu, l, c),
+            "MAX_CONNECTIONS",
+            "hover@MAX_CONNECTIONS_DEF",
+        );
     }
 
     // ── 6. Hover: function definition ────────────────────────────
     {
         let (l, c) = mark(&main_c, "method_to_string_DEF", "method_to_string");
-        check_hover_contains(&mut t, &s.hover(&mu, l, c), "method_to_string", "hover@method_to_string_DEF");
+        check_hover_contains(
+            &mut t,
+            &s.hover(&mu, l, c),
+            "method_to_string",
+            "hover@method_to_string_DEF",
+        );
     }
 
     // ── 7. Hover: static inline function ─────────────────────────
     {
         let (l, c) = mark(&server_h, "validate_port_DEF", "validate_port");
-        check_hover_contains(&mut t, &s.hover(&su, l, c), "validate_port", "hover@validate_port_DEF");
+        check_hover_contains(
+            &mut t,
+            &s.hover(&su, l, c),
+            "validate_port",
+            "hover@validate_port_DEF",
+        );
     }
 
     // ── 8. Hover: function pointer typedef ───────────────────────
     {
         let (l, c) = mark(&types_h, "RequestHandler_DEF", "RequestHandler");
-        check_hover_contains(&mut t, &s.hover(&tu, l, c), "RequestHandler", "hover@RequestHandler_DEF");
+        check_hover_contains(
+            &mut t,
+            &s.hover(&tu, l, c),
+            "RequestHandler",
+            "hover@RequestHandler_DEF",
+        );
     }
 
     // ── 9. Hover: function call site ─────────────────────────────
     {
         let (l, c) = mark(&main_c, "CALL_buffer_init_in_request", "buffer_init");
-        check_hover_contains(&mut t, &s.hover(&mu, l, c), "buffer_init", "hover@CALL_buffer_init");
+        check_hover_contains(
+            &mut t,
+            &s.hover(&mu, l, c),
+            "buffer_init",
+            "hover@CALL_buffer_init",
+        );
     }
 
     // ── 10. Hover: struct field access (arrow) — must not error
@@ -596,25 +670,44 @@ fn test_c_project_full_lsp() {
     // ── 12. Hover: enum value in switch/case ─────────────────────
     {
         let (l, c) = mark(&main_c, "USE_HTTP_GET_switch", "HTTP_GET");
-        check_hover_contains(&mut t, &s.hover(&mu, l, c), "HTTP_GET", "hover@USE_HTTP_GET_switch");
+        check_hover_contains(
+            &mut t,
+            &s.hover(&mu, l, c),
+            "HTTP_GET",
+            "hover@USE_HTTP_GET_switch",
+        );
     }
 
     // ── 13. Hover: function pointer parameter type ───────────────
     {
         let (l, c) = mark(&main_c, "USE_RequestHandler_param", "RequestHandler");
-        check_hover_contains(&mut t, &s.hover(&mu, l, c), "RequestHandler", "hover@USE_RequestHandler_param");
+        check_hover_contains(
+            &mut t,
+            &s.hover(&mu, l, c),
+            "RequestHandler",
+            "hover@USE_RequestHandler_param",
+        );
     }
 
     // ── 14. Hover: VERSION_STRING macro usage ────────────────────
     {
         let (l, c) = mark(&main_c, "USE_VERSION_STRING_in_main", "VERSION_STRING");
-        check_hover_contains(&mut t, &s.hover(&mu, l, c), "VERSION_STRING", "hover@USE_VERSION_STRING_in_main");
+        check_hover_contains(
+            &mut t,
+            &s.hover(&mu, l, c),
+            "VERSION_STRING",
+            "hover@USE_VERSION_STRING_in_main",
+        );
     }
 
     // ── 15. Goto-def: Buffer typedef from main.c ─────────────────
     {
         let (l, c) = mark(&main_c, "buffer_init_IMPL", "Buffer");
-        check_definition_found(&mut t, &s.goto_definition(&mu, l, c), "def@Buffer_from_buffer_init");
+        check_definition_found(
+            &mut t,
+            &s.goto_definition(&mu, l, c),
+            "def@Buffer_from_buffer_init",
+        );
     }
 
     // ── 16. Goto-def: MAX_CONNECTIONS macro ──────────────────────
@@ -632,7 +725,11 @@ fn test_c_project_full_lsp() {
     // ── 18. Goto-def: handle_request passed as function pointer ──
     {
         let (l, c) = mark(&main_c, "PASS_handle_request_as_fnptr", "handle_request");
-        check_definition_found(&mut t, &s.goto_definition(&mu, l, c), "def@handle_request_fnptr");
+        check_definition_found(
+            &mut t,
+            &s.goto_definition(&mu, l, c),
+            "def@handle_request_fnptr",
+        );
     }
 
     // ── 19. Goto-def: LOG_INFO enum value ────────────────────────
@@ -650,7 +747,11 @@ fn test_c_project_full_lsp() {
     // ── 21. Goto-def: CONN_ESTABLISHED enum ──────────────────────
     {
         let (l, c) = mark(&main_c, "USE_CONN_ESTABLISHED_in_if", "CONN_ESTABLISHED");
-        check_definition_found(&mut t, &s.goto_definition(&mu, l, c), "def@CONN_ESTABLISHED");
+        check_definition_found(
+            &mut t,
+            &s.goto_definition(&mu, l, c),
+            "def@CONN_ESTABLISHED",
+        );
     }
 
     // ── 22. Goto-def: address_format function ────────────────────
@@ -692,7 +793,11 @@ fn test_c_project_full_lsp() {
     // ── 28. Goto-def: RequestHandler from Server struct field ────
     {
         let (l, c) = mark(&server_h, "Server_handler_field", "RequestHandler");
-        check_definition_found(&mut t, &s.goto_definition(&su, l, c), "def@RequestHandler_from_Server");
+        check_definition_found(
+            &mut t,
+            &s.goto_definition(&su, l, c),
+            "def@RequestHandler_from_Server",
+        );
     }
 
     // ── 29. Find-refs: buffer_init ───────────────────────────────
@@ -722,7 +827,12 @@ fn test_c_project_full_lsp() {
     // ── 33. Find-refs: CONN_ESTABLISHED ──────────────────────────
     {
         let (l, c) = mark(&types_h, "CONN_ESTABLISHED_DEF", "CONN_ESTABLISHED");
-        check_references_ge(&mut t, &s.find_references(&tu, l, c), 2, "refs@CONN_ESTABLISHED");
+        check_references_ge(
+            &mut t,
+            &s.find_references(&tu, l, c),
+            2,
+            "refs@CONN_ESTABLISHED",
+        );
     }
 
     // ── 34. Find-refs: Request ───────────────────────────────────
@@ -734,7 +844,12 @@ fn test_c_project_full_lsp() {
     // ── 35. Find-refs: handle_request ────────────────────────────
     {
         let (l, c) = mark(&main_c, "handle_request_DEF", "handle_request");
-        check_references_ge(&mut t, &s.find_references(&mu, l, c), 2, "refs@handle_request");
+        check_references_ge(
+            &mut t,
+            &s.find_references(&mu, l, c),
+            2,
+            "refs@handle_request",
+        );
     }
 
     // ── 36. Find-refs: HTTP_OK ───────────────────────────────────
@@ -747,42 +862,66 @@ fn test_c_project_full_lsp() {
     {
         let (l, c) = mark(&main_c, "CALL_buffer_append_in_set_body", "buffer_append");
         let c_inside = c + "buffer_append(".len() as u32;
-        check_sighelp_found(&mut t, &s.signature_help(&mu, l, c_inside), "sighelp@buffer_append");
+        check_sighelp_found(
+            &mut t,
+            &s.signature_help(&mu, l, c_inside),
+            "sighelp@buffer_append",
+        );
     }
 
     // ── 38. Signature-help: address_format() ─────────────────────
     {
         let (l, c) = mark(&main_c, "CALL_address_format_in_main", "address_format");
         let c_inside = c + "address_format(".len() as u32;
-        check_sighelp_found(&mut t, &s.signature_help(&mu, l, c_inside), "sighelp@address_format");
+        check_sighelp_found(
+            &mut t,
+            &s.signature_help(&mu, l, c_inside),
+            "sighelp@address_format",
+        );
     }
 
     // ── 39. Signature-help: server_log() ─────────────────────────
     {
         let (l, c) = mark(&main_c, "CALL_server_log_error", "server_log");
         let c_inside = c + "server_log(".len() as u32;
-        check_sighelp_found(&mut t, &s.signature_help(&mu, l, c_inside), "sighelp@server_log");
+        check_sighelp_found(
+            &mut t,
+            &s.signature_help(&mu, l, c_inside),
+            "sighelp@server_log",
+        );
     }
 
     // ── 40. Signature-help: server_create() ──────────────────────
     {
         let (l, c) = mark(&main_c, "CALL_server_create", "server_create");
         let c_inside = c + "server_create(".len() as u32;
-        check_sighelp_found(&mut t, &s.signature_help(&mu, l, c_inside), "sighelp@server_create");
+        check_sighelp_found(
+            &mut t,
+            &s.signature_help(&mu, l, c_inside),
+            "sighelp@server_create",
+        );
     }
 
     // ── 41. Signature-help: connection_init() ────────────────────
     {
         let (l, c) = mark(&main_c, "CALL_connection_init", "connection_init");
         let c_inside = c + "connection_init(".len() as u32;
-        check_sighelp_found(&mut t, &s.signature_help(&mu, l, c_inside), "sighelp@connection_init");
+        check_sighelp_found(
+            &mut t,
+            &s.signature_help(&mu, l, c_inside),
+            "sighelp@connection_init",
+        );
     }
 
     // ── 42. Signature-help: address_parse() ──────────────────────
     {
         let (l, c) = mark(&main_c, "CALL_address_parse", "address_parse");
         let c_inside = c + "address_parse(".len() as u32;
-        check_sighelp_found(&mut t, &s.signature_help(&mu, l, c_inside), "sighelp@address_parse");
+        check_sighelp_found(
+            &mut t,
+            &s.signature_help(&mu, l, c_inside),
+            "sighelp@address_parse",
+        );
     }
 
     // ═════════════════════════════════════════════════════════════
@@ -795,8 +934,12 @@ fn test_c_project_full_lsp() {
     {
         let (l, c) = mark(&main_c, "buffer_init_IMPL", "buffer_init");
         let resp = s.find_references(&mu, l, c);
-        check_references_include_file(&mut t, &resp, "main.c",
-            "refs@buffer_init: must include main.c self-references (calls within same file)");
+        check_references_include_file(
+            &mut t,
+            &resp,
+            "main.c",
+            "refs@buffer_init: must include main.c self-references (calls within same file)",
+        );
     }
 
     // ── 44. BUG: Find-refs for Buffer from types.h should include
@@ -805,8 +948,12 @@ fn test_c_project_full_lsp() {
     {
         let (l, c) = mark(&types_h, "Buffer_DEF", "Buffer");
         let resp = s.find_references(&tu, l, c);
-        check_references_include_file(&mut t, &resp, "main.c",
-            "refs@Buffer: must include main.c usages (cross-file from header to .c)");
+        check_references_include_file(
+            &mut t,
+            &resp,
+            "main.c",
+            "refs@Buffer: must include main.c usages (cross-file from header to .c)",
+        );
     }
 
     // ── 45. BUG: Find-refs for LogLevel from types.h should
@@ -815,8 +962,12 @@ fn test_c_project_full_lsp() {
     {
         let (l, c) = mark(&types_h, "LogLevel_DEF", "LogLevel");
         let resp = s.find_references(&tu, l, c);
-        check_references_include_file(&mut t, &resp, "main.c",
-            "refs@LogLevel: must include main.c usages (cross-file from header to .c)");
+        check_references_include_file(
+            &mut t,
+            &resp,
+            "main.c",
+            "refs@LogLevel: must include main.c usages (cross-file from header to .c)",
+        );
     }
 
     // ── 46. BUG: Find-refs for Connection from types.h should
@@ -825,8 +976,12 @@ fn test_c_project_full_lsp() {
     {
         let (l, c) = mark(&types_h, "Connection_DEF", "Connection");
         let resp = s.find_references(&tu, l, c);
-        check_references_include_file(&mut t, &resp, "main.c",
-            "refs@Connection: must include main.c usages (cross-file from header to .c)");
+        check_references_include_file(
+            &mut t,
+            &resp,
+            "main.c",
+            "refs@Connection: must include main.c usages (cross-file from header to .c)",
+        );
     }
 
     // ── 47. BUG: Find-refs for CONN_ESTABLISHED from types.h
@@ -835,8 +990,12 @@ fn test_c_project_full_lsp() {
     {
         let (l, c) = mark(&types_h, "CONN_ESTABLISHED_DEF", "CONN_ESTABLISHED");
         let resp = s.find_references(&tu, l, c);
-        check_references_include_file(&mut t, &resp, "main.c",
-            "refs@CONN_ESTABLISHED: must include main.c usages (cross-file from header to .c)");
+        check_references_include_file(
+            &mut t,
+            &resp,
+            "main.c",
+            "refs@CONN_ESTABLISHED: must include main.c usages (cross-file from header to .c)",
+        );
     }
 
     // ── 48. BUG: Find-refs for server_log from main.c should
@@ -845,8 +1004,12 @@ fn test_c_project_full_lsp() {
     {
         let (l, c) = mark(&main_c, "server_log_IMPL", "server_log");
         let resp = s.find_references(&mu, l, c);
-        check_references_include_file(&mut t, &resp, "server.h",
-            "refs@server_log: must include server.h declaration (cross-file from .c to header)");
+        check_references_include_file(
+            &mut t,
+            &resp,
+            "server.h",
+            "refs@server_log: must include server.h declaration (cross-file from .c to header)",
+        );
     }
 
     // ── 49. BUG: Find-refs for MAX_HEADERS from types.h should
@@ -854,8 +1017,12 @@ fn test_c_project_full_lsp() {
     {
         let (l, c) = mark(&types_h, "MAX_HEADERS_DEF", "MAX_HEADERS");
         let resp = s.find_references(&tu, l, c);
-        check_references_include_file(&mut t, &resp, "main.c",
-            "refs@MAX_HEADERS: must include main.c usages (cross-file from header to .c)");
+        check_references_include_file(
+            &mut t,
+            &resp,
+            "main.c",
+            "refs@MAX_HEADERS: must include main.c usages (cross-file from header to .c)",
+        );
     }
 
     // ── 50. BUG: Hover on typedef struct should show clean type
@@ -864,8 +1031,12 @@ fn test_c_project_full_lsp() {
     {
         let (l, c) = mark(&types_h, "Buffer_DEF", "Buffer");
         let resp = s.hover(&tu, l, c);
-        check_hover_not_contains(&mut t, &resp, "} ",
-            "hover@Buffer_DEF: should not show closing brace '} Buffer' — display typedef cleanly");
+        check_hover_not_contains(
+            &mut t,
+            &resp,
+            "} ",
+            "hover@Buffer_DEF: should not show closing brace '} Buffer' — display typedef cleanly",
+        );
     }
 
     // ── 51. BUG: Hover on typedef enum should show clean type
@@ -892,8 +1063,11 @@ fn test_c_project_full_lsp() {
     //    not every local variable.
     {
         let resp = s.document_symbols(&mu);
-        check_symbols_exclude_locals(&mut t, &resp,
-            "docSymbols@main.c: too many local variables in symbol list");
+        check_symbols_exclude_locals(
+            &mut t,
+            &resp,
+            "docSymbols@main.c: too many local variables in symbol list",
+        );
     }
 
     // ── 54. BUG: Goto-def on buffer_init from its call site in
@@ -905,8 +1079,12 @@ fn test_c_project_full_lsp() {
         let resp = s.goto_definition(&mu, l, c);
         // Verify it points to a location that actually contains "buffer_init"
         // The definition should be in main.c (impl) or server.h (decl)
-        check_definition_target(&mut t, &resp, "main.c",
-            "def@buffer_init_call: goto-def from call site should go to main.c implementation");
+        check_definition_target(
+            &mut t,
+            &resp,
+            "main.c",
+            "def@buffer_init_call: goto-def from call site should go to main.c implementation",
+        );
     }
 
     // ── 55. BUG: Find-refs for HTTP_OK from types.h should
@@ -915,8 +1093,12 @@ fn test_c_project_full_lsp() {
     {
         let (l, c) = mark(&types_h, "HTTP_OK_DEF", "HTTP_OK");
         let resp = s.find_references(&tu, l, c);
-        check_references_include_file(&mut t, &resp, "main.c",
-            "refs@HTTP_OK: must include main.c usages (cross-file from header to .c)");
+        check_references_include_file(
+            &mut t,
+            &resp,
+            "main.c",
+            "refs@HTTP_OK: must include main.c usages (cross-file from header to .c)",
+        );
     }
 
     // ── Cleanup ──────────────────────────────────────────────────

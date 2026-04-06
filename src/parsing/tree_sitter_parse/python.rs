@@ -52,14 +52,17 @@ pub struct PythonParser;
 
 impl TsParser for PythonParser {
     fn parse(source: &str) -> ParseResult {
-        let mut result = common::run_query_parse(source, &QueryParseConfig {
-            language: tree_sitter_python::LANGUAGE.into(),
-            query_source: PYTHON_QUERY,
-            identifier_kinds: PYTHON_IDENT_KINDS,
-            def_keyword: python_def_keyword,
-            visibility: |_node: Node, _source: &str| Visibility::Unknown,
-            post_process: None,
-        });
+        let mut result = common::run_query_parse(
+            source,
+            &QueryParseConfig {
+                language: tree_sitter_python::LANGUAGE.into(),
+                query_source: PYTHON_QUERY,
+                identifier_kinds: PYTHON_IDENT_KINDS,
+                def_keyword: python_def_keyword,
+                visibility: |_node: Node, _source: &str| Visibility::Unknown,
+                post_process: None,
+            },
+        );
         // Post-process: apply name-based visibility and constant detection
         for sym in &mut result.symbols {
             sym.visibility = python_visibility(&sym.name);
@@ -129,14 +132,46 @@ class _PrivateClass:
         let result = PythonParser::parse(source);
         let names: Vec<&str> = result.symbols.iter().map(|s| s.name.as_str()).collect();
 
-        assert!(names.contains(&"MAX_SIZE"), "should find constant MAX_SIZE, got: {:?}", names);
-        assert!(names.contains(&"_private_var"), "should find _private_var, got: {:?}", names);
-        assert!(names.contains(&"hello"), "should find function hello, got: {:?}", names);
-        assert!(names.contains(&"_helper"), "should find function _helper, got: {:?}", names);
-        assert!(names.contains(&"Config"), "should find class Config, got: {:?}", names);
-        assert!(names.contains(&"__init__"), "should find method __init__, got: {:?}", names);
-        assert!(names.contains(&"get_name"), "should find method get_name, got: {:?}", names);
-        assert!(names.contains(&"_PrivateClass"), "should find _PrivateClass, got: {:?}", names);
+        assert!(
+            names.contains(&"MAX_SIZE"),
+            "should find constant MAX_SIZE, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"_private_var"),
+            "should find _private_var, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"hello"),
+            "should find function hello, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"_helper"),
+            "should find function _helper, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Config"),
+            "should find class Config, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"__init__"),
+            "should find method __init__, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"get_name"),
+            "should find method get_name, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"_PrivateClass"),
+            "should find _PrivateClass, got: {:?}",
+            names
+        );
 
         // Check visibility
         let hello_sym = result.symbols.iter().find(|s| s.name == "hello").unwrap();
@@ -146,11 +181,19 @@ class _PrivateClass:
         assert_eq!(helper_sym.visibility, Visibility::Private);
 
         // Check method container
-        let init_sym = result.symbols.iter().find(|s| s.name == "__init__").unwrap();
+        let init_sym = result
+            .symbols
+            .iter()
+            .find(|s| s.name == "__init__")
+            .unwrap();
         assert_eq!(init_sym.container.as_deref(), Some("Config"));
 
         // Check constant detection
-        let max_sym = result.symbols.iter().find(|s| s.name == "MAX_SIZE").unwrap();
+        let max_sym = result
+            .symbols
+            .iter()
+            .find(|s| s.name == "MAX_SIZE")
+            .unwrap();
         assert_eq!(max_sym.kind, SymbolKind::Constant);
 
         assert!(!result.occurrences.is_empty());
@@ -172,13 +215,22 @@ class _PrivateClass:
         assert!(names.contains(&"Handler"));
 
         // Methods
-        let init = result.symbols.iter().find(|s| s.name == "__init__" && s.container.as_deref() == Some("Config"));
+        let init = result
+            .symbols
+            .iter()
+            .find(|s| s.name == "__init__" && s.container.as_deref() == Some("Config"));
         assert!(init.is_some(), "should find Config.__init__");
 
-        let display = result.symbols.iter().find(|s| s.name == "display" && s.container.as_deref() == Some("Config"));
+        let display = result
+            .symbols
+            .iter()
+            .find(|s| s.name == "display" && s.container.as_deref() == Some("Config"));
         assert!(display.is_some(), "should find Config.display");
 
-        let add_handler = result.symbols.iter().find(|s| s.name == "add_handler" && s.container.as_deref() == Some("Server"));
+        let add_handler = result
+            .symbols
+            .iter()
+            .find(|s| s.name == "add_handler" && s.container.as_deref() == Some("Server"));
         assert!(add_handler.is_some(), "should find Server.add_handler");
 
         // Functions
