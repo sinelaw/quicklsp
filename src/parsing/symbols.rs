@@ -269,6 +269,32 @@ pub fn extract_signature(
         return Some(trimmed.to_string());
     }
 
+    // Multi-line typedef: name is on the closing `}` line (e.g. `} Buffer;`).
+    // Scan backwards to find the opening `typedef` line and compose the signature.
+    if trimmed.starts_with('}') {
+        let name = trimmed
+            .trim_start_matches('}')
+            .trim()
+            .trim_end_matches(';')
+            .trim();
+        for i in (0..def_line).rev() {
+            if let Some(prev) = lines.get(i) {
+                let pt = prev.trim();
+                if pt.starts_with("typedef ") || pt.starts_with("typedef\t") {
+                    let prefix = pt.split('{').next().unwrap_or(pt).trim();
+                    return if name.is_empty() {
+                        Some(prefix.to_string())
+                    } else {
+                        Some(format!("{prefix} {name}"))
+                    };
+                }
+            }
+        }
+        if !name.is_empty() {
+            return Some(name.to_string());
+        }
+    }
+
     // Check if this is a simple declaration (no parens expected):
     // const, static, let, var, type, struct, enum, interface, trait, mod, etc.
     // For these, the signature is just the first line up to '{' or ';'
@@ -534,5 +560,42 @@ mod tests {
     fn extract_params_python() {
         let params = extract_parameters("def process(self, data, callback)");
         assert_eq!(params, vec!["self", "data", "callback"]);
+    }
+
+    /// Issue 1: extract_signature for a multi-line typedef struct where the
+    /// symbol name is on the closing `}` line should produce a clean signature
+    /// like `typedef struct Buffer`, not `} Buffer`.
+    #[test]
+    fn extract_signature_multiline_typedef_struct() {
+        let src = "typedef struct {\n    uint8_t *data;\n    size_t len;\n} Buffer;";
+        let lines: Vec<&str> = src.lines().collect();
+        // The symbol `Buffer` is on line 3 (0-indexed), which is `} Buffer;`
+        let sig = extract_signature(&lines, 3, 2, LangFamily::CLike);
+        let sig_str = sig.expect("should produce a signature");
+        assert!(
+            !sig_str.contains('}'),
+            "signature should not contain '}}', got: {sig_str}"
+        );
+        assert!(
+            sig_str.contains("typedef"),
+            "signature should contain 'typedef', got: {sig_str}"
+        );
+    }
+
+    /// Issue 1: same bug for typedef enum.
+    #[test]
+    fn extract_signature_multiline_typedef_enum() {
+        let src = "typedef enum {\n    LOG_DEBUG = 0,\n    LOG_INFO = 1\n} LogLevel;";
+        let lines: Vec<&str> = src.lines().collect();
+        let sig = extract_signature(&lines, 3, 2, LangFamily::CLike);
+        let sig_str = sig.expect("should produce a signature");
+        assert!(
+            !sig_str.contains('}'),
+            "signature should not contain '}}', got: {sig_str}"
+        );
+        assert!(
+            sig_str.contains("typedef"),
+            "signature should contain 'typedef', got: {sig_str}"
+        );
     }
 }
