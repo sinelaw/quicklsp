@@ -63,7 +63,7 @@ fn process_request(config: &Config, request: &Request) -> Response { // @mark pr
         Status::Inactive
     };
 
-    let body = format!(
+    let body = format!( // @mark USE_format_macro
         "Handled {} {} on {}:{}",
         request.method, request.path, config.host, config.port
     );
