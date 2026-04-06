@@ -641,6 +641,17 @@ impl LanguageServer for QuickLspServer {
             .unwrap_or_default();
         let lsp_syms: Vec<SymbolInformation> = syms
             .iter()
+            .filter(|s| {
+                // Exclude local variables, parameters, and struct fields from
+                // the document outline. These have depth > 0 (inside a function
+                // body or struct). Top-level definitions — including those inside
+                // #ifdef or namespace blocks — always have depth == 0.
+                !(s.depth > 0
+                    && matches!(
+                        s.def_keyword.as_str(),
+                        "variable" | "parameter" | "field"
+                    ))
+            })
             .map(|s| {
                 let line_str = lines.get(s.line).copied().unwrap_or("");
                 #[allow(deprecated)]
