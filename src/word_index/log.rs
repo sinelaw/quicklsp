@@ -418,6 +418,7 @@ fn read_symbol(r: &mut impl Read) -> io::Result<Symbol> {
         visibility,
         container,
         depth,
+        scope_end_line: None,
     })
 }
 
@@ -515,6 +516,7 @@ mod tests {
                     line: 0, col: 3, def_keyword: "fn".into(),
                     doc_comment: None, signature: None,
                     visibility: Visibility::Public, container: None, depth: 0,
+                    scope_end_line: None,
                 }],
                 Some(LangFamily::Rust),
             ).unwrap();

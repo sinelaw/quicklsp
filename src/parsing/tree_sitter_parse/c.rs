@@ -79,6 +79,7 @@ fn extract_definition(node: Node, source: &str, symbols: &mut Vec<Symbol>, insid
                     visibility: if is_static { Visibility::Private } else { Visibility::Public },
                     container: None,
                     depth: 0,
+                    scope_end_line: None,
                 });
                 Some(n)
             } else {
@@ -90,7 +91,8 @@ fn extract_definition(node: Node, source: &str, symbols: &mut Vec<Symbol>, insid
             }
             // Extract local variable declarations from the function body
             if let Some(body) = node.child_by_field_name("body") {
-                extract_locals_from_compound(body, source, symbols, func_name.as_deref(), 1);
+                let body_end = body.end_position().row;
+                extract_locals_from_compound(body, source, symbols, func_name.as_deref(), 1, body_end);
             }
         }
         "declaration" => {
@@ -123,6 +125,7 @@ fn extract_definition(node: Node, source: &str, symbols: &mut Vec<Symbol>, insid
                         visibility: Visibility::Unknown,
                         container: None,
                         depth: 0,
+                        scope_end_line: None,
                     });
                 }
                 // Extract struct/union fields
@@ -146,6 +149,7 @@ fn extract_definition(node: Node, source: &str, symbols: &mut Vec<Symbol>, insid
                     visibility: Visibility::Unknown,
                     container: None,
                     depth: 0,
+                    scope_end_line: None,
                 });
             }
             // Index individual enumerators
@@ -166,6 +170,7 @@ fn extract_definition(node: Node, source: &str, symbols: &mut Vec<Symbol>, insid
                                 visibility: Visibility::Unknown,
                                 container: None,
                                 depth: 0,
+                                scope_end_line: None,
                             });
                         }
                     }
@@ -188,6 +193,7 @@ fn extract_definition(node: Node, source: &str, symbols: &mut Vec<Symbol>, insid
                     visibility: Visibility::Unknown,
                     container: None,
                     depth: 0,
+                    scope_end_line: None,
                 });
             }
         }
@@ -206,6 +212,7 @@ fn extract_definition(node: Node, source: &str, symbols: &mut Vec<Symbol>, insid
                     visibility: Visibility::Unknown,
                     container: None,
                     depth: 0,
+                    scope_end_line: None,
                 });
             }
         }
@@ -224,6 +231,7 @@ fn extract_definition(node: Node, source: &str, symbols: &mut Vec<Symbol>, insid
                     visibility: Visibility::Unknown,
                     container: None,
                     depth: 0,
+                    scope_end_line: None,
                 });
             }
         }
@@ -298,6 +306,7 @@ fn extract_file_scope_declaration(node: Node, source: &str, symbols: &mut Vec<Sy
             visibility: if is_static { Visibility::Private } else { Visibility::Unknown },
             container: None,
             depth: 0,
+            scope_end_line: None,
         });
     }
 }
@@ -336,6 +345,8 @@ fn extract_function_params(func_node: Node, source: &str, symbols: &mut Vec<Symb
                             visibility: Visibility::Private,
                             container: Some(func_name.to_string()),
                             depth: 1,
+                            // Parameter scope extends to end of function body
+                            scope_end_line: func_node.end_position().row.checked_sub(0),
                         });
                     }
                 }
@@ -359,30 +370,38 @@ fn find_function_declarator(mut node: Node) -> Option<Node> {
 
 /// Extract local variable declarations from a compound_statement (function body).
 /// Recurses into nested blocks (if/for/while bodies).
+/// `scope_end` is the end line of the current enclosing scope (compound_statement).
 fn extract_locals_from_compound(
     node: Node,
     source: &str,
     symbols: &mut Vec<Symbol>,
     func_name: Option<&str>,
     depth: usize,
+    scope_end: usize,
 ) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
             "declaration" => {
-                extract_local_declaration(child, source, symbols, func_name, depth);
+                extract_local_declaration(child, source, symbols, func_name, depth, scope_end);
             }
-            // Recurse into nested blocks
-            "compound_statement" | "if_statement" | "for_statement" | "while_statement"
+            // Recurse into nested blocks — use the block's own end line as scope_end
+            "compound_statement" => {
+                let inner_end = child.end_position().row;
+                extract_locals_from_compound(child, source, symbols, func_name, depth + 1, inner_end);
+            }
+            "if_statement" | "for_statement" | "while_statement"
             | "do_statement" | "switch_statement" | "case_statement" => {
-                extract_locals_from_compound(child, source, symbols, func_name, depth + 1);
+                // These contain compound_statements as children; use their end as scope
+                let inner_end = child.end_position().row;
+                extract_locals_from_compound(child, source, symbols, func_name, depth + 1, inner_end);
             }
             _ => {
                 // Recurse into any other compound children (e.g., else clauses)
                 if child.child_count() > 0 {
                     let has_compound = has_nested_declarations(child);
                     if has_compound {
-                        extract_locals_from_compound(child, source, symbols, func_name, depth);
+                        extract_locals_from_compound(child, source, symbols, func_name, depth, scope_end);
                     }
                 }
             }
@@ -399,6 +418,7 @@ fn extract_local_declaration(
     symbols: &mut Vec<Symbol>,
     func_name: Option<&str>,
     depth: usize,
+    scope_end: usize,
 ) {
     let type_text = node.child_by_field_name("type")
         .map(|t| node_text(t, source).to_string());
@@ -406,7 +426,7 @@ fn extract_local_declaration(
     // Try direct declarator field first (plain: `int x;`)
     if let Some(declarator) = node.child_by_field_name("declarator") {
         if !is_function_prototype(&declarator) {
-            extract_local_var_from_declarator(declarator, source, symbols, func_name, depth, type_text.as_deref());
+            extract_local_var_from_declarator(declarator, source, symbols, func_name, depth, type_text.as_deref(), scope_end);
             return;
         }
     }
@@ -417,7 +437,7 @@ fn extract_local_declaration(
         if child.kind() == "init_declarator" {
             if let Some(decl) = child.child_by_field_name("declarator") {
                 if !is_function_prototype(&decl) {
-                    extract_local_var_from_declarator(decl, source, symbols, func_name, depth, type_text.as_deref());
+                    extract_local_var_from_declarator(decl, source, symbols, func_name, depth, type_text.as_deref(), scope_end);
                 }
             }
         }
@@ -431,6 +451,7 @@ fn extract_local_var_from_declarator(
     func_name: Option<&str>,
     depth: usize,
     type_text: Option<&str>,
+    scope_end: usize,
 ) {
     let name_node = innermost_declarator_name(declarator);
     if name_node.kind() == "identifier" || name_node.kind() == "type_identifier" {
@@ -446,6 +467,7 @@ fn extract_local_var_from_declarator(
             visibility: Visibility::Private,
             container: func_name.map(|s| s.to_string()),
             depth,
+            scope_end_line: Some(scope_end),
         });
     }
 }
@@ -477,6 +499,7 @@ fn extract_struct_fields(
                         visibility: Visibility::Unknown,
                         container: struct_name.map(|s| s.to_string()),
                         depth: 1,
+                        scope_end_line: None,
                     });
                 }
             }
