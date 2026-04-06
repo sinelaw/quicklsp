@@ -703,7 +703,10 @@ impl LanguageServer for QuickLspServer {
         let pos = params.text_document_position_params.position;
         let source = match self.workspace.file_source_from_uri(uri) {
             Some(s) => s,
-            None => return Ok(None),
+            None => {
+                tracing::debug!("hover: no source for {uri}");
+                return Ok(None);
+            }
         };
         let line_str = source.lines().nth(pos.line as usize);
         let char_col = line_str
@@ -711,8 +714,12 @@ impl LanguageServer for QuickLspServer {
             .unwrap_or(0);
         let symbol = match Self::word_at_position(&source, pos.line as usize, char_col) {
             Some(s) => s,
-            None => return Ok(None),
+            None => {
+                tracing::debug!("hover: no word at {}:{} (char_col={})", pos.line, pos.character, char_col);
+                return Ok(None);
+            }
         };
+        tracing::debug!("hover: word={symbol:?} at {}:{} (char_col={char_col})", pos.line, pos.character);
 
         // Find definitions and rank them by context (qualifier + same-file + ident kind)
         let qualifier = Self::qualifier_at_position(&source, pos.line as usize, char_col);
@@ -761,6 +768,8 @@ impl LanguageServer for QuickLspServer {
 
         self.workspace
             .rank_definitions(&mut defs, current_file.as_deref(), qualifier.as_deref());
+
+        tracing::debug!("hover: found {} definitions for {symbol:?}, ctx={ident_ctx:?}", defs.len());
 
         let loc = match defs.first_mut() {
             Some(loc) => loc,
