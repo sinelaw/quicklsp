@@ -58,12 +58,11 @@ fn encoding_col_to_byte(line: &str, encoded_col: u32, encoding: PosEncoding) -> 
                 return encoded_col.min(line.len());
             }
             match encoding {
-                PosEncoding::Utf32 => {
-                    line.char_indices()
-                        .nth(encoded_col)
-                        .map(|(i, _)| i)
-                        .unwrap_or(line.len())
-                }
+                PosEncoding::Utf32 => line
+                    .char_indices()
+                    .nth(encoded_col)
+                    .map(|(i, _)| i)
+                    .unwrap_or(line.len()),
                 PosEncoding::Utf16 => {
                     let mut utf16_offset = 0usize;
                     for (i, ch) in line.char_indices() {
@@ -100,11 +99,7 @@ impl QuickLspServer {
     }
 
     /// Convert an incoming client position to a char index for the given line.
-    fn client_col_to_char_index(
-        line: &str,
-        encoded_col: u32,
-        encoding: PosEncoding,
-    ) -> usize {
+    fn client_col_to_char_index(line: &str, encoded_col: u32, encoding: PosEncoding) -> usize {
         let byte_offset = encoding_col_to_byte(line, encoded_col, encoding);
         // Convert byte offset to char index
         line[..byte_offset.min(line.len())].chars().count()
@@ -214,14 +209,21 @@ fn get_source_line(ws: &Workspace, loc: &SymbolLocation) -> Option<String> {
     source.lines().nth(loc.symbol.line).map(|s| s.to_string())
 }
 
-fn loc_to_lsp(loc: &SymbolLocation, source_line: Option<&str>, enc: PosEncoding) -> Option<Location> {
+fn loc_to_lsp(
+    loc: &SymbolLocation,
+    source_line: Option<&str>,
+    enc: PosEncoding,
+) -> Option<Location> {
     let uri = Url::from_file_path(&loc.file).ok()?;
     let (start_char, end_char) = match source_line {
         Some(line) => (
             byte_col_to_encoding(line, loc.symbol.col, enc),
             byte_col_to_encoding(line, loc.symbol.col + loc.symbol.name.len(), enc),
         ),
-        None => (loc.symbol.col as u32, (loc.symbol.col + loc.symbol.name.len()) as u32),
+        None => (
+            loc.symbol.col as u32,
+            (loc.symbol.col + loc.symbol.name.len()) as u32,
+        ),
     };
     Some(Location {
         uri,
@@ -340,15 +342,17 @@ impl LanguageServer for QuickLspServer {
             }
 
             // Phase 1: scan workspace with progress reporting via channel.
-            let (scan_tx, mut scan_rx) =
-                tokio::sync::mpsc::unbounded_channel::<(usize, usize)>();
+            let (scan_tx, mut scan_rx) = tokio::sync::mpsc::unbounded_channel::<(usize, usize)>();
 
             let ws = workspace.clone();
             let scan_root = root.clone();
             let scan_handle = tokio::task::spawn_blocking(move || {
-                ws.scan_directory(&scan_root, Some(&|done, total| {
-                    let _ = scan_tx.send((done, total));
-                }));
+                ws.scan_directory(
+                    &scan_root,
+                    Some(&|done, total| {
+                        let _ = scan_tx.send((done, total));
+                    }),
+                );
             });
 
             // Forward scan progress to client.
@@ -496,11 +500,17 @@ impl LanguageServer for QuickLspServer {
         };
         let qualifier = Self::qualifier_at_position(&source, pos.line as usize, char_col);
         let current_file = uri.to_file_path().ok();
-        let ident_ctx = current_file.as_ref().map(|path| {
-            self.workspace.syntax_cache().ident_context_at(
-                path, pos.line as usize, char_col, &source,
-            )
-        }).unwrap_or(IdentContext::Plain);
+        let ident_ctx = current_file
+            .as_ref()
+            .map(|path| {
+                self.workspace.syntax_cache().ident_context_at(
+                    path,
+                    pos.line as usize,
+                    char_col,
+                    &source,
+                )
+            })
+            .unwrap_or(IdentContext::Plain);
 
         let mut defs = match ident_ctx {
             IdentContext::FieldAccess => {
@@ -508,7 +518,9 @@ impl LanguageServer for QuickLspServer {
                 // definitions first, then fall back to global definitions.
                 let mut field_defs = Vec::new();
                 if let Some(ref path) = current_file {
-                    field_defs = self.workspace.find_local_definitions(&symbol, path)
+                    field_defs = self
+                        .workspace
+                        .find_local_definitions(&symbol, path)
                         .into_iter()
                         .filter(|d| d.symbol.def_keyword == "field")
                         .collect();
@@ -534,7 +546,9 @@ impl LanguageServer for QuickLspServer {
                 if d.is_empty() {
                     if let Some(ref path) = current_file {
                         if let Some(local) = self.workspace.find_local_definition_at(
-                            &symbol, path, pos.line as usize,
+                            &symbol,
+                            path,
+                            pos.line as usize,
                         ) {
                             d.push(local);
                         }
@@ -579,9 +593,10 @@ impl LanguageServer for QuickLspServer {
             .iter()
             .filter_map(|r| {
                 let u = Url::from_file_path(&r.file).ok()?;
-                let ref_line = self.workspace.file_source(&r.file).and_then(|s| {
-                    s.lines().nth(r.line).map(|l| l.to_string())
-                });
+                let ref_line = self
+                    .workspace
+                    .file_source(&r.file)
+                    .and_then(|s| s.lines().nth(r.line).map(|l| l.to_string()));
                 let ref_line_str = ref_line.as_deref().unwrap_or("");
                 Some(Location {
                     uri: u,
@@ -620,7 +635,10 @@ impl LanguageServer for QuickLspServer {
             return Ok(None);
         }
         let source = self.workspace.file_source(&path);
-        let lines: Vec<&str> = source.as_deref().map(|s| s.lines().collect()).unwrap_or_default();
+        let lines: Vec<&str> = source
+            .as_deref()
+            .map(|s| s.lines().collect())
+            .unwrap_or_default();
         let lsp_syms: Vec<SymbolInformation> = syms
             .iter()
             .map(|s| {
@@ -640,7 +658,11 @@ impl LanguageServer for QuickLspServer {
                             },
                             end: Position {
                                 line: s.line as u32,
-                                character: byte_col_to_encoding(line_str, s.col + s.name.len(), enc),
+                                character: byte_col_to_encoding(
+                                    line_str,
+                                    s.col + s.name.len(),
+                                    enc,
+                                ),
                             },
                         },
                     },
@@ -715,26 +737,43 @@ impl LanguageServer for QuickLspServer {
         let symbol = match Self::word_at_position(&source, pos.line as usize, char_col) {
             Some(s) => s,
             None => {
-                tracing::debug!("hover: no word at {}:{} (char_col={})", pos.line, pos.character, char_col);
+                tracing::debug!(
+                    "hover: no word at {}:{} (char_col={})",
+                    pos.line,
+                    pos.character,
+                    char_col
+                );
                 return Ok(None);
             }
         };
-        tracing::debug!("hover: word={symbol:?} at {}:{} (char_col={char_col})", pos.line, pos.character);
+        tracing::debug!(
+            "hover: word={symbol:?} at {}:{} (char_col={char_col})",
+            pos.line,
+            pos.character
+        );
 
         // Find definitions and rank them by context (qualifier + same-file + ident kind)
         let qualifier = Self::qualifier_at_position(&source, pos.line as usize, char_col);
         let current_file = uri.to_file_path().ok();
-        let ident_ctx = current_file.as_ref().map(|path| {
-            self.workspace.syntax_cache().ident_context_at(
-                path, pos.line as usize, char_col, &source,
-            )
-        }).unwrap_or(IdentContext::Plain);
+        let ident_ctx = current_file
+            .as_ref()
+            .map(|path| {
+                self.workspace.syntax_cache().ident_context_at(
+                    path,
+                    pos.line as usize,
+                    char_col,
+                    &source,
+                )
+            })
+            .unwrap_or(IdentContext::Plain);
 
         let mut defs = match ident_ctx {
             IdentContext::FieldAccess => {
                 let mut field_defs = Vec::new();
                 if let Some(ref path) = current_file {
-                    field_defs = self.workspace.find_local_definitions(&symbol, path)
+                    field_defs = self
+                        .workspace
+                        .find_local_definitions(&symbol, path)
                         .into_iter()
                         .filter(|d| d.symbol.def_keyword == "field")
                         .collect();
@@ -745,9 +784,7 @@ impl LanguageServer for QuickLspServer {
                     field_defs
                 }
             }
-            IdentContext::TypeRef => {
-                self.workspace.find_definitions(&symbol)
-            }
+            IdentContext::TypeRef => self.workspace.find_definitions(&symbol),
             IdentContext::FunctionCall | IdentContext::Plain => {
                 let mut d = self.workspace.find_definitions(&symbol);
                 if d.is_empty() {
@@ -756,7 +793,9 @@ impl LanguageServer for QuickLspServer {
                 if d.is_empty() {
                     if let Some(ref path) = current_file {
                         if let Some(local) = self.workspace.find_local_definition_at(
-                            &symbol, path, pos.line as usize,
+                            &symbol,
+                            path,
+                            pos.line as usize,
                         ) {
                             d.push(local);
                         }
@@ -769,7 +808,10 @@ impl LanguageServer for QuickLspServer {
         self.workspace
             .rank_definitions(&mut defs, current_file.as_deref(), qualifier.as_deref());
 
-        tracing::debug!("hover: found {} definitions for {symbol:?}, ctx={ident_ctx:?}", defs.len());
+        tracing::debug!(
+            "hover: found {} definitions for {symbol:?}, ctx={ident_ctx:?}",
+            defs.len()
+        );
 
         let loc = match defs.first_mut() {
             Some(loc) => loc,
@@ -828,22 +870,21 @@ impl LanguageServer for QuickLspServer {
             .map(|l| Self::client_col_to_char_index(l, pos.character, enc))
             .unwrap_or(0);
 
-        let (loc, active_param) = match self.workspace.signature_help_at(
-            &source,
-            pos.line as usize,
-            char_col,
-        ) {
-            Some(result) => result,
-            // Fallback to dependency index
-            None => match self.dep_index.signature_help_at(
-                &source,
-                pos.line as usize,
-                char_col,
-            ) {
+        let (loc, active_param) =
+            match self
+                .workspace
+                .signature_help_at(&source, pos.line as usize, char_col)
+            {
                 Some(result) => result,
-                None => return Ok(None),
-            },
-        };
+                // Fallback to dependency index
+                None => match self
+                    .dep_index
+                    .signature_help_at(&source, pos.line as usize, char_col)
+                {
+                    Some(result) => result,
+                    None => return Ok(None),
+                },
+            };
 
         let sig_text = match &loc.symbol.signature {
             Some(s) => s.clone(),

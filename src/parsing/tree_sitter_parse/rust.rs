@@ -8,7 +8,7 @@ use tree_sitter::Node;
 use crate::parsing::symbols::SymbolKind;
 use crate::parsing::tokenizer::Visibility;
 
-use super::common::{self, node_text, find_child_by_kind, QueryParseConfig};
+use super::common::{self, find_child_by_kind, node_text, QueryParseConfig};
 use super::{ParseResult, TsParser};
 
 const RUST_IDENT_KINDS: &[&str] = &["identifier", "type_identifier", "field_identifier"];
@@ -104,14 +104,17 @@ pub struct RustParser;
 
 impl TsParser for RustParser {
     fn parse(source: &str) -> ParseResult {
-        common::run_query_parse(source, &QueryParseConfig {
-            language: tree_sitter_rust::LANGUAGE.into(),
-            query_source: RUST_QUERY,
-            identifier_kinds: RUST_IDENT_KINDS,
-            def_keyword: rust_def_keyword,
-            visibility: rust_visibility,
-            post_process: None,
-        })
+        common::run_query_parse(
+            source,
+            &QueryParseConfig {
+                language: tree_sitter_rust::LANGUAGE.into(),
+                query_source: RUST_QUERY,
+                identifier_kinds: RUST_IDENT_KINDS,
+                def_keyword: rust_def_keyword,
+                visibility: rust_visibility,
+                post_process: None,
+            },
+        )
     }
 }
 
@@ -195,20 +198,76 @@ macro_rules! my_macro {
         let result = RustParser::parse(source);
         let names: Vec<&str> = result.symbols.iter().map(|s| s.name.as_str()).collect();
 
-        assert!(names.contains(&"hello"), "should find fn hello, got: {:?}", names);
-        assert!(names.contains(&"Config"), "should find struct Config, got: {:?}", names);
-        assert!(names.contains(&"name"), "should find field name, got: {:?}", names);
-        assert!(names.contains(&"Status"), "should find enum Status, got: {:?}", names);
-        assert!(names.contains(&"Active"), "should find variant Active, got: {:?}", names);
-        assert!(names.contains(&"Handler"), "should find trait Handler, got: {:?}", names);
-        assert!(names.contains(&"handle"), "should find trait method handle, got: {:?}", names);
-        assert!(names.contains(&"Result"), "should find type alias Result, got: {:?}", names);
-        assert!(names.contains(&"MAX"), "should find const MAX, got: {:?}", names);
-        assert!(names.contains(&"GLOBAL"), "should find static GLOBAL, got: {:?}", names);
-        assert!(names.contains(&"utils"), "should find mod utils, got: {:?}", names);
-        assert!(names.contains(&"helper"), "should find nested fn helper, got: {:?}", names);
-        assert!(names.contains(&"new"), "should find impl method new, got: {:?}", names);
-        assert!(names.contains(&"my_macro"), "should find macro my_macro, got: {:?}", names);
+        assert!(
+            names.contains(&"hello"),
+            "should find fn hello, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Config"),
+            "should find struct Config, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"name"),
+            "should find field name, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Status"),
+            "should find enum Status, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Active"),
+            "should find variant Active, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Handler"),
+            "should find trait Handler, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"handle"),
+            "should find trait method handle, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Result"),
+            "should find type alias Result, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"MAX"),
+            "should find const MAX, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"GLOBAL"),
+            "should find static GLOBAL, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"utils"),
+            "should find mod utils, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"helper"),
+            "should find nested fn helper, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"new"),
+            "should find impl method new, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"my_macro"),
+            "should find macro my_macro, got: {:?}",
+            names
+        );
 
         // Check visibility
         let hello_sym = result.symbols.iter().find(|s| s.name == "hello").unwrap();
@@ -257,10 +316,18 @@ macro_rules! my_macro {
         assert!(names.contains(&"validate_request"));
 
         // Impl methods
-        let new_sym = result.symbols.iter().find(|s| s.name == "new" && s.container.as_deref() == Some("Server")).unwrap();
+        let new_sym = result
+            .symbols
+            .iter()
+            .find(|s| s.name == "new" && s.container.as_deref() == Some("Server"))
+            .unwrap();
         assert_eq!(new_sym.kind, SymbolKind::Method);
 
-        let add_handler = result.symbols.iter().find(|s| s.name == "add_handler").unwrap();
+        let add_handler = result
+            .symbols
+            .iter()
+            .find(|s| s.name == "add_handler")
+            .unwrap();
         assert_eq!(add_handler.container.as_deref(), Some("Server"));
 
         // Module
@@ -308,8 +375,14 @@ impl B {
 }
 "#;
         let result = RustParser::parse(source);
-        let a_foo = result.symbols.iter().find(|s| s.name == "foo" && s.container.as_deref() == Some("A"));
-        let b_foo = result.symbols.iter().find(|s| s.name == "foo" && s.container.as_deref() == Some("B"));
+        let a_foo = result
+            .symbols
+            .iter()
+            .find(|s| s.name == "foo" && s.container.as_deref() == Some("A"));
+        let b_foo = result
+            .symbols
+            .iter()
+            .find(|s| s.name == "foo" && s.container.as_deref() == Some("B"));
         assert!(a_foo.is_some(), "should find A::foo");
         assert!(b_foo.is_some(), "should find B::foo");
     }
@@ -324,13 +397,25 @@ pub struct PubStruct;
 struct PrivStruct;
 "#;
         let result = RustParser::parse(source);
-        let pub_fn = result.symbols.iter().find(|s| s.name == "public_fn").unwrap();
+        let pub_fn = result
+            .symbols
+            .iter()
+            .find(|s| s.name == "public_fn")
+            .unwrap();
         assert_eq!(pub_fn.visibility, Visibility::Public);
 
-        let priv_fn = result.symbols.iter().find(|s| s.name == "private_fn").unwrap();
+        let priv_fn = result
+            .symbols
+            .iter()
+            .find(|s| s.name == "private_fn")
+            .unwrap();
         assert_eq!(priv_fn.visibility, Visibility::Unknown);
 
-        let crate_fn = result.symbols.iter().find(|s| s.name == "crate_fn").unwrap();
+        let crate_fn = result
+            .symbols
+            .iter()
+            .find(|s| s.name == "crate_fn")
+            .unwrap();
         assert_eq!(crate_fn.visibility, Visibility::Public);
     }
 }

@@ -14,7 +14,12 @@ use super::common::{
 };
 use super::{ParseResult, TsParser};
 
-const CPP_IDENT_KINDS: &[&str] = &["identifier", "type_identifier", "field_identifier", "namespace_identifier"];
+const CPP_IDENT_KINDS: &[&str] = &[
+    "identifier",
+    "type_identifier",
+    "field_identifier",
+    "namespace_identifier",
+];
 
 const CPP_QUERY: &str = r#"
 ; ── Function definitions ─────────────────────────────────────────────────
@@ -89,14 +94,17 @@ pub struct CppParser;
 impl TsParser for CppParser {
     fn parse(source: &str) -> ParseResult {
         let lang: tree_sitter::Language = tree_sitter_cpp::LANGUAGE.into();
-        let mut result = common::run_query_parse(source, &QueryParseConfig {
-            language: lang,
-            query_source: CPP_QUERY,
-            identifier_kinds: CPP_IDENT_KINDS,
-            def_keyword: cpp_def_keyword,
-            visibility: cpp_visibility,
-            post_process: Some(cpp_post_process),
-        });
+        let mut result = common::run_query_parse(
+            source,
+            &QueryParseConfig {
+                language: lang,
+                query_source: CPP_QUERY,
+                identifier_kinds: CPP_IDENT_KINDS,
+                def_keyword: cpp_def_keyword,
+                visibility: cpp_visibility,
+                post_process: Some(cpp_post_process),
+            },
+        );
         result
     }
 }
@@ -142,7 +150,8 @@ fn extract_class_bodies(node: Node, source: &str, symbols: &mut Vec<Symbol>) {
     for child in node.children(&mut cursor) {
         match child.kind() {
             "class_specifier" | "struct_specifier" => {
-                let name = child.child_by_field_name("name")
+                let name = child
+                    .child_by_field_name("name")
                     .map(|n| node_text(n, source).to_string());
                 if let Some(body) = child.child_by_field_name("body") {
                     let default_vis = if child.kind() == "class_specifier" {
@@ -162,8 +171,7 @@ fn extract_class_bodies(node: Node, source: &str, symbols: &mut Vec<Symbol>) {
                     extract_class_bodies(body, source, symbols);
                 }
             }
-            "preproc_ifdef" | "preproc_if" | "preproc_elif" | "preproc_else"
-            | "preproc_ifndef" => {
+            "preproc_ifdef" | "preproc_if" | "preproc_elif" | "preproc_else" | "preproc_ifndef" => {
                 extract_class_bodies(child, source, symbols);
             }
             _ => {
@@ -221,9 +229,16 @@ fn extract_class_member(
                 let col = name_node.start_position().column;
                 if !symbols.iter().any(|s| s.line == line && s.col == col) {
                     symbols.push(make_contained_symbol(
-                        name, SymbolKind::Method,
-                        line, col,
-                        "method", vis, class_name, 1, None, None,
+                        name,
+                        SymbolKind::Method,
+                        line,
+                        col,
+                        "method",
+                        vis,
+                        class_name,
+                        1,
+                        None,
+                        None,
                     ));
                 }
             }
@@ -239,9 +254,16 @@ fn extract_class_member(
                     let col = name_node.start_position().column;
                     if !symbols.iter().any(|s| s.line == line && s.col == col) {
                         symbols.push(make_contained_symbol(
-                            name, SymbolKind::Method,
-                            line, col,
-                            "method", vis, class_name, 1, None, None,
+                            name,
+                            SymbolKind::Method,
+                            line,
+                            col,
+                            "method",
+                            vis,
+                            class_name,
+                            1,
+                            None,
+                            None,
                         ));
                     }
                 }
@@ -264,12 +286,20 @@ fn extract_class_field(
             let line = name_node.start_position().row;
             let col = name_node.start_position().column;
             if !symbols.iter().any(|s| s.line == line && s.col == col) {
-                let type_text = node.child_by_field_name("type")
+                let type_text = node
+                    .child_by_field_name("type")
                     .map(|t| node_text(t, source).to_string());
                 symbols.push(make_contained_symbol(
-                    name, SymbolKind::Variable,
-                    line, col,
-                    "field", vis, class_name, 1, None, type_text,
+                    name,
+                    SymbolKind::Variable,
+                    line,
+                    col,
+                    "field",
+                    vis,
+                    class_name,
+                    1,
+                    None,
+                    type_text,
                 ));
             }
         }
@@ -291,7 +321,8 @@ fn extract_typedef_function_ptrs(node: Node, source: &str, symbols: &mut Vec<Sym
                             symbols.push(make_symbol(
                                 name.to_string(),
                                 SymbolKind::TypeAlias,
-                                line, col,
+                                line,
+                                col,
                                 "typedef",
                                 Visibility::Unknown,
                             ));
@@ -299,8 +330,7 @@ fn extract_typedef_function_ptrs(node: Node, source: &str, symbols: &mut Vec<Sym
                     }
                 }
             }
-            "preproc_ifdef" | "preproc_if" | "preproc_elif" | "preproc_else"
-            | "preproc_ifndef" => {
+            "preproc_ifdef" | "preproc_if" | "preproc_elif" | "preproc_else" | "preproc_ifndef" => {
                 extract_typedef_function_ptrs(child, source, symbols);
             }
             _ => {}
@@ -327,19 +357,27 @@ fn extract_file_scope_vars(node: Node, source: &str, symbols: &mut Vec<Symbol>) 
                     let col = name_node.start_position().column;
                     if !symbols.iter().any(|s| s.line == line && s.col == col) {
                         let is_static = common::has_child_with_kind_and_text(
-                            child, "storage_class_specifier", "static", source,
+                            child,
+                            "storage_class_specifier",
+                            "static",
+                            source,
                         );
                         symbols.push(make_symbol(
-                            name, SymbolKind::Variable,
-                            line, col,
+                            name,
+                            SymbolKind::Variable,
+                            line,
+                            col,
                             "variable",
-                            if is_static { Visibility::Private } else { Visibility::Unknown },
+                            if is_static {
+                                Visibility::Private
+                            } else {
+                                Visibility::Unknown
+                            },
                         ));
                     }
                 }
             }
-            "preproc_ifdef" | "preproc_if" | "preproc_elif" | "preproc_else"
-            | "preproc_ifndef" => {
+            "preproc_ifdef" | "preproc_if" | "preproc_elif" | "preproc_else" | "preproc_ifndef" => {
                 extract_file_scope_vars(child, source, symbols);
             }
             _ => {}
@@ -350,8 +388,12 @@ fn extract_file_scope_vars(node: Node, source: &str, symbols: &mut Vec<Symbol>) 
 fn innermost_declarator_name(mut node: Node) -> Node {
     loop {
         match node.kind() {
-            "function_declarator" | "array_declarator" | "parenthesized_declarator"
-            | "pointer_declarator" | "reference_declarator" | "init_declarator" => {
+            "function_declarator"
+            | "array_declarator"
+            | "parenthesized_declarator"
+            | "pointer_declarator"
+            | "reference_declarator"
+            | "init_declarator" => {
                 if let Some(decl) = node.child_by_field_name("declarator") {
                     node = decl;
                 } else {
@@ -359,10 +401,14 @@ fn innermost_declarator_name(mut node: Node) -> Node {
                     let mut found = false;
                     for child in node.named_children(&mut cursor) {
                         match child.kind() {
-                            "identifier" | "type_identifier" | "field_identifier"
+                            "identifier"
+                            | "type_identifier"
+                            | "field_identifier"
                             | "qualified_identifier"
-                            | "pointer_declarator" | "reference_declarator"
-                            | "function_declarator" | "array_declarator"
+                            | "pointer_declarator"
+                            | "reference_declarator"
+                            | "function_declarator"
+                            | "array_declarator"
                             | "parenthesized_declarator" => {
                                 node = child;
                                 found = true;
@@ -371,7 +417,9 @@ fn innermost_declarator_name(mut node: Node) -> Node {
                             _ => {}
                         }
                     }
-                    if !found { break; }
+                    if !found {
+                        break;
+                    }
                 }
             }
             "qualified_identifier" => {
@@ -438,18 +486,58 @@ void helper() {}
         let result = CppParser::parse(source);
         let names: Vec<&str> = result.symbols.iter().map(|s| s.name.as_str()).collect();
 
-        assert!(names.contains(&"MAX_SIZE"), "should find #define MAX_SIZE, got: {:?}", names);
-        assert!(names.contains(&"mylib"), "should find namespace mylib, got: {:?}", names);
-        assert!(names.contains(&"Config"), "should find class Config, got: {:?}", names);
-        assert!(names.contains(&"Point"), "should find struct Point, got: {:?}", names);
-        assert!(names.contains(&"Color"), "should find enum Color, got: {:?}", names);
-        assert!(names.contains(&"RED"), "should find enumerator RED, got: {:?}", names);
-        assert!(names.contains(&"uint32"), "should find typedef uint32, got: {:?}", names);
-        assert!(names.contains(&"StringVec"), "should find alias StringVec, got: {:?}", names);
-        assert!(names.contains(&"helper"), "should find function helper, got: {:?}", names);
+        assert!(
+            names.contains(&"MAX_SIZE"),
+            "should find #define MAX_SIZE, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"mylib"),
+            "should find namespace mylib, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Config"),
+            "should find class Config, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Point"),
+            "should find struct Point, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Color"),
+            "should find enum Color, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"RED"),
+            "should find enumerator RED, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"uint32"),
+            "should find typedef uint32, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"StringVec"),
+            "should find alias StringVec, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"helper"),
+            "should find function helper, got: {:?}",
+            names
+        );
 
         // Check class members
-        assert!(names.contains(&"name_"), "should find field name_, got: {:?}", names);
+        assert!(
+            names.contains(&"name_"),
+            "should find field name_, got: {:?}",
+            names
+        );
 
         assert!(!result.occurrences.is_empty());
     }

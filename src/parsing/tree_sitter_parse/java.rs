@@ -83,14 +83,17 @@ pub struct JavaParser;
 
 impl TsParser for JavaParser {
     fn parse(source: &str) -> ParseResult {
-        let mut result = common::run_query_parse(source, &QueryParseConfig {
-            language: tree_sitter_java::LANGUAGE.into(),
-            query_source: JAVA_QUERY,
-            identifier_kinds: JAVA_IDENT_KINDS,
-            def_keyword: java_def_keyword,
-            visibility: java_visibility,
-            post_process: None,
-        });
+        let mut result = common::run_query_parse(
+            source,
+            &QueryParseConfig {
+                language: tree_sitter_java::LANGUAGE.into(),
+                query_source: JAVA_QUERY,
+                identifier_kinds: JAVA_IDENT_KINDS,
+                def_keyword: java_def_keyword,
+                visibility: java_visibility,
+                post_process: None,
+            },
+        );
         result
     }
 }
@@ -168,13 +171,41 @@ record Point(int x, int y) {}
         let result = JavaParser::parse(source);
         let names: Vec<&str> = result.symbols.iter().map(|s| s.name.as_str()).collect();
 
-        assert!(names.contains(&"Config"), "should find class Config, got: {:?}", names);
-        assert!(names.contains(&"name"), "should find field name, got: {:?}", names);
-        assert!(names.contains(&"getName"), "should find method getName, got: {:?}", names);
-        assert!(names.contains(&"Handler"), "should find interface Handler, got: {:?}", names);
-        assert!(names.contains(&"Status"), "should find enum Status, got: {:?}", names);
-        assert!(names.contains(&"ACTIVE"), "should find enum constant ACTIVE, got: {:?}", names);
-        assert!(names.contains(&"Point"), "should find record Point, got: {:?}", names);
+        assert!(
+            names.contains(&"Config"),
+            "should find class Config, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"name"),
+            "should find field name, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"getName"),
+            "should find method getName, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Handler"),
+            "should find interface Handler, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Status"),
+            "should find enum Status, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"ACTIVE"),
+            "should find enum constant ACTIVE, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Point"),
+            "should find record Point, got: {:?}",
+            names
+        );
 
         // Check visibility
         let config_sym = result.symbols.iter().find(|s| s.name == "Config").unwrap();

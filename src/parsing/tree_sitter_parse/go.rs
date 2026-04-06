@@ -71,14 +71,17 @@ pub struct GoParser;
 
 impl TsParser for GoParser {
     fn parse(source: &str) -> ParseResult {
-        let mut result = common::run_query_parse(source, &QueryParseConfig {
-            language: tree_sitter_go::LANGUAGE.into(),
-            query_source: GO_QUERY,
-            identifier_kinds: GO_IDENT_KINDS,
-            def_keyword: go_def_keyword,
-            visibility: |_node: Node, _source: &str| Visibility::Unknown,
-            post_process: Some(go_post_process),
-        });
+        let mut result = common::run_query_parse(
+            source,
+            &QueryParseConfig {
+                language: tree_sitter_go::LANGUAGE.into(),
+                query_source: GO_QUERY,
+                identifier_kinds: GO_IDENT_KINDS,
+                def_keyword: go_def_keyword,
+                visibility: |_node: Node, _source: &str| Visibility::Unknown,
+                post_process: Some(go_post_process),
+            },
+        );
         // Apply Go visibility convention (uppercase = Public)
         for sym in &mut result.symbols {
             sym.visibility = go_visibility(&sym.name);
@@ -123,9 +126,10 @@ fn set_method_receivers(node: Node, source: &str, symbols: &mut Vec<Symbol>) {
                 let line = name_node.start_position().row;
                 let col = name_node.start_position().column;
                 if let Some(receiver_type) = extract_receiver_type(child, source) {
-                    if let Some(sym) = symbols.iter_mut().find(|s| {
-                        s.name == name && s.line == line && s.col == col
-                    }) {
+                    if let Some(sym) = symbols
+                        .iter_mut()
+                        .find(|s| s.name == name && s.line == line && s.col == col)
+                    {
                         sym.container = Some(receiver_type.to_string());
                     }
                 }
@@ -186,15 +190,51 @@ const MaxSize = 100
         let result = GoParser::parse(source);
         let names: Vec<&str> = result.symbols.iter().map(|s| s.name.as_str()).collect();
 
-        assert!(names.contains(&"Hello"), "should find func Hello, got: {:?}", names);
-        assert!(names.contains(&"helper"), "should find func helper, got: {:?}", names);
-        assert!(names.contains(&"Config"), "should find struct Config, got: {:?}", names);
-        assert!(names.contains(&"Name"), "should find field Name, got: {:?}", names);
-        assert!(names.contains(&"Handler"), "should find interface Handler, got: {:?}", names);
-        assert!(names.contains(&"MyInt"), "should find type MyInt, got: {:?}", names);
-        assert!(names.contains(&"GetName"), "should find method GetName, got: {:?}", names);
-        assert!(names.contains(&"GlobalVar"), "should find var GlobalVar, got: {:?}", names);
-        assert!(names.contains(&"MaxSize"), "should find const MaxSize, got: {:?}", names);
+        assert!(
+            names.contains(&"Hello"),
+            "should find func Hello, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"helper"),
+            "should find func helper, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Config"),
+            "should find struct Config, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Name"),
+            "should find field Name, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Handler"),
+            "should find interface Handler, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"MyInt"),
+            "should find type MyInt, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"GetName"),
+            "should find method GetName, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"GlobalVar"),
+            "should find var GlobalVar, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"MaxSize"),
+            "should find const MaxSize, got: {:?}",
+            names
+        );
 
         // Check visibility
         let hello_sym = result.symbols.iter().find(|s| s.name == "Hello").unwrap();
@@ -236,7 +276,11 @@ const MaxSize = 100
         assert!(names.contains(&"main"));
 
         // Methods
-        let add_handler = result.symbols.iter().find(|s| s.name == "AddHandler").unwrap();
+        let add_handler = result
+            .symbols
+            .iter()
+            .find(|s| s.name == "AddHandler")
+            .unwrap();
         assert_eq!(add_handler.container.as_deref(), Some("Server"));
 
         let run = result.symbols.iter().find(|s| s.name == "Run").unwrap();

@@ -89,8 +89,8 @@ pub fn index_dir_for_project(project_root: &Path) -> Option<PathBuf> {
                 .map(|h| PathBuf::from(h).join(".cache"))
         })?;
 
-    let canonical = std::fs::canonicalize(project_root)
-        .unwrap_or_else(|_| project_root.to_path_buf());
+    let canonical =
+        std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
     let hash = path_hash(&canonical);
 
     Some(cache_base.join("quicklsp").join(format!("{hash:016x}")))
@@ -106,7 +106,10 @@ fn path_hash(path: &Path) -> u64 {
 }
 
 /// Collect file paths and mtimes for freshness checking.
-pub fn collect_file_mtimes(root: &Path, skip_dirs: &dyn Fn(&str) -> bool) -> Vec<(PathBuf, SystemTime)> {
+pub fn collect_file_mtimes(
+    root: &Path,
+    skip_dirs: &dyn Fn(&str) -> bool,
+) -> Vec<(PathBuf, SystemTime)> {
     let mut result = Vec::new();
     collect_mtimes_recursive(root, skip_dirs, &mut result, 0);
     result.sort_by(|a, b| a.0.cmp(&b.0));

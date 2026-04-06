@@ -24,10 +24,18 @@ pub fn node_text<'a>(node: Node, source: &'a str) -> &'a str {
 }
 
 /// Get the name (text) and position of a child identified by `field_name`.
-pub fn named_child_text(node: Node, field_name: &str, source: &str) -> Option<(String, usize, usize)> {
+pub fn named_child_text(
+    node: Node,
+    field_name: &str,
+    source: &str,
+) -> Option<(String, usize, usize)> {
     let child = node.child_by_field_name(field_name)?;
     let text = node_text(child, source).to_string();
-    Some((text, child.start_position().row, child.start_position().column))
+    Some((
+        text,
+        child.start_position().row,
+        child.start_position().column,
+    ))
 }
 
 // ── Symbol construction ─────────────────────────────────────────────────
@@ -166,7 +174,12 @@ where
 {
     let tree = match parse_source(source, language) {
         Some(t) => t,
-        None => return ParseResult { symbols: Vec::new(), occurrences: Vec::new() },
+        None => {
+            return ParseResult {
+                symbols: Vec::new(),
+                occurrences: Vec::new(),
+            }
+        }
     };
 
     let mut symbols = Vec::new();
@@ -174,7 +187,10 @@ where
 
     let occurrences = collect_occurrences(tree.root_node(), source, &symbols, identifier_kinds);
 
-    ParseResult { symbols, occurrences }
+    ParseResult {
+        symbols,
+        occurrences,
+    }
 }
 
 // ── Query-based parsing engine ──────────────────────────────────────────
@@ -268,14 +284,22 @@ pub fn default_visibility(_node: Node, _source: &str) -> Visibility {
 pub fn run_query_parse(source: &str, config: &QueryParseConfig) -> ParseResult {
     let tree = match parse_source(source, &config.language) {
         Some(t) => t,
-        None => return ParseResult { symbols: Vec::new(), occurrences: Vec::new() },
+        None => {
+            return ParseResult {
+                symbols: Vec::new(),
+                occurrences: Vec::new(),
+            }
+        }
     };
 
     let query = match Query::new(&config.language, config.query_source) {
         Ok(q) => q,
         Err(e) => {
             tracing::error!("Failed to compile tree-sitter query: {e:?}");
-            return ParseResult { symbols: Vec::new(), occurrences: Vec::new() };
+            return ParseResult {
+                symbols: Vec::new(),
+                occurrences: Vec::new(),
+            };
         }
     };
 
@@ -301,20 +325,19 @@ pub fn run_query_parse(source: &str, config: &QueryParseConfig) -> ParseResult {
 
     while let Some(m) = matches.next() {
         // Find the @name capture
-        let name_capture = name_idx.and_then(|idx| {
-            m.captures.iter().find(|c| c.index == idx)
-        });
+        let name_capture = name_idx.and_then(|idx| m.captures.iter().find(|c| c.index == idx));
 
         // Find the @definition.* capture
         let def_capture = m.captures.iter().find_map(|c| {
-            def_captures.iter().find(|(idx, _, _)| *idx == c.index)
+            def_captures
+                .iter()
+                .find(|(idx, _, _)| *idx == c.index)
                 .map(|(_, kind, suffix)| (c, *kind, *suffix))
         });
 
         // Find the @container capture
-        let container_capture = container_idx.and_then(|idx| {
-            m.captures.iter().find(|c| c.index == idx)
-        });
+        let container_capture =
+            container_idx.and_then(|idx| m.captures.iter().find(|c| c.index == idx));
 
         if let (Some(name_cap), Some((def_cap, kind, suffix))) = (name_capture, def_capture) {
             let name = node_text(name_cap.node, source).to_string();
@@ -323,8 +346,7 @@ pub fn run_query_parse(source: &str, config: &QueryParseConfig) -> ParseResult {
             let def_keyword = (config.def_keyword)(kind, suffix);
             let visibility = (config.visibility)(def_cap.node, source);
 
-            let container = container_capture
-                .map(|c| node_text(c.node, source).to_string());
+            let container = container_capture.map(|c| node_text(c.node, source).to_string());
 
             let has_container = container.is_some();
             symbols.push(Symbol {
@@ -352,14 +374,13 @@ pub fn run_query_parse(source: &str, config: &QueryParseConfig) -> ParseResult {
         post(tree.root_node(), source, &mut symbols);
     }
 
-    let occurrences = collect_occurrences(
-        tree.root_node(),
-        source,
-        &symbols,
-        config.identifier_kinds,
-    );
+    let occurrences =
+        collect_occurrences(tree.root_node(), source, &symbols, config.identifier_kinds);
 
-    ParseResult { symbols, occurrences }
+    ParseResult {
+        symbols,
+        occurrences,
+    }
 }
 
 /// Remove duplicate symbols at the same position, preferring the one with
@@ -421,22 +442,29 @@ where
 
 /// Recursively walk into preprocessor conditional blocks to find definitions.
 /// Used by C/C++ parsers for `#ifdef`, `#ifndef`, `#if`, etc.
-pub fn walk_preproc_conditionals<F>(node: Node, source: &str, symbols: &mut Vec<Symbol>, mut extract: F)
-where
+pub fn walk_preproc_conditionals<F>(
+    node: Node,
+    source: &str,
+    symbols: &mut Vec<Symbol>,
+    mut extract: F,
+) where
     F: FnMut(Node, &str, &mut Vec<Symbol>),
 {
     walk_preproc_conditionals_inner(node, source, symbols, &mut extract);
 }
 
-fn walk_preproc_conditionals_inner<F>(node: Node, source: &str, symbols: &mut Vec<Symbol>, extract: &mut F)
-where
+fn walk_preproc_conditionals_inner<F>(
+    node: Node,
+    source: &str,
+    symbols: &mut Vec<Symbol>,
+    extract: &mut F,
+) where
     F: FnMut(Node, &str, &mut Vec<Symbol>),
 {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
-            "preproc_ifdef" | "preproc_if" | "preproc_elif" | "preproc_else"
-            | "preproc_ifndef" => {
+            "preproc_ifdef" | "preproc_if" | "preproc_elif" | "preproc_else" | "preproc_ifndef" => {
                 walk_preproc_conditionals_inner(child, source, symbols, extract);
             }
             _ => {

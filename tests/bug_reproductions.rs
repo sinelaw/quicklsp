@@ -602,7 +602,14 @@ fn go_fixture_definitions_all_indexed() {
     ws.index_file(fixture, source);
 
     // Types
-    for name in &["Config", "Status", "HandlerFunc", "Request", "Response", "Server"] {
+    for name in &[
+        "Config",
+        "Status",
+        "HandlerFunc",
+        "Request",
+        "Response",
+        "Server",
+    ] {
         assert!(
             !ws.find_definitions(name).is_empty(),
             "Go type '{}' should be in definitions",
@@ -828,23 +835,48 @@ fn kernel_ifdef_guarded_definitions_indexed() {
     ws.index_file(fixture, source);
 
     // Top-level definitions (always worked)
-    for name in &["CIA_VERSION", "CIA_MAX_OPS", "CIA_MIN", "cia_op_type",
-                   "CIA_READ", "CIA_WRITE", "CIA_EXEC", "cia_context",
-                   "cia_ctx_t", "cia_init", "cia_execute", "cia_main"] {
+    for name in &[
+        "CIA_VERSION",
+        "CIA_MAX_OPS",
+        "CIA_MIN",
+        "cia_op_type",
+        "CIA_READ",
+        "CIA_WRITE",
+        "CIA_EXEC",
+        "cia_context",
+        "cia_ctx_t",
+        "cia_init",
+        "cia_execute",
+        "cia_main",
+    ] {
         let defs = ws.find_definitions(name);
-        assert!(!defs.is_empty(), "Top-level symbol '{}' should be indexed", name);
+        assert!(
+            !defs.is_empty(),
+            "Top-level symbol '{}' should be indexed",
+            name
+        );
     }
 
     // Definitions inside #ifdef CONFIG_CIA_SECURITY
-    for name in &["cia_security_ops", "cia_security_check", "cia_security_audit"] {
+    for name in &[
+        "cia_security_ops",
+        "cia_security_check",
+        "cia_security_audit",
+    ] {
         let defs = ws.find_definitions(name);
-        assert!(!defs.is_empty(),
-            "'{}' inside #ifdef CONFIG_CIA_SECURITY should be indexed", name);
+        assert!(
+            !defs.is_empty(),
+            "'{}' inside #ifdef CONFIG_CIA_SECURITY should be indexed",
+            name
+        );
     }
 
     // Definitions inside #ifndef CONFIG_CIA_MINIMAL
     let defs = ws.find_definitions("cia_full_init");
-    assert!(!defs.is_empty(), "cia_full_init inside #ifndef should be indexed");
+    assert!(
+        !defs.is_empty(),
+        "cia_full_init inside #ifndef should be indexed"
+    );
 
     // Definitions inside #if defined(CONFIG_SMP)
     for name in &["cia_spinlock_t", "cia_spin_lock"] {
@@ -854,11 +886,17 @@ fn kernel_ifdef_guarded_definitions_indexed() {
 
     // Definitions inside nested #ifdef (inside #if)
     let defs = ws.find_definitions("cia_spin_dump");
-    assert!(!defs.is_empty(), "cia_spin_dump inside nested #ifdef should be indexed");
+    assert!(
+        !defs.is_empty(),
+        "cia_spin_dump inside nested #ifdef should be indexed"
+    );
 
     // Definitions inside #else
     let defs = ws.find_definitions("cia_nosmp_fallback");
-    assert!(!defs.is_empty(), "cia_nosmp_fallback inside #else should be indexed");
+    assert!(
+        !defs.is_empty(),
+        "cia_nosmp_fallback inside #else should be indexed"
+    );
 }
 
 // =========================================================================
@@ -919,7 +957,8 @@ fn local_variable_go_to_definition() {
         assert!(
             defs.is_empty(),
             "Local variable '{}' should NOT be in global definitions (got {} defs)",
-            name, defs.len()
+            name,
+            defs.len()
         );
     }
 
@@ -929,10 +968,19 @@ fn local_variable_go_to_definition() {
         !local_defs.is_empty(),
         "Local variable 'status' should be found via find_local_definitions"
     );
-    assert_eq!(local_defs[0].symbol.kind, quicklsp::parsing::symbols::SymbolKind::Variable);
-    assert!(local_defs[0].symbol.depth > 0, "Local should have depth > 0");
-    assert_eq!(local_defs[0].symbol.container.as_deref(), Some("cia_execute"),
-        "Local 'status' should have container = 'cia_execute'");
+    assert_eq!(
+        local_defs[0].symbol.kind,
+        quicklsp::parsing::symbols::SymbolKind::Variable
+    );
+    assert!(
+        local_defs[0].symbol.depth > 0,
+        "Local should have depth > 0"
+    );
+    assert_eq!(
+        local_defs[0].symbol.container.as_deref(),
+        Some("cia_execute"),
+        "Local 'status' should have container = 'cia_execute'"
+    );
 
     let local_defs = ws.find_local_definitions("prev_count", &fixture);
     assert!(
@@ -952,8 +1000,11 @@ fn local_variable_hover_shows_type() {
     // Local variables have their type stored in doc_comment by the C parser
     let local_defs = ws.find_local_definitions("status", &fixture);
     assert!(!local_defs.is_empty(), "Should find local 'status'");
-    assert_eq!(local_defs[0].symbol.doc_comment.as_deref(), Some("int"),
-        "Local 'status' should have type 'int' in doc_comment");
+    assert_eq!(
+        local_defs[0].symbol.doc_comment.as_deref(),
+        Some("int"),
+        "Local 'status' should have type 'int' in doc_comment"
+    );
 }
 
 /// Function parameters should be found via find_local_definitions.
@@ -996,8 +1047,11 @@ fn struct_field_go_to_definition() {
         "Struct field 'op_count' should be found via find_local_definitions"
     );
     assert_eq!(local_defs[0].symbol.def_keyword, "field");
-    assert_eq!(local_defs[0].symbol.container.as_deref(), Some("cia_context"),
-        "Field 'op_count' should have container = 'cia_context'");
+    assert_eq!(
+        local_defs[0].symbol.container.as_deref(),
+        Some("cia_context"),
+        "Field 'op_count' should have container = 'cia_context'"
+    );
 
     // 'last_op' is a field of struct cia_context
     let local_defs = ws.find_local_definitions("last_op", &fixture);
@@ -1039,7 +1093,8 @@ void cia_log(int level, const char *msg) {
 void cia_warn(const char *msg) {
     printk(KERN_WARNING "CIA warning: %s\n", msg);
 }
-"#.to_string(),
+"#
+        .to_string(),
     );
 
     // printk is not defined in this file or workspace
@@ -1084,28 +1139,43 @@ fn word_at_position_mid_symbol() {
 
     // Cursor on 'c' of 'cia_security_check' (col=5, first char)
     let word = QuickLspServer::word_at_position(source, 0, 5);
-    assert_eq!(word.as_deref(), Some("cia_security_check"),
-        "Cursor at start of symbol should extract full word");
+    assert_eq!(
+        word.as_deref(),
+        Some("cia_security_check"),
+        "Cursor at start of symbol should extract full word"
+    );
 
     // Cursor on 's' of 'security' (col=9, middle of symbol)
     let word = QuickLspServer::word_at_position(source, 0, 9);
-    assert_eq!(word.as_deref(), Some("cia_security_check"),
-        "Cursor in middle of symbol should extract full word");
+    assert_eq!(
+        word.as_deref(),
+        Some("cia_security_check"),
+        "Cursor in middle of symbol should extract full word"
+    );
 
     // Cursor on 'k' of 'check' (col=22, near end)
     let word = QuickLspServer::word_at_position(source, 0, 22);
-    assert_eq!(word.as_deref(), Some("cia_security_check"),
-        "Cursor near end of symbol should extract full word");
+    assert_eq!(
+        word.as_deref(),
+        Some("cia_security_check"),
+        "Cursor near end of symbol should extract full word"
+    );
 
     // Cursor on 'c' of 'cia_context' (col=31)
     let word = QuickLspServer::word_at_position(source, 0, 35);
-    assert_eq!(word.as_deref(), Some("cia_context"),
-        "Cursor on struct type name should extract full word");
+    assert_eq!(
+        word.as_deref(),
+        Some("cia_context"),
+        "Cursor on struct type name should extract full word"
+    );
 
     // Cursor on 't' of 'ctx' (middle of param name)
     let word = QuickLspServer::word_at_position(source, 0, 44);
-    assert_eq!(word.as_deref(), Some("ctx"),
-        "Cursor on parameter name should extract full word");
+    assert_eq!(
+        word.as_deref(),
+        Some("ctx"),
+        "Cursor on parameter name should extract full word"
+    );
 }
 
 /// go-to-definition should work with cursor in the middle of a symbol name.
@@ -1120,7 +1190,8 @@ void cia_security_check(void) {}
 void caller(void) {
     cia_security_check();
 }
-"#.to_string(),
+"#
+        .to_string(),
     );
 
     // The word extraction is tested above; here we verify the full pipeline:
@@ -1145,7 +1216,8 @@ void cia_security_check(void) {}
 void caller(void) {
     cia_security_check();
 }
-"#.to_string(),
+"#
+        .to_string(),
     );
 
     let refs = ws.find_references("cia_security_check");
@@ -1176,21 +1248,34 @@ fn local_variable_scope_shadowing() {
 
     // Both 'x' declarations should exist as locals
     let all_x = ws.find_local_definitions("x", &path);
-    assert_eq!(all_x.len(), 2, "Should find 2 declarations of 'x', got {}", all_x.len());
+    assert_eq!(
+        all_x.len(),
+        2,
+        "Should find 2 declarations of 'x', got {}",
+        all_x.len()
+    );
 
     // Cursor on line 4 (inside if block, after inner `int x = 2;` on line 3):
     // should resolve to the inner x (line 3, depth 2)
     let inner = ws.find_local_definition_at("x", &path, 4);
     assert!(inner.is_some(), "Should find inner x at cursor line 4");
     let inner = inner.unwrap();
-    assert_eq!(inner.symbol.line, 3, "Should pick inner x on line 3, got line {}", inner.symbol.line);
+    assert_eq!(
+        inner.symbol.line, 3,
+        "Should pick inner x on line 3, got line {}",
+        inner.symbol.line
+    );
 
     // Cursor on line 6 (after the if block closed):
     // should resolve to the outer x (line 1, depth 1)
     let outer = ws.find_local_definition_at("x", &path, 6);
     assert!(outer.is_some(), "Should find outer x at cursor line 6");
     let outer = outer.unwrap();
-    assert_eq!(outer.symbol.line, 1, "Should pick outer x on line 1, got line {}", outer.symbol.line);
+    assert_eq!(
+        outer.symbol.line, 1,
+        "Should pick outer x on line 1, got line {}",
+        outer.symbol.line
+    );
 }
 
 /// Scope-aware resolution for for-loop variables.
@@ -1212,10 +1297,18 @@ fn local_variable_scope_for_loop() {
     // Cursor on line 2 (inside first for loop): should find the first i (line 1)
     let first = ws.find_local_definition_at("i", &path, 2);
     assert!(first.is_some(), "Should find i at cursor line 2");
-    assert_eq!(first.unwrap().symbol.line, 1, "Should pick first loop's i on line 1");
+    assert_eq!(
+        first.unwrap().symbol.line,
+        1,
+        "Should pick first loop's i on line 1"
+    );
 
     // Cursor on line 5 (inside second for loop): should find the second i (line 4)
     let second = ws.find_local_definition_at("i", &path, 5);
     assert!(second.is_some(), "Should find i at cursor line 5");
-    assert_eq!(second.unwrap().symbol.line, 4, "Should pick second loop's i on line 4");
+    assert_eq!(
+        second.unwrap().symbol.line,
+        4,
+        "Should pick second loop's i on line 4"
+    );
 }

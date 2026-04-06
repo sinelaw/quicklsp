@@ -73,7 +73,11 @@ impl LspServer {
             }
         });
 
-        LspServer { child, rx, _reader_thread: reader_thread }
+        LspServer {
+            child,
+            rx,
+            _reader_thread: reader_thread,
+        }
     }
 
     fn stdin(&mut self) -> &mut std::process::ChildStdin {
@@ -148,9 +152,11 @@ impl LspServer {
             }
         }));
 
-        let response = self.wait_for(Duration::from_secs(5), |msg| {
-            msg.get("id").and_then(|v| v.as_u64()) == Some(1)
-        }).expect("No initialize response received");
+        let response = self
+            .wait_for(Duration::from_secs(5), |msg| {
+                msg.get("id").and_then(|v| v.as_u64()) == Some(1)
+            })
+            .expect("No initialize response received");
 
         // Send initialized notification
         self.send(&serde_json::json!({
@@ -202,7 +208,9 @@ fn test_initialize_handshake() {
     let response = server.initialize(&fixtures_dir());
 
     // Verify we got a valid response with capabilities
-    let result = response.get("result").expect("No result in initialize response");
+    let result = response
+        .get("result")
+        .expect("No result in initialize response");
     let caps = result.get("capabilities").expect("No capabilities");
 
     assert_eq!(caps["definitionProvider"], true);
@@ -233,7 +241,10 @@ fn test_progress_notifications_during_indexing() {
     let create_req = server.wait_for(Duration::from_secs(5), |msg| {
         msg.get("method").and_then(|v| v.as_str()) == Some("window/workDoneProgress/create")
     });
-    assert!(create_req.is_some(), "Server should send workDoneProgress/create request");
+    assert!(
+        create_req.is_some(),
+        "Server should send workDoneProgress/create request"
+    );
     let create_req = create_req.unwrap();
 
     // Respond to the create request (client must acknowledge)
@@ -305,10 +316,9 @@ fn test_progress_includes_workspace_scan_updates() {
     });
 
     // Filter to "report" kind only (not begin/end)
-    let reports: Vec<_> = progress_msgs.iter()
-        .filter(|msg| {
-            msg["params"]["value"]["kind"].as_str() == Some("report")
-        })
+    let reports: Vec<_> = progress_msgs
+        .iter()
+        .filter(|msg| msg["params"]["value"]["kind"].as_str() == Some("report"))
         .collect();
 
     // For the small fixtures dir (5 files), scan progress reports won't fire
@@ -318,9 +328,9 @@ fn test_progress_includes_workspace_scan_updates() {
     println!("Progress messages received: {}", progress_msgs.len());
     println!("Report messages during scan: {}", reports.len());
     for (i, msg) in progress_msgs.iter().enumerate() {
-        println!("  [{i}] kind={}, message={}",
-            msg["params"]["value"]["kind"],
-            msg["params"]["value"]["message"],
+        println!(
+            "  [{i}] kind={}, message={}",
+            msg["params"]["value"]["kind"], msg["params"]["value"]["message"],
         );
     }
 
@@ -358,7 +368,9 @@ fn test_go_to_definition_after_indexing() {
 
     // Find a function name in the fixture and request definition
     // Look for "process_data" which should be defined in the fixture
-    let line = source.lines().enumerate()
+    let line = source
+        .lines()
+        .enumerate()
         .find(|(_, l)| l.contains("process_data"))
         .map(|(i, _)| i)
         .unwrap_or(0);
@@ -413,7 +425,9 @@ fn test_find_references_after_indexing() {
     }));
 
     // Find references for "process_data"
-    let line = source.lines().enumerate()
+    let line = source
+        .lines()
+        .enumerate()
         .find(|(_, l)| l.contains("fn process_data"))
         .map(|(i, _)| i)
         .unwrap_or(0);
@@ -476,20 +490,31 @@ fn test_document_symbols() {
         }
     }));
 
-    let response = server.wait_for(Duration::from_secs(5), |msg| {
-        msg.get("id").and_then(|v| v.as_u64()) == Some(30)
-    }).expect("Should receive documentSymbol response");
+    let response = server
+        .wait_for(Duration::from_secs(5), |msg| {
+            msg.get("id").and_then(|v| v.as_u64()) == Some(30)
+        })
+        .expect("Should receive documentSymbol response");
 
-    let result = response["result"].as_array().expect("result should be array");
+    let result = response["result"]
+        .as_array()
+        .expect("result should be array");
     assert!(!result.is_empty(), "Should find symbols in sample_rust.rs");
 
     // Verify we find expected symbols
-    let names: Vec<&str> = result.iter()
-        .filter_map(|s| s["name"].as_str())
-        .collect();
-    assert!(names.contains(&"Config"), "Should find struct Config, got: {names:?}");
-    assert!(names.contains(&"Server"), "Should find struct Server, got: {names:?}");
-    assert!(names.contains(&"process_request"), "Should find fn process_request, got: {names:?}");
+    let names: Vec<&str> = result.iter().filter_map(|s| s["name"].as_str()).collect();
+    assert!(
+        names.contains(&"Config"),
+        "Should find struct Config, got: {names:?}"
+    );
+    assert!(
+        names.contains(&"Server"),
+        "Should find struct Server, got: {names:?}"
+    );
+    assert!(
+        names.contains(&"process_request"),
+        "Should find fn process_request, got: {names:?}"
+    );
 
     server.shutdown();
 }
@@ -509,17 +534,22 @@ fn test_workspace_symbol_search() {
         }
     }));
 
-    let response = server.wait_for(Duration::from_secs(5), |msg| {
-        msg.get("id").and_then(|v| v.as_u64()) == Some(40)
-    }).expect("Should receive workspace/symbol response");
+    let response = server
+        .wait_for(Duration::from_secs(5), |msg| {
+            msg.get("id").and_then(|v| v.as_u64()) == Some(40)
+        })
+        .expect("Should receive workspace/symbol response");
 
-    let result = response["result"].as_array().expect("result should be array");
+    let result = response["result"]
+        .as_array()
+        .expect("result should be array");
     assert!(!result.is_empty(), "Should find symbols matching 'Config'");
 
-    let names: Vec<&str> = result.iter()
-        .filter_map(|s| s["name"].as_str())
-        .collect();
-    assert!(names.contains(&"Config"), "Should find Config in results, got: {names:?}");
+    let names: Vec<&str> = result.iter().filter_map(|s| s["name"].as_str()).collect();
+    assert!(
+        names.contains(&"Config"),
+        "Should find Config in results, got: {names:?}"
+    );
 
     server.shutdown();
 }
@@ -533,7 +563,9 @@ fn test_completion() {
     let (file_uri, source) = open_fixture(&mut server, "sample_rust.rs");
 
     // Find a line where we can complete — after "process_" should suggest "process_request"
-    let line = source.lines().enumerate()
+    let line = source
+        .lines()
+        .enumerate()
         .find(|(_, l)| l.contains("fn process_request"))
         .map(|(i, _)| i)
         .unwrap_or(0);
@@ -549,9 +581,11 @@ fn test_completion() {
         }
     }));
 
-    let response = server.wait_for(Duration::from_secs(5), |msg| {
-        msg.get("id").and_then(|v| v.as_u64()) == Some(50)
-    }).expect("Should receive completion response");
+    let response = server
+        .wait_for(Duration::from_secs(5), |msg| {
+            msg.get("id").and_then(|v| v.as_u64()) == Some(50)
+        })
+        .expect("Should receive completion response");
 
     // Should have a result (array or CompletionList)
     assert!(
@@ -571,7 +605,9 @@ fn test_hover() {
     let (file_uri, source) = open_fixture(&mut server, "sample_rust.rs");
 
     // Hover over "Config" on the struct definition line
-    let line = source.lines().enumerate()
+    let line = source
+        .lines()
+        .enumerate()
         .find(|(_, l)| l.contains("struct Config"))
         .map(|(i, _)| i)
         .unwrap_or(0);
@@ -586,9 +622,11 @@ fn test_hover() {
         }
     }));
 
-    let response = server.wait_for(Duration::from_secs(5), |msg| {
-        msg.get("id").and_then(|v| v.as_u64()) == Some(60)
-    }).expect("Should receive hover response");
+    let response = server
+        .wait_for(Duration::from_secs(5), |msg| {
+            msg.get("id").and_then(|v| v.as_u64()) == Some(60)
+        })
+        .expect("Should receive hover response");
 
     assert!(
         !response.get("error").is_some(),
@@ -597,7 +635,10 @@ fn test_hover() {
 
     // Should have actual hover content with signature
     let result = &response["result"];
-    assert!(!result.is_null(), "Hover should return content for struct Config, got null");
+    assert!(
+        !result.is_null(),
+        "Hover should return content for struct Config, got null"
+    );
     let content = result["contents"]["value"].as_str().unwrap_or("");
     assert!(
         content.contains("Config"),
@@ -616,7 +657,11 @@ fn drain_until_progress_end(server: &mut LspServer) {
         let remaining = timeout.saturating_sub(start.elapsed());
         if let Some(msg) = server.recv(remaining) {
             // Respond to progress create requests
-            if msg.get("method").and_then(|v: &serde_json::Value| v.as_str()) == Some("window/workDoneProgress/create") {
+            if msg
+                .get("method")
+                .and_then(|v: &serde_json::Value| v.as_str())
+                == Some("window/workDoneProgress/create")
+            {
                 if let Some(id) = msg.get("id") {
                     server.send(&serde_json::json!({
                         "jsonrpc": "2.0",
@@ -626,7 +671,11 @@ fn drain_until_progress_end(server: &mut LspServer) {
                 }
             }
             // Check for progress End
-            if msg.get("method").and_then(|v: &serde_json::Value| v.as_str()) == Some("$/progress") {
+            if msg
+                .get("method")
+                .and_then(|v: &serde_json::Value| v.as_str())
+                == Some("$/progress")
+            {
                 if msg["params"]["value"]["kind"].as_str() == Some("end") {
                     return;
                 }
@@ -653,17 +702,23 @@ fn test_scan_progress_callback_fires() {
     let last_done = AtomicUsize::new(0);
     let last_total = AtomicUsize::new(0);
 
-    ws.scan_directory(dir.path(), Some(&|done, total| {
-        progress_count.fetch_add(1, Ordering::Relaxed);
-        last_done.store(done, Ordering::Relaxed);
-        last_total.store(total, Ordering::Relaxed);
-    }));
+    ws.scan_directory(
+        dir.path(),
+        Some(&|done, total| {
+            progress_count.fetch_add(1, Ordering::Relaxed);
+            last_done.store(done, Ordering::Relaxed);
+            last_total.store(total, Ordering::Relaxed);
+        }),
+    );
 
     let count = progress_count.load(Ordering::Relaxed);
     let done = last_done.load(Ordering::Relaxed);
     let total = last_total.load(Ordering::Relaxed);
 
-    assert!(count >= 1, "Progress callback should fire at least once for 600 files, got {count}");
+    assert!(
+        count >= 1,
+        "Progress callback should fire at least once for 600 files, got {count}"
+    );
     assert_eq!(total, 600, "Total should be 600 files");
     assert!(done >= 500, "Last done should be >= 500, got {done}");
 }
