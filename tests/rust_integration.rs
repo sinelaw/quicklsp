@@ -405,27 +405,67 @@ fn run_all_checks(s: &mut LspServer, t: &mut TestResults, uri: &str, src: &str, 
     }
 
     // ═════════════════════════════════════════════════════════════
-    //  9. BUG-REPRODUCING TESTS
+    //  9. BUG-REPRODUCING TESTS — same-file (baseline)
     // ═════════════════════════════════════════════════════════════
 
-    // BUG 1: Cross-language name collision — Config should resolve
-    // to Rust struct, not C definition from sample_c.c / c_project.
+    // BUG 1 baseline: Config from same file — should work (same-file preference).
     {
         let (l, c) = mark(src, "USE_Config_param", "Config");
         check_hover_contains(t, &s.hover(uri, l, c), "struct Config",
-            &format!("{phase}:BUG1_hover@Config_param"));
+            &format!("{phase}:BUG1_baseline_hover@Config_param"));
         check_definition_target(t, &s.goto_definition(uri, l, c), "sample_rust.rs",
-            &format!("{phase}:BUG1_def@Config_param"));
+            &format!("{phase}:BUG1_baseline_def@Config_param"));
     }
+
+    // BUG 3: Hover on `format!` macro — should NOT return `mod format`.
+    // Macros are not tracked, so hover should return null, not a false
+    // positive from module-name matching.
     {
-        let (l, c) = mark(src, "Server_new_DEF", "Config");
-        check_definition_target(t, &s.goto_definition(uri, l, c), "sample_rust.rs",
-            &format!("{phase}:BUG1_def@Config_in_Server_new"));
+        let (l, c) = mark(src, "USE_format_macro", "format");
+        let resp = s.hover(uri, l, c);
+        // It's OK to return null. It's NOT OK to return "mod format".
+        if !resp["result"].is_null() {
+            let content = resp["result"]["contents"]["value"].as_str().unwrap_or("");
+            t.check(
+                !content.contains("mod format"),
+                format!("{phase}:BUG3_hover@format_macro: should not return 'mod format' false positive, got:\n  {content}"),
+            );
+        } else {
+            t.check(true, String::new()); // null is correct
+        }
+    }
+
+    // BUG 4: Hover on `Request` between identifiers — the manual
+    // test found an empty result at the exact column between
+    // `&Config, ` and `request:` on the process_request signature line.
+    {
+        let (l, c) = mark(src, "USE_Request_param", "Request");
+        let resp = s.hover(uri, l, c);
+        check_hover_contains(t, &resp, "Request",
+            &format!("{phase}:BUG4_hover@Request_param"));
+    }
+
+    // BUG 5: Signature help at definition site (not a call).
+    // Server::new definition line — sighelp should return null/empty,
+    // not error. This documents that sighelp only works at call sites.
+    {
+        let (l, c) = mark(src, "Server_new_DEF", "new");
+        let resp = s.signature_help(uri, l, c + 3); // cursor at "new("
+        check_hover_no_error(t, &resp,
+            &format!("{phase}:BUG5_sighelp@Server_new_def_no_error"));
+    }
+
+    // BUG 6: Signature help at non-function expression.
+    // DEFAULT_TIMEOUT * (i as u64 + 1) is not a function call.
+    {
+        let (l, c) = mark(src, "USE_DEFAULT_TIMEOUT", "DEFAULT_TIMEOUT");
+        let resp = s.signature_help(uri, l, c + 5); // cursor inside identifier
+        // Should not error — just return null/empty
+        check_hover_no_error(t, &resp,
+            &format!("{phase}:BUG6_sighelp@non_call_no_error"));
     }
 
     // BUG 2: Unicode prefix completion via didChange with fresh prefix.
-    // Send modified buffer with "don" typed on a new line — should
-    // match "données_utilisateur".
     {
         let modified = format!("{}\nfn _bug2_test() {{\n    don\n}}\n", src);
         let bug_line = modified.lines().count() as u32 - 2;
@@ -435,23 +475,153 @@ fn run_all_checks(s: &mut LspServer, t: &mut TestResults, uri: &str, src: &str, 
         check_completion_contains(t, &s.completion(uri, bug_line, 7),
             "données_utilisateur", &format!("{phase}:BUG2_completion@don"));
 
-        // Restore
         s.did_change(uri, 101, src);
         std::thread::sleep(Duration::from_millis(100));
     }
     {
         let modified = format!("{}\nfn _bug2_test2() {{\n    Üb\n}}\n", src);
         let bug_line = modified.lines().count() as u32 - 2;
-        // "    Üb" — col 7 is past the end (4 spaces + Ü(2 bytes) + b(1 byte))
         s.did_change(uri, 102, &modified);
         std::thread::sleep(Duration::from_millis(100));
 
         check_completion_contains(t, &s.completion(uri, bug_line, 7),
             "Über", &format!("{phase}:BUG2_completion@Üb"));
 
-        // Restore
         s.did_change(uri, 103, src);
         std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Run cross-file checks that are expected to PASS (non-collision symbols).
+fn run_cross_file_passing_checks(
+    s: &mut LspServer,
+    t: &mut TestResults,
+    consumer_uri: &str,
+    consumer_src: &str,
+    phase: &str,
+) {
+    // Cross-file hover for symbols without name collisions
+    {
+        let (l, c) = mark(consumer_src, "XFILE_USE_Status", "Status");
+        check_hover_contains(t, &s.hover(consumer_uri, l, c), "Status",
+            &format!("{phase}:XFILE_hover@Status"));
+    }
+    {
+        let (l, c) = mark(consumer_src, "XFILE_USE_Handler", "Handler");
+        check_hover_contains(t, &s.hover(consumer_uri, l, c), "Handler",
+            &format!("{phase}:XFILE_hover@Handler"));
+    }
+
+    // Cross-file goto-def for non-colliding symbols
+    {
+        let (l, c) = mark(consumer_src, "XFILE_CALL_create_config", "create_config");
+        check_definition_found(t, &s.goto_definition(consumer_uri, l, c),
+            &format!("{phase}:XFILE_def@create_config"));
+    }
+    {
+        let (l, c) = mark(consumer_src, "XFILE_CALL_validate_request", "validate_request");
+        check_definition_found(t, &s.goto_definition(consumer_uri, l, c),
+            &format!("{phase}:XFILE_def@validate_request"));
+    }
+
+    // Cross-file find-references
+    {
+        let (l, c) = mark(consumer_src, "XFILE_USE_Config", "Config");
+        let resp = s.find_references(consumer_uri, l, c);
+        check_references_include_file(t, &resp, "rust_consumer.rs",
+            &format!("{phase}:XFILE_refs@Config_self"));
+        check_references_include_file(t, &resp, "sample_rust.rs",
+            &format!("{phase}:XFILE_refs@Config_other"));
+    }
+
+    // Cross-file completion
+    {
+        let (l, c) = mark(consumer_src, "XFILE_COMPLETION_Conf", "Conf");
+        check_completion_contains(t, &s.completion(consumer_uri, l, c + 4), "Config",
+            &format!("{phase}:XFILE_completion@Conf"));
+    }
+
+    // Cross-file signature help
+    {
+        let (l, c) = mark(consumer_src, "XFILE_CALL_process_request2", "process_request");
+        check_sighelp_found(t, &s.signature_help(consumer_uri, l, c + "process_request(".len() as u32),
+            &format!("{phase}:XFILE_sighelp@process_request"));
+    }
+    {
+        let (l, c) = mark(consumer_src, "XFILE_CALL_validate_request", "validate_request");
+        check_sighelp_found(t, &s.signature_help(consumer_uri, l, c + "validate_request(".len() as u32),
+            &format!("{phase}:XFILE_sighelp@validate_request"));
+    }
+}
+
+/// Run cross-file bug reproduction tests that are EXPECTED TO FAIL.
+///
+/// These test the cross-language name collision bug: when querying from
+/// rust_consumer.rs (which does not define `Config` or `process_request`),
+/// same-file ranking preference is gone. The server incorrectly picks the
+/// C/Go/Python definition instead of the Rust one.
+fn run_cross_file_bug_checks(
+    s: &mut LspServer,
+    t: &mut TestResults,
+    consumer_uri: &str,
+    consumer_src: &str,
+    phase: &str,
+) {
+    // ═════════════════════════════════════════════════════════════
+    //  BUG 1: Cross-language Config collision (cross-file)
+    //
+    //  sample_c.c and sample_go.go both define `Config`.
+    //  sample_rust.rs also defines `struct Config`.
+    //  When querying from rust_consumer.rs (which defines neither),
+    //  same-file preference is gone and the wrong language wins.
+    // ═════════════════════════════════════════════════════════════
+
+    // Hover on Config param — should show Rust struct Config, not C/Go
+    {
+        let (l, c) = mark(consumer_src, "XFILE_USE_Config", "Config");
+        let resp = s.hover(consumer_uri, l, c);
+        check_hover_contains(t, &resp, "struct Config",
+            &format!("{phase}:BUG1_XFILE_hover@Config should show Rust struct Config"));
+    }
+
+    // Goto-def on Config — should go to sample_rust.rs, not sample_c.c/sample_go.go
+    {
+        let (l, c) = mark(consumer_src, "XFILE_USE_Config", "Config");
+        check_definition_target(t, &s.goto_definition(consumer_uri, l, c), "sample_rust.rs",
+            &format!("{phase}:BUG1_XFILE_def@Config should go to sample_rust.rs"));
+    }
+
+    // Config in return type position — same collision
+    {
+        let (l, c) = mark(consumer_src, "XFILE_Config_return", "Config");
+        check_definition_target(t, &s.goto_definition(consumer_uri, l, c), "sample_rust.rs",
+            &format!("{phase}:BUG1_XFILE_def@Config_return should go to sample_rust.rs"));
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    //  BUG 1b: Cross-language process_request collision
+    //
+    //  sample_c.c and sample_python.py both define process_request.
+    //  Cross-file goto-def from rust_consumer.rs picks the wrong one.
+    // ═════════════════════════════════════════════════════════════
+    {
+        let (l, c) = mark(consumer_src, "XFILE_CALL_process_request", "process_request");
+        check_definition_target(t, &s.goto_definition(consumer_uri, l, c), "sample_rust.rs",
+            &format!("{phase}:BUG1b_XFILE_def@process_request should go to sample_rust.rs"));
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    //  BUG 1c: Cross-language Request collision
+    //
+    //  Request is defined in multiple fixture files across languages.
+    //  Cross-file hover from rust_consumer.rs may pick the wrong one.
+    // ═════════════════════════════════════════════════════════════
+    {
+        let (l, c) = mark(consumer_src, "XFILE_USE_Request", "Request");
+        check_hover_contains(t, &s.hover(consumer_uri, l, c), "Request",
+            &format!("{phase}:BUG1c_XFILE_hover@Request should resolve to Rust struct"));
+        check_definition_target(t, &s.goto_definition(consumer_uri, l, c), "sample_rust.rs",
+            &format!("{phase}:BUG1c_XFILE_def@Request should go to sample_rust.rs"));
     }
 }
 
@@ -464,25 +634,59 @@ fn test_rust_full_lsp() {
     drain_until_progress_end(&mut s);
 
     let (uri, src) = open_fixture(&mut s, &dir, "sample_rust.rs", "rust");
+    let (consumer_uri, consumer_src) = open_fixture(&mut s, &dir, "rust_consumer.rs", "rust");
     std::thread::sleep(Duration::from_millis(200));
 
     let mut t = TestResults::new();
 
-    // ── Phase 1: vanilla (initial file open) ────────────────────
+    // ── Phase 1: vanilla ────────────────────────────────────────
     eprintln!("\n=== Phase 1: vanilla ===");
     run_all_checks(&mut s, &mut t, &uri, &src, "vanilla");
+    run_cross_file_passing_checks(&mut s, &mut t, &consumer_uri, &consumer_src, "vanilla");
 
-    // ── Phase 2: after didChange re-index ───────────────────────
-    //
-    // Send a trivial modification (append a comment) to trigger
-    // a full re-index, then run every check again.
+    // ── Phase 2: after didChange ────────────────────────────────
     eprintln!("\n=== Phase 2: didChange ===");
     let modified_src = format!("{}\n// didChange trigger comment\n", src);
+    let modified_consumer = format!("{}\n// didChange trigger comment\n", consumer_src);
     s.did_change(&uri, 50, &modified_src);
+    s.did_change(&consumer_uri, 50, &modified_consumer);
     std::thread::sleep(Duration::from_millis(200));
     run_all_checks(&mut s, &mut t, &uri, &modified_src, "didChange");
+    run_cross_file_passing_checks(&mut s, &mut t, &consumer_uri, &modified_consumer, "didChange");
 
-    // ── Cleanup ──────────────────────────────────────────────────
+    s.shutdown();
+    t.finish();
+}
+
+/// Separate test for known cross-language collision bugs.
+///
+/// These tests FAIL because of the cross-language name collision bug:
+/// when `Config`, `process_request`, and `Request` are queried from a
+/// file that doesn't define them, the server picks the wrong language's
+/// definition (C, Go, or Python instead of Rust).
+///
+/// When these bugs are fixed, this test will start passing.
+#[test]
+fn test_rust_cross_language_collision_bugs() {
+    let dir = fixtures_dir();
+    let mut s = LspServer::spawn();
+    s.initialize(&dir);
+    drain_until_progress_end(&mut s);
+
+    let (_uri, _src) = open_fixture(&mut s, &dir, "sample_rust.rs", "rust");
+    let (consumer_uri, consumer_src) = open_fixture(&mut s, &dir, "rust_consumer.rs", "rust");
+    std::thread::sleep(Duration::from_millis(200));
+
+    let mut t = TestResults::new();
+
+    run_cross_file_bug_checks(&mut s, &mut t, &consumer_uri, &consumer_src, "vanilla");
+
+    // Also test after didChange
+    let modified_consumer = format!("{}\n// didChange trigger\n", consumer_src);
+    s.did_change(&consumer_uri, 50, &modified_consumer);
+    std::thread::sleep(Duration::from_millis(200));
+    run_cross_file_bug_checks(&mut s, &mut t, &consumer_uri, &modified_consumer, "didChange");
+
     s.shutdown();
     t.finish();
 }
