@@ -49,6 +49,7 @@ struct LspServer {
     child: Child,
     rx: mpsc::Receiver<serde_json::Value>,
     _reader_thread: std::thread::JoinHandle<()>,
+    _cache_dir: tempfile::TempDir,
     next_id: u64,
 }
 
@@ -59,9 +60,14 @@ impl LspServer {
             .join("debug")
             .join("quicklsp");
 
+        // Use a fresh temporary cache directory so tests are isolated from
+        // any previously persisted word-index state.
+        let cache_dir = tempfile::tempdir().expect("failed to create temp cache dir");
+
         // Set RUST_LOG=quicklsp=debug and use .stderr(Stdio::inherit())
         // to see server-side tracing when debugging test failures.
         let mut child = Command::new(&binary)
+            .env("XDG_CACHE_HOME", cache_dir.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -84,6 +90,7 @@ impl LspServer {
             child,
             rx,
             _reader_thread: reader_thread,
+            _cache_dir: cache_dir,
             next_id: 100,
         }
     }
