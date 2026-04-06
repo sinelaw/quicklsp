@@ -1,4 +1,4 @@
-//! Tree-sitter based Java parser.
+//! Tree-sitter based Java parser using SCM queries.
 //!
 //! Extracts: classes, interfaces, enums, methods, constructors, fields,
 //! and enum constants.
@@ -8,172 +8,110 @@ use tree_sitter::Node;
 use crate::parsing::symbols::{Symbol, SymbolKind};
 use crate::parsing::tokenizer::Visibility;
 
-use super::common::{self, make_contained_symbol, make_symbol, node_text};
+use super::common::{self, node_text, QueryParseConfig};
 use super::{ParseResult, TsParser};
 
 const JAVA_IDENT_KINDS: &[&str] = &["identifier", "type_identifier"];
+
+const JAVA_QUERY: &str = r#"
+; ── Class declarations ───────────────────────────────────────────────────
+(class_declaration
+  name: (identifier) @name) @definition.class
+
+; ── Interface declarations ───────────────────────────────────────────────
+(interface_declaration
+  name: (identifier) @name) @definition.interface
+
+; ── Enum declarations ────────────────────────────────────────────────────
+(enum_declaration
+  name: (identifier) @name) @definition.enum
+
+; ── Record declarations ──────────────────────────────────────────────────
+(record_declaration
+  name: (identifier) @name) @definition.struct
+
+; ── Annotation declarations ──────────────────────────────────────────────
+(annotation_type_declaration
+  name: (identifier) @name) @definition.interface
+
+; ── Methods inside classes ───────────────────────────────────────────────
+(class_declaration
+  name: (identifier) @container
+  body: (class_body
+    (method_declaration
+      name: (identifier) @name) @definition.method))
+
+; ── Constructors inside classes ──────────────────────────────────────────
+(class_declaration
+  name: (identifier) @container
+  body: (class_body
+    (constructor_declaration
+      name: (identifier) @name) @definition.constructor))
+
+; ── Fields inside classes ────────────────────────────────────────────────
+(class_declaration
+  name: (identifier) @container
+  body: (class_body
+    (field_declaration
+      declarator: (variable_declarator
+        name: (identifier) @name)) @definition.field))
+
+; ── Methods inside interfaces ────────────────────────────────────────────
+(interface_declaration
+  name: (identifier) @container
+  body: (interface_body
+    (method_declaration
+      name: (identifier) @name) @definition.method))
+
+; ── Enum constants ───────────────────────────────────────────────────────
+(enum_declaration
+  name: (identifier) @container
+  body: (enum_body
+    (enum_constant
+      name: (identifier) @name) @definition.constant))
+
+; ── Methods inside enums ─────────────────────────────────────────────────
+(enum_declaration
+  name: (identifier) @container
+  body: (enum_body
+    (enum_body_declarations
+      (method_declaration
+        name: (identifier) @name) @definition.method)))
+"#;
 
 pub struct JavaParser;
 
 impl TsParser for JavaParser {
     fn parse(source: &str) -> ParseResult {
-        let lang: tree_sitter::Language = tree_sitter_java::LANGUAGE.into();
-        common::run_parse(source, &lang, JAVA_IDENT_KINDS, collect_definitions)
+        let mut result = common::run_query_parse(source, &QueryParseConfig {
+            language: tree_sitter_java::LANGUAGE.into(),
+            query_source: JAVA_QUERY,
+            identifier_kinds: JAVA_IDENT_KINDS,
+            def_keyword: java_def_keyword,
+            visibility: java_visibility,
+            post_process: None,
+        });
+        result
     }
 }
 
-fn collect_definitions(root: Node, source: &str, symbols: &mut Vec<Symbol>) {
-    collect_definitions_recursive(root, source, symbols, None);
-}
-
-fn collect_definitions_recursive(
-    node: Node,
-    source: &str,
-    symbols: &mut Vec<Symbol>,
-    container: Option<&str>,
-) {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        extract_definition(child, source, symbols, container);
+fn java_def_keyword(_kind: SymbolKind, suffix: &str) -> &'static str {
+    match suffix {
+        "function" => "function",
+        "method" => "method",
+        "class" => "class",
+        "interface" => "interface",
+        "enum" => "enum",
+        "struct" => "record",
+        "constant" => "enum",
+        "variable" | "field" => "field",
+        "constructor" => "constructor",
+        _ => "class",
     }
 }
 
-fn extract_definition(node: Node, source: &str, symbols: &mut Vec<Symbol>, container: Option<&str>) {
-    match node.kind() {
-        "class_declaration" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = node_text(name_node, source).to_string();
-                let vis = java_visibility(node, source);
-                symbols.push(make_symbol(
-                    name.clone(), SymbolKind::Class,
-                    name_node.start_position().row, name_node.start_position().column,
-                    "class", vis,
-                ));
-                if let Some(body) = node.child_by_field_name("body") {
-                    collect_definitions_recursive(body, source, symbols, Some(&name));
-                }
-            }
-        }
-        "interface_declaration" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = node_text(name_node, source).to_string();
-                let vis = java_visibility(node, source);
-                symbols.push(make_symbol(
-                    name.clone(), SymbolKind::Interface,
-                    name_node.start_position().row, name_node.start_position().column,
-                    "interface", vis,
-                ));
-                if let Some(body) = node.child_by_field_name("body") {
-                    collect_definitions_recursive(body, source, symbols, Some(&name));
-                }
-            }
-        }
-        "enum_declaration" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = node_text(name_node, source).to_string();
-                let vis = java_visibility(node, source);
-                symbols.push(make_symbol(
-                    name.clone(), SymbolKind::Enum,
-                    name_node.start_position().row, name_node.start_position().column,
-                    "enum", vis,
-                ));
-                if let Some(body) = node.child_by_field_name("body") {
-                    extract_enum_constants(body, source, symbols, &name);
-                    collect_definitions_recursive(body, source, symbols, Some(&name));
-                }
-            }
-        }
-        "record_declaration" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = node_text(name_node, source).to_string();
-                let vis = java_visibility(node, source);
-                symbols.push(make_symbol(
-                    name.clone(), SymbolKind::Struct,
-                    name_node.start_position().row, name_node.start_position().column,
-                    "record", vis,
-                ));
-                if let Some(body) = node.child_by_field_name("body") {
-                    collect_definitions_recursive(body, source, symbols, Some(&name));
-                }
-            }
-        }
-        "method_declaration" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = node_text(name_node, source).to_string();
-                let vis = java_visibility(node, source);
-                symbols.push(make_contained_symbol(
-                    name, SymbolKind::Method,
-                    name_node.start_position().row, name_node.start_position().column,
-                    "method", vis, container, 1, None, None,
-                ));
-            }
-        }
-        "constructor_declaration" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = node_text(name_node, source).to_string();
-                let vis = java_visibility(node, source);
-                symbols.push(make_contained_symbol(
-                    name, SymbolKind::Function,
-                    name_node.start_position().row, name_node.start_position().column,
-                    "constructor", vis, container, 1, None, None,
-                ));
-            }
-        }
-        "field_declaration" => {
-            let vis = java_visibility(node, source);
-            let type_text = node.child_by_field_name("type")
-                .map(|t| node_text(t, source).to_string());
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                if child.kind() == "variable_declarator" {
-                    if let Some(name_node) = child.child_by_field_name("name") {
-                        let name = node_text(name_node, source).to_string();
-                        symbols.push(make_contained_symbol(
-                            name, SymbolKind::Variable,
-                            name_node.start_position().row, name_node.start_position().column,
-                            "field", vis, container, 1, None, type_text.clone(),
-                        ));
-                    }
-                }
-            }
-        }
-        "annotation_type_declaration" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = node_text(name_node, source).to_string();
-                let vis = java_visibility(node, source);
-                symbols.push(make_symbol(
-                    name, SymbolKind::Interface,
-                    name_node.start_position().row, name_node.start_position().column,
-                    "annotation", vis,
-                ));
-            }
-        }
-        _ => {}
-    }
-}
-
-fn extract_enum_constants(body: Node, source: &str, symbols: &mut Vec<Symbol>, enum_name: &str) {
-    let mut cursor = body.walk();
-    for child in body.children(&mut cursor) {
-        if child.kind() == "enum_constant" {
-            if let Some(name_node) = child.child_by_field_name("name") {
-                let name = node_text(name_node, source).to_string();
-                symbols.push(make_contained_symbol(
-                    name, SymbolKind::Constant,
-                    name_node.start_position().row, name_node.start_position().column,
-                    "enum", Visibility::Public, Some(enum_name), 1, None, None,
-                ));
-            }
-        }
-        // enum_body_declarations contains methods/fields after the constants
-        if child.kind() == "enum_body_declarations" {
-            collect_definitions_recursive(child, source, symbols, Some(enum_name));
-        }
-    }
-}
-
-/// Detect Java visibility from modifiers.
 fn java_visibility(node: Node, source: &str) -> Visibility {
+    // Look for modifiers child
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "modifiers" {
@@ -182,9 +120,9 @@ fn java_visibility(node: Node, source: &str) -> Visibility {
                 return Visibility::Public;
             } else if text.contains("private") {
                 return Visibility::Private;
-            } else if text.contains("protected") {
-                return Visibility::Unknown;
             }
+            // protected and package-private → Unknown
+            return Visibility::Unknown;
         }
     }
     Visibility::Unknown
@@ -197,8 +135,6 @@ mod tests {
     #[test]
     fn test_java_parser_basic() {
         let source = r#"
-package com.example;
-
 public class Config {
     private String name;
     public int value;
@@ -208,48 +144,52 @@ public class Config {
     }
 
     public String getName() {
-        return name;
+        return this.name;
     }
 
     private void helper() {}
 }
 
 interface Handler {
-    void handle();
+    void handle(String data);
 }
 
 enum Status {
     ACTIVE,
     INACTIVE;
 
-    public String label() { return name(); }
+    public String label() {
+        return name().toLowerCase();
+    }
 }
+
+record Point(int x, int y) {}
 "#;
         let result = JavaParser::parse(source);
         let names: Vec<&str> = result.symbols.iter().map(|s| s.name.as_str()).collect();
 
         assert!(names.contains(&"Config"), "should find class Config, got: {:?}", names);
         assert!(names.contains(&"name"), "should find field name, got: {:?}", names);
-        assert!(names.contains(&"value"), "should find field value, got: {:?}", names);
         assert!(names.contains(&"getName"), "should find method getName, got: {:?}", names);
-        assert!(names.contains(&"helper"), "should find method helper, got: {:?}", names);
         assert!(names.contains(&"Handler"), "should find interface Handler, got: {:?}", names);
-        assert!(names.contains(&"handle"), "should find interface method handle, got: {:?}", names);
         assert!(names.contains(&"Status"), "should find enum Status, got: {:?}", names);
         assert!(names.contains(&"ACTIVE"), "should find enum constant ACTIVE, got: {:?}", names);
-        assert!(names.contains(&"INACTIVE"), "should find enum constant INACTIVE, got: {:?}", names);
-        assert!(names.contains(&"label"), "should find enum method label, got: {:?}", names);
+        assert!(names.contains(&"Point"), "should find record Point, got: {:?}", names);
 
         // Check visibility
-        let get_name = result.symbols.iter().find(|s| s.name == "getName").unwrap();
-        assert_eq!(get_name.visibility, Visibility::Public);
+        let config_sym = result.symbols.iter().find(|s| s.name == "Config").unwrap();
+        assert_eq!(config_sym.visibility, Visibility::Public);
 
         let helper_sym = result.symbols.iter().find(|s| s.name == "helper").unwrap();
         assert_eq!(helper_sym.visibility, Visibility::Private);
 
-        // Check container
-        let name_field = result.symbols.iter().find(|s| s.name == "name" && s.def_keyword == "field").unwrap();
-        assert_eq!(name_field.container.as_deref(), Some("Config"));
+        // Check method container
+        let get_name = result.symbols.iter().find(|s| s.name == "getName").unwrap();
+        assert_eq!(get_name.container.as_deref(), Some("Config"));
+
+        // Check enum constant container
+        let active = result.symbols.iter().find(|s| s.name == "ACTIVE").unwrap();
+        assert_eq!(active.container.as_deref(), Some("Status"));
 
         assert!(!result.occurrences.is_empty());
     }

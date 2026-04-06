@@ -1,4 +1,4 @@
-//! Tree-sitter based TypeScript parser.
+//! Tree-sitter based TypeScript parser using SCM queries.
 //!
 //! Extends JavaScript parsing with TypeScript-specific constructs:
 //! interfaces, type aliases, enums, and type annotations.
@@ -8,22 +8,134 @@ use tree_sitter::Node;
 use crate::parsing::symbols::{Symbol, SymbolKind};
 use crate::parsing::tokenizer::Visibility;
 
-use super::common::{self, make_contained_symbol, make_symbol, node_text};
+use super::common::{self, node_text, QueryParseConfig};
 use super::{ParseResult, TsParser};
 
-const TS_IDENT_KINDS: &[&str] = &[
-    "identifier",
-    "property_identifier",
-    "shorthand_property_identifier",
-    "type_identifier",
-];
+const TS_IDENT_KINDS: &[&str] = &["identifier", "property_identifier", "type_identifier"];
+
+const TS_QUERY: &str = r#"
+; ── Function declarations ────────────────────────────────────────────────
+(function_declaration
+  name: (identifier) @name) @definition.function
+
+; ── Generator functions ──────────────────────────────────────────────────
+(generator_function_declaration
+  name: (identifier) @name) @definition.function
+
+; ── Class declarations ───────────────────────────────────────────────────
+(class_declaration
+  name: (type_identifier) @name) @definition.class
+
+; ── Methods inside classes ───────────────────────────────────────────────
+(class_declaration
+  name: (type_identifier) @container
+  body: (class_body
+    (method_definition
+      name: (property_identifier) @name) @definition.method))
+
+; ── Class properties ─────────────────────────────────────────────────────
+(class_declaration
+  name: (type_identifier) @container
+  body: (class_body
+    (public_field_definition
+      name: (property_identifier) @name) @definition.field))
+
+; ── Interface declarations ───────────────────────────────────────────────
+(interface_declaration
+  name: (type_identifier) @name) @definition.interface
+
+; ── Interface method signatures ──────────────────────────────────────────
+(interface_declaration
+  name: (type_identifier) @container
+  body: (interface_body
+    (method_signature
+      name: (property_identifier) @name) @definition.method))
+
+; ── Interface property signatures ────────────────────────────────────────
+(interface_declaration
+  name: (type_identifier) @container
+  body: (interface_body
+    (property_signature
+      name: (property_identifier) @name) @definition.field))
+
+; ── Type alias declarations ──────────────────────────────────────────────
+(type_alias_declaration
+  name: (type_identifier) @name) @definition.type
+
+; ── Enum declarations ────────────────────────────────────────────────────
+(enum_declaration
+  name: (identifier) @name) @definition.enum
+
+; ── Enum members ─────────────────────────────────────────────────────────
+(enum_declaration
+  name: (identifier) @container
+  body: (enum_body
+    (property_identifier) @name) @definition.variant)
+
+; ── Variable declarations (const/let/var) ────────────────────────────────
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @name) @definition.variable)
+
+(variable_declaration
+  (variable_declarator
+    name: (identifier) @name) @definition.variable)
+
+; ── Arrow function assigned to variable ──────────────────────────────────
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (arrow_function)) @definition.function)
+
+(variable_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (arrow_function)) @definition.function)
+
+; ── Function expression assigned to variable ─────────────────────────────
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (function_expression)) @definition.function)
+
+; ── Exported function declarations ───────────────────────────────────────
+(export_statement
+  (function_declaration
+    name: (identifier) @name) @definition.function)
+
+; ── Exported class declarations ──────────────────────────────────────────
+(export_statement
+  (class_declaration
+    name: (type_identifier) @name) @definition.class)
+
+; ── Exported interface declarations ──────────────────────────────────────
+(export_statement
+  (interface_declaration
+    name: (type_identifier) @name) @definition.interface)
+
+; ── Exported type alias declarations ─────────────────────────────────────
+(export_statement
+  (type_alias_declaration
+    name: (type_identifier) @name) @definition.type)
+
+; ── Exported enum declarations ───────────────────────────────────────────
+(export_statement
+  (enum_declaration
+    name: (identifier) @name) @definition.enum)
+
+; ── Exported variable declarations ───────────────────────────────────────
+(export_statement
+  (lexical_declaration
+    (variable_declarator
+      name: (identifier) @name) @definition.variable))
+"#;
 
 pub struct TypeScriptParser;
 
 impl TsParser for TypeScriptParser {
     fn parse(source: &str) -> ParseResult {
         let lang: tree_sitter::Language = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
-        common::run_parse(source, &lang, TS_IDENT_KINDS, collect_definitions)
+        parse_ts_common(source, lang)
     }
 }
 
@@ -32,210 +144,76 @@ pub struct TsxParser;
 impl TsParser for TsxParser {
     fn parse(source: &str) -> ParseResult {
         let lang: tree_sitter::Language = tree_sitter_typescript::LANGUAGE_TSX.into();
-        common::run_parse(source, &lang, TS_IDENT_KINDS, collect_definitions)
+        parse_ts_common(source, lang)
     }
 }
 
-fn collect_definitions(root: Node, source: &str, symbols: &mut Vec<Symbol>) {
-    collect_definitions_recursive(root, source, symbols, None, false);
+fn parse_ts_common(source: &str, language: tree_sitter::Language) -> ParseResult {
+    let mut result = common::run_query_parse(source, &QueryParseConfig {
+        language,
+        query_source: TS_QUERY,
+        identifier_kinds: TS_IDENT_KINDS,
+        def_keyword: ts_def_keyword,
+        visibility: |_node: Node, _source: &str| Visibility::Unknown,
+        post_process: Some(ts_post_process),
+    });
+    result
 }
 
-fn collect_definitions_recursive(
-    node: Node,
-    source: &str,
-    symbols: &mut Vec<Symbol>,
-    container: Option<&str>,
-    is_exported: bool,
-) {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        extract_definition(child, source, symbols, container, is_exported);
+fn ts_def_keyword(_kind: SymbolKind, suffix: &str) -> &'static str {
+    match suffix {
+        "function" => "function",
+        "method" => "method",
+        "class" => "class",
+        "interface" => "interface",
+        "type" => "type",
+        "enum" => "enum",
+        "variable" | "field" => "variable",
+        "variant" => "enum",
+        "constant" => "const",
+        _ => "function",
     }
 }
 
-fn extract_definition(
-    node: Node,
-    source: &str,
-    symbols: &mut Vec<Symbol>,
-    container: Option<&str>,
-    is_exported: bool,
-) {
+/// Post-process: detect exports and const vs let/var.
+fn ts_post_process(root: Node, source: &str, symbols: &mut Vec<Symbol>) {
+    walk_for_export_and_const(root, source, symbols);
+}
+
+fn walk_for_export_and_const(node: Node, source: &str, symbols: &mut Vec<Symbol>) {
     match node.kind() {
-        "function_declaration" | "generator_function_declaration" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = node_text(name_node, source).to_string();
-                let vis = if is_exported { Visibility::Public } else { Visibility::Unknown };
-                symbols.push(make_symbol(
-                    name, SymbolKind::Function,
-                    name_node.start_position().row, name_node.start_position().column,
-                    "function", vis,
-                ));
-            }
-        }
-        "class_declaration" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = node_text(name_node, source).to_string();
-                let vis = if is_exported { Visibility::Public } else { Visibility::Unknown };
-                symbols.push(make_symbol(
-                    name.clone(), SymbolKind::Class,
-                    name_node.start_position().row, name_node.start_position().column,
-                    "class", vis,
-                ));
-                if let Some(body) = node.child_by_field_name("body") {
-                    collect_definitions_recursive(body, source, symbols, Some(&name), false);
+        "export_statement" => {
+            let start_line = node.start_position().row;
+            let end_line = node.end_position().row;
+            for sym in symbols.iter_mut() {
+                if sym.line >= start_line && sym.line <= end_line {
+                    sym.visibility = Visibility::Public;
                 }
             }
         }
-        "method_definition" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = node_text(name_node, source).to_string();
-                symbols.push(make_contained_symbol(
-                    name, SymbolKind::Method,
-                    name_node.start_position().row, name_node.start_position().column,
-                    "method", Visibility::Unknown, container, 1, None, None,
-                ));
-            }
-        }
-        "public_field_definition" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = node_text(name_node, source).to_string();
-                symbols.push(make_contained_symbol(
-                    name, SymbolKind::Variable,
-                    name_node.start_position().row, name_node.start_position().column,
-                    "field", Visibility::Unknown, container, 1, None, None,
-                ));
-            }
-        }
-        "interface_declaration" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = node_text(name_node, source).to_string();
-                let vis = if is_exported { Visibility::Public } else { Visibility::Unknown };
-                symbols.push(make_symbol(
-                    name.clone(), SymbolKind::Interface,
-                    name_node.start_position().row, name_node.start_position().column,
-                    "interface", vis,
-                ));
-                // Interface body is interface_body (accessed via "body" field)
-                if let Some(body) = node.child_by_field_name("body") {
-                    extract_interface_members(body, source, symbols, &name);
-                }
-            }
-        }
-        "type_alias_declaration" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = node_text(name_node, source).to_string();
-                let vis = if is_exported { Visibility::Public } else { Visibility::Unknown };
-                symbols.push(make_symbol(
-                    name, SymbolKind::TypeAlias,
-                    name_node.start_position().row, name_node.start_position().column,
-                    "type", vis,
-                ));
-            }
-        }
-        "enum_declaration" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = node_text(name_node, source).to_string();
-                let vis = if is_exported { Visibility::Public } else { Visibility::Unknown };
-                symbols.push(make_symbol(
-                    name.clone(), SymbolKind::Enum,
-                    name_node.start_position().row, name_node.start_position().column,
-                    "enum", vis,
-                ));
-                // Enum body is enum_body (accessed via "body" field)
-                if let Some(body) = node.child_by_field_name("body") {
-                    extract_enum_members(body, source, symbols, &name);
-                }
-            }
-        }
-        "lexical_declaration" | "variable_declaration" => {
-            let kw = if node.kind() == "lexical_declaration" {
-                node.child(0).map(|c| node_text(c, source)).unwrap_or("let")
-            } else {
-                "var"
-            };
+        "lexical_declaration" => {
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
-                if child.kind() == "variable_declarator" {
-                    if let Some(name_node) = child.child_by_field_name("name") {
-                        if name_node.kind() == "identifier" {
-                            let name = node_text(name_node, source).to_string();
-                            let vis = if is_exported { Visibility::Public } else { Visibility::Unknown };
-                            let kind = if kw == "const" { SymbolKind::Constant } else { SymbolKind::Variable };
-                            symbols.push(make_symbol(
-                                name, kind,
-                                name_node.start_position().row, name_node.start_position().column,
-                                kw, vis,
-                            ));
+                if node_text(child, source) == "const" {
+                    let start_line = node.start_position().row;
+                    let end_line = node.end_position().row;
+                    for sym in symbols.iter_mut() {
+                        if sym.line >= start_line && sym.line <= end_line
+                            && sym.kind == SymbolKind::Variable
+                        {
+                            sym.kind = SymbolKind::Constant;
+                            sym.def_keyword = "const".to_string();
                         }
                     }
-                }
-            }
-        }
-        "export_statement" => {
-            if let Some(decl) = node.child_by_field_name("declaration") {
-                extract_definition(decl, source, symbols, container, true);
-            } else {
-                let mut cursor = node.walk();
-                for child in node.children(&mut cursor) {
-                    match child.kind() {
-                        "function_declaration" | "generator_function_declaration"
-                        | "class_declaration" | "lexical_declaration" | "variable_declaration"
-                        | "interface_declaration" | "type_alias_declaration" | "enum_declaration" => {
-                            extract_definition(child, source, symbols, container, true);
-                        }
-                        _ => {}
-                    }
+                    break;
                 }
             }
         }
         _ => {}
     }
-}
-
-fn extract_interface_members(body: Node, source: &str, symbols: &mut Vec<Symbol>, iface_name: &str) {
-    let mut cursor = body.walk();
-    for child in body.children(&mut cursor) {
-        match child.kind() {
-            "method_signature" => {
-                if let Some(name_node) = child.child_by_field_name("name") {
-                    let name = node_text(name_node, source).to_string();
-                    symbols.push(make_contained_symbol(
-                        name, SymbolKind::Method,
-                        name_node.start_position().row, name_node.start_position().column,
-                        "method", Visibility::Unknown, Some(iface_name), 1, None, None,
-                    ));
-                }
-            }
-            "property_signature" => {
-                if let Some(name_node) = child.child_by_field_name("name") {
-                    let name = node_text(name_node, source).to_string();
-                    symbols.push(make_contained_symbol(
-                        name, SymbolKind::Variable,
-                        name_node.start_position().row, name_node.start_position().column,
-                        "field", Visibility::Unknown, Some(iface_name), 1, None, None,
-                    ));
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-fn extract_enum_members(body: Node, source: &str, symbols: &mut Vec<Symbol>, enum_name: &str) {
-    let mut cursor = body.walk();
-    for child in body.children(&mut cursor) {
-        // Enum members: look for property_identifier inside enum_member or directly
-        if child.kind() == "enum_member" || child.kind() == "property_identifier" {
-            let name_node = child.child_by_field_name("name").unwrap_or(child);
-            if name_node.kind() == "property_identifier" || name_node.kind() == "identifier" {
-                let name = node_text(name_node, source).to_string();
-                symbols.push(make_contained_symbol(
-                    name, SymbolKind::Constant,
-                    name_node.start_position().row, name_node.start_position().column,
-                    "enum", Visibility::Unknown, Some(enum_name), 1, None, None,
-                ));
-            }
-        }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk_for_export_and_const(child, source, symbols);
     }
 }
 
@@ -250,57 +228,128 @@ function hello(name: string): string {
     return "Hello, " + name;
 }
 
-interface Handler {
-    handle(req: Request): Response;
-    name: string;
-}
-
-type Result<T> = { ok: true; value: T } | { ok: false; error: Error };
-
-enum Status {
-    Active,
-    Inactive,
-}
-
 const MAX_SIZE: number = 100;
 
-class Config {
+interface Handler {
+    handle(data: string): void;
     name: string;
+}
 
-    constructor(name: string) {
-        this.name = name;
-    }
+class Config {
+    private value: number;
+
+    constructor(public name: string) {}
 
     getName(): string {
         return this.name;
     }
 }
 
-export function exported(): void {}
-export interface PublicApi {
-    fetch(): void;
+type Result<T> = { ok: true; value: T } | { ok: false; error: string };
+
+enum Status {
+    Active,
+    Inactive,
 }
-export type ID = string;
+
+export function exported(): void {}
+
+const handler = (x: number): number => x + 1;
 "#;
         let result = TypeScriptParser::parse(source);
         let names: Vec<&str> = result.symbols.iter().map(|s| s.name.as_str()).collect();
 
         assert!(names.contains(&"hello"), "should find function hello, got: {:?}", names);
-        assert!(names.contains(&"Handler"), "should find interface Handler, got: {:?}", names);
-        assert!(names.contains(&"handle"), "should find interface method handle, got: {:?}", names);
-        assert!(names.contains(&"Result"), "should find type alias Result, got: {:?}", names);
-        assert!(names.contains(&"Status"), "should find enum Status, got: {:?}", names);
         assert!(names.contains(&"MAX_SIZE"), "should find const MAX_SIZE, got: {:?}", names);
+        assert!(names.contains(&"Handler"), "should find interface Handler, got: {:?}", names);
         assert!(names.contains(&"Config"), "should find class Config, got: {:?}", names);
         assert!(names.contains(&"getName"), "should find method getName, got: {:?}", names);
+        assert!(names.contains(&"Result"), "should find type alias Result, got: {:?}", names);
+        assert!(names.contains(&"Status"), "should find enum Status, got: {:?}", names);
         assert!(names.contains(&"exported"), "should find exported function, got: {:?}", names);
-        assert!(names.contains(&"PublicApi"), "should find exported interface, got: {:?}", names);
-        assert!(names.contains(&"ID"), "should find exported type alias, got: {:?}", names);
+        assert!(names.contains(&"handler"), "should find arrow function handler, got: {:?}", names);
 
-        // Check visibility
+        // Check exported visibility
         let exported_sym = result.symbols.iter().find(|s| s.name == "exported").unwrap();
         assert_eq!(exported_sym.visibility, Visibility::Public);
 
+        // Check interface method container
+        let handle_sym = result.symbols.iter().find(|s| s.name == "handle").unwrap();
+        assert_eq!(handle_sym.container.as_deref(), Some("Handler"));
+
         assert!(!result.occurrences.is_empty());
+    }
+
+    #[test]
+    fn test_typescript_parser_fixture() {
+        let source = include_str!("../../../tests/fixtures/sample_typescript.ts");
+        let result = TypeScriptParser::parse(source);
+        let names: Vec<&str> = result.symbols.iter().map(|s| s.name.as_str()).collect();
+
+        // Constants
+        assert!(names.contains(&"MAX_RETRIES"), "got: {:?}", names);
+        assert!(names.contains(&"DEFAULT_TIMEOUT"));
+
+        // Interfaces
+        assert!(names.contains(&"Config"));
+        assert!(names.contains(&"Handler"));
+
+        // Type aliases
+        assert!(names.contains(&"StatusCode"));
+        assert!(names.contains(&"HandlerResult"));
+
+        // Classes
+        assert!(names.contains(&"Request"));
+        assert!(names.contains(&"Response"));
+        assert!(names.contains(&"Server"));
+
+        // Functions
+        assert!(names.contains(&"createConfig"));
+        assert!(names.contains(&"processRequest"));
+        assert!(names.contains(&"validateRequest"));
+
+        // Enum
+        assert!(names.contains(&"Status"));
+
+        // Class methods with containers
+        let add_handler = result.symbols.iter().find(|s| s.name == "addHandler");
+        assert!(add_handler.is_some(), "should find Server.addHandler");
+        if let Some(s) = add_handler {
+            assert_eq!(s.container.as_deref(), Some("Server"));
+        }
+
+        // Variables
+        assert!(names.contains(&"globalCounter"));
+    }
+
+    #[test]
+    fn test_tsx_parser_basic() {
+        let source = r#"
+interface Props {
+    name: string;
+    onClick: () => void;
+}
+
+function Greeting(props: Props) {
+    return props.name;
+}
+
+const App = () => {
+    return "hello";
+};
+
+export default App;
+"#;
+        let result = TsxParser::parse(source);
+        let names: Vec<&str> = result.symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"Props"), "should find interface Props, got: {:?}", names);
+        assert!(names.contains(&"Greeting"), "should find function Greeting, got: {:?}", names);
+        assert!(names.contains(&"App"), "should find const App, got: {:?}", names);
+    }
+
+    #[test]
+    fn test_typescript_empty_file() {
+        let result = TypeScriptParser::parse("");
+        assert!(result.symbols.is_empty());
     }
 }

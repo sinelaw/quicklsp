@@ -3,8 +3,13 @@
 //! Provides common utilities for symbol construction, occurrence collection,
 //! and AST walking so that per-language parsers only need to define their
 //! language-specific definition extraction logic.
+//!
+//! The **query engine** (`run_query_parse`) uses tree-sitter SCM queries to
+//! declaratively match AST patterns and extract symbols. Per-language parsers
+//! provide a `QueryParseConfig` with the SCM source, identifier kinds, and
+//! optional callbacks for visibility detection and post-processing.
 
-use tree_sitter::{Node, Parser, Tree};
+use tree_sitter::{Node, Parser, Query, QueryCursor, StreamingIterator, Tree};
 
 use crate::parsing::symbols::{Symbol, SymbolKind};
 use crate::parsing::tokenizer::{Occurrence, OccurrenceRole, Visibility};
@@ -170,6 +175,211 @@ where
     let occurrences = collect_occurrences(tree.root_node(), source, &symbols, identifier_kinds);
 
     ParseResult { symbols, occurrences }
+}
+
+// ── Query-based parsing engine ──────────────────────────────────────────
+
+/// Configuration for query-based parsing.
+pub struct QueryParseConfig {
+    /// Tree-sitter language grammar.
+    pub language: tree_sitter::Language,
+    /// SCM query source with `@name` and `@definition.*` captures.
+    /// Optional: `@container` for parent type/class name.
+    pub query_source: &'static str,
+    /// Node kinds that count as identifiers for occurrence collection.
+    pub identifier_kinds: &'static [&'static str],
+    /// Map SymbolKind to def_keyword string for this language.
+    pub def_keyword: fn(SymbolKind, &str) -> &'static str,
+    /// Detect visibility from a definition node.
+    pub visibility: fn(Node, &str) -> Visibility,
+    /// Optional post-processing on collected symbols (e.g. for local variables).
+    /// Receives the parsed tree root, source, and the symbols vec.
+    pub post_process: Option<fn(Node, &str, &mut Vec<Symbol>)>,
+}
+
+/// Map a capture name suffix (after "definition.") to a SymbolKind.
+fn capture_to_kind(capture_name: &str) -> Option<SymbolKind> {
+    let suffix = capture_name.strip_prefix("definition.")?;
+    match suffix {
+        "function" => Some(SymbolKind::Function),
+        "method" => Some(SymbolKind::Method),
+        "class" => Some(SymbolKind::Class),
+        "struct" => Some(SymbolKind::Struct),
+        "enum" => Some(SymbolKind::Enum),
+        "interface" => Some(SymbolKind::Interface),
+        "trait" => Some(SymbolKind::Trait),
+        "type" => Some(SymbolKind::TypeAlias),
+        "constant" => Some(SymbolKind::Constant),
+        "variable" => Some(SymbolKind::Variable),
+        "module" => Some(SymbolKind::Module),
+        "macro" => Some(SymbolKind::Function),
+        "field" => Some(SymbolKind::Variable),
+        "variant" => Some(SymbolKind::Constant),
+        "constructor" => Some(SymbolKind::Function),
+        _ => None,
+    }
+}
+
+/// Default def_keyword: use the capture suffix directly.
+pub fn default_def_keyword(kind: SymbolKind, capture_suffix: &str) -> &'static str {
+    // Use the capture suffix as a hint, falling back to kind name
+    match capture_suffix {
+        "function" => "fn",
+        "method" => "method",
+        "class" => "class",
+        "struct" => "struct",
+        "enum" => "enum",
+        "interface" => "interface",
+        "trait" => "trait",
+        "type" => "type",
+        "constant" | "variant" => "const",
+        "variable" | "field" => "variable",
+        "module" => "mod",
+        "macro" => "macro",
+        "constructor" => "constructor",
+        _ => match kind {
+            SymbolKind::Function => "fn",
+            SymbolKind::Method => "method",
+            SymbolKind::Class => "class",
+            SymbolKind::Struct => "struct",
+            SymbolKind::Enum => "enum",
+            SymbolKind::Interface => "interface",
+            SymbolKind::Trait => "trait",
+            SymbolKind::TypeAlias => "type",
+            SymbolKind::Constant => "const",
+            SymbolKind::Variable => "variable",
+            SymbolKind::Module => "mod",
+            SymbolKind::Unknown => "unknown",
+        },
+    }
+}
+
+/// Default visibility: Unknown.
+pub fn default_visibility(_node: Node, _source: &str) -> Visibility {
+    Visibility::Unknown
+}
+
+/// Full query-based parse pipeline:
+/// 1. Parse source with tree-sitter
+/// 2. Run SCM query to extract definitions
+/// 3. Map captures to Symbol objects
+/// 4. Run optional post-processing
+/// 5. Collect all identifier occurrences
+pub fn run_query_parse(source: &str, config: &QueryParseConfig) -> ParseResult {
+    let tree = match parse_source(source, &config.language) {
+        Some(t) => t,
+        None => return ParseResult { symbols: Vec::new(), occurrences: Vec::new() },
+    };
+
+    let query = match Query::new(&config.language, config.query_source) {
+        Ok(q) => q,
+        Err(e) => {
+            tracing::error!("Failed to compile tree-sitter query: {e:?}");
+            return ParseResult { symbols: Vec::new(), occurrences: Vec::new() };
+        }
+    };
+
+    // Resolve capture indices
+    let name_idx = query.capture_index_for_name("name");
+    let container_idx = query.capture_index_for_name("container");
+
+    // Find all definition capture indices
+    let capture_names = query.capture_names();
+    let def_captures: Vec<(u32, SymbolKind, &str)> = capture_names
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &name)| {
+            let suffix = name.strip_prefix("definition.")?;
+            let kind = capture_to_kind(name)?;
+            Some((i as u32, kind, suffix))
+        })
+        .collect();
+
+    let mut symbols = Vec::new();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
+
+    while let Some(m) = matches.next() {
+        // Find the @name capture
+        let name_capture = name_idx.and_then(|idx| {
+            m.captures.iter().find(|c| c.index == idx)
+        });
+
+        // Find the @definition.* capture
+        let def_capture = m.captures.iter().find_map(|c| {
+            def_captures.iter().find(|(idx, _, _)| *idx == c.index)
+                .map(|(_, kind, suffix)| (c, *kind, *suffix))
+        });
+
+        // Find the @container capture
+        let container_capture = container_idx.and_then(|idx| {
+            m.captures.iter().find(|c| c.index == idx)
+        });
+
+        if let (Some(name_cap), Some((def_cap, kind, suffix))) = (name_capture, def_capture) {
+            let name = node_text(name_cap.node, source).to_string();
+            let line = name_cap.node.start_position().row;
+            let col = name_cap.node.start_position().column;
+            let def_keyword = (config.def_keyword)(kind, suffix);
+            let visibility = (config.visibility)(def_cap.node, source);
+
+            let container = container_capture
+                .map(|c| node_text(c.node, source).to_string());
+
+            let has_container = container.is_some();
+            symbols.push(Symbol {
+                name,
+                kind,
+                line,
+                col,
+                def_keyword: def_keyword.to_string(),
+                doc_comment: None,
+                signature: None,
+                visibility,
+                container,
+                depth: if has_container { 1 } else { 0 },
+                scope_end_line: None,
+            });
+        }
+    }
+
+    // Deduplicate: when the same name node is matched by multiple patterns,
+    // keep the one with a container (more specific) over the one without.
+    deduplicate_symbols(&mut symbols);
+
+    // Run optional post-processing (e.g. local variable extraction)
+    if let Some(post) = config.post_process {
+        post(tree.root_node(), source, &mut symbols);
+    }
+
+    let occurrences = collect_occurrences(
+        tree.root_node(),
+        source,
+        &symbols,
+        config.identifier_kinds,
+    );
+
+    ParseResult { symbols, occurrences }
+}
+
+/// Remove duplicate symbols at the same position, preferring the one with
+/// a container (more specific match from a nested pattern) over one without.
+fn deduplicate_symbols(symbols: &mut Vec<Symbol>) {
+    // Sort by (line, col) so duplicates are adjacent
+    symbols.sort_by(|a, b| a.line.cmp(&b.line).then(a.col.cmp(&b.col)));
+    let mut i = 0;
+    while i + 1 < symbols.len() {
+        if symbols[i].line == symbols[i + 1].line && symbols[i].col == symbols[i + 1].col {
+            // Same position — keep the one with a container (more specific)
+            if symbols[i].container.is_some() && symbols[i + 1].container.is_none() {
+                symbols.remove(i + 1);
+            } else {
+                symbols.remove(i);
+            }
+        } else {
+            i += 1;
+        }
+    }
 }
 
 // ── AST walking helpers ─────────────────────────────────────────────────
