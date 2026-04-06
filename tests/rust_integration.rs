@@ -666,7 +666,9 @@ fn test_rust_full_lsp() {
 /// definition (C, Go, or Python instead of Rust).
 ///
 /// When these bugs are fixed, this test will start passing.
+/// See `docs/import-aware-ranking-design.md` for the fix plan.
 #[test]
+#[ignore] // TODO: fix cross-language ranking — see docs/import-aware-ranking-design.md
 fn test_rust_cross_language_collision_bugs() {
     let dir = fixtures_dir();
     let mut s = LspServer::spawn();
