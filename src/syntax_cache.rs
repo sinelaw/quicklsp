@@ -76,7 +76,7 @@ impl SyntaxCache {
     /// Called on `didOpen` and `didChange`. If the language has no tree-sitter
     /// grammar, this is a no-op and queries will return `None`.
     pub fn update(&self, path: &Path, source: &str, lang: Option<LangFamily>) {
-        let tree = match Self::parse_for_lang(source, lang) {
+        let tree = match Self::parse_for_lang(source, lang, path) {
             Some(t) => t,
             None => {
                 // No grammar for this language — remove stale tree if any
@@ -190,18 +190,16 @@ impl SyntaxCache {
 
     /// Parse source with the appropriate tree-sitter grammar.
     ///
-    /// Returns `None` if the language has no tree-sitter grammar.
-    /// To add a new language: add a match arm here and the tree-sitter
-    /// crate dependency.
-    fn parse_for_lang(source: &str, lang: Option<LangFamily>) -> Option<Tree> {
-        let language = match lang {
-            Some(LangFamily::CLike) => tree_sitter_c::LANGUAGE.into(),
-            // Future: add more languages here
-            // Some(LangFamily::Rust) => tree_sitter_rust::LANGUAGE.into(),
-            // Some(LangFamily::Go) => tree_sitter_go::LANGUAGE.into(),
-            _ => return None,
-        };
-
+    /// Tries extension-based lookup first (more precise: distinguishes C vs C++,
+    /// TS vs JS), then falls back to language family.
+    fn parse_for_lang(source: &str, lang: Option<LangFamily>, path: &Path) -> Option<Tree> {
+        let language = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .and_then(crate::parsing::tree_sitter_parse::language_for_extension)
+            .or_else(|| {
+                lang.and_then(crate::parsing::tree_sitter_parse::language_for_family)
+            })?;
         let mut parser = Parser::new();
         parser.set_language(&language).ok()?;
         parser.parse(source, None)

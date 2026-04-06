@@ -24,7 +24,7 @@ use tower_lsp::lsp_types::Url;
 use crate::fuzzy::deletion_neighborhood::DeletionIndex;
 use crate::parsing::symbols::Symbol;
 use crate::parsing::tokenizer::{self, LangFamily};
-use crate::parsing::tree_sitter_parse::{self, TsParser};
+use crate::parsing::tree_sitter_parse;
 use crate::word_index::{
     IndexMeta, LogIndex, LogWriter, word_hash,
     collect_file_mtimes, index_dir_for_project,
@@ -185,21 +185,22 @@ impl Workspace {
             .and_then(|e| e.to_str())
             .and_then(LangFamily::from_extension);
 
-        let (symbols, occurrences) = match lang {
-            Some(LangFamily::CLike) => {
-                let result = tree_sitter_parse::c::CParser::parse(source);
-                let mut symbols = result.symbols;
-                Symbol::enrich_from_source(&mut symbols, source, LangFamily::CLike);
-                (symbols, result.occurrences)
-            }
-            Some(l) => {
-                let (scan_result, def_contexts) = tokenizer::scan_with_contexts(source, l);
-                let mut symbols =
-                    Symbol::from_tokens_with_contexts(&scan_result.tokens, &def_contexts);
+        let (symbols, occurrences) = if let Some(result) = tree_sitter_parse::try_parse(path, source) {
+            // Tree-sitter grammar available — use AST-based parsing
+            let mut symbols = result.symbols;
+            if let Some(l) = lang {
                 Symbol::enrich_from_source(&mut symbols, source, l);
-                (symbols, scan_result.occurrences)
             }
-            None => (Vec::new(), Vec::new()),
+            (symbols, result.occurrences)
+        } else if let Some(l) = lang {
+            // No tree-sitter grammar — fall back to hand-written tokenizer
+            let (scan_result, def_contexts) = tokenizer::scan_with_contexts(source, l);
+            let mut symbols =
+                Symbol::from_tokens_with_contexts(&scan_result.tokens, &def_contexts);
+            Symbol::enrich_from_source(&mut symbols, source, l);
+            (symbols, scan_result.occurrences)
+        } else {
+            (Vec::new(), Vec::new())
         };
 
         let mut hashes: Vec<u32> = occurrences.iter()
