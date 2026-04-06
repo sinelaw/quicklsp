@@ -127,7 +127,9 @@ impl Symbol {
             if sym.depth == 0 {
                 sym.doc_comment = extract_doc_comment(&lines, sym.line, lang);
             }
-            sym.signature = extract_signature(&lines, sym.line, sym.col, lang);
+            if sym.signature.is_none() {
+                sym.signature = extract_signature(&lines, sym.line, sym.col, lang);
+            }
         }
     }
 }

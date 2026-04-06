@@ -94,6 +94,29 @@ pub fn make_contained_symbol(
     }
 }
 
+/// Extract a signature from a tree-sitter definition node whose name
+/// appears on a later line (e.g. multi-line typedef structs/enums).
+///
+/// Composes the signature from the opening line + the symbol name:
+///   `typedef struct { ... } Buffer;` → `typedef struct Buffer`
+///   `typedef enum { ... } LogLevel;` → `typedef enum LogLevel`
+fn signature_from_node(node: Node, name: &str, source: &str) -> Option<String> {
+    let start = node.start_byte();
+    let end = node.end_byte().min(source.len());
+    let text = &source[start..end];
+    let first_line = text.lines().next()?.trim();
+    // Get the part before `{` (e.g. "typedef struct")
+    let prefix = first_line
+        .split('{')
+        .next()
+        .unwrap_or(first_line)
+        .trim();
+    if prefix.is_empty() {
+        return Some(name.to_string());
+    }
+    Some(format!("{prefix} {name}"))
+}
+
 // ── Occurrence collection ───────────────────────────────────────────────
 
 /// Walk the entire AST and collect all identifier occurrences.
@@ -346,6 +369,17 @@ pub fn run_query_parse(source: &str, config: &QueryParseConfig) -> ParseResult {
             let def_keyword = (config.def_keyword)(kind, suffix);
             let visibility = (config.visibility)(def_cap.node, source);
 
+            // When the name appears on a different line than the definition
+            // start (e.g. `typedef struct { ... } Buffer;` where the name is
+            // on the closing line), extract the signature from the definition
+            // node to avoid showing `} Buffer`.
+            let def_start_line = def_cap.node.start_position().row;
+            let signature = if def_start_line < line {
+                signature_from_node(def_cap.node, &name, source)
+            } else {
+                None
+            };
+
             let container = container_capture.map(|c| node_text(c.node, source).to_string());
 
             let has_container = container.is_some();
@@ -356,7 +390,7 @@ pub fn run_query_parse(source: &str, config: &QueryParseConfig) -> ParseResult {
                 col,
                 def_keyword: def_keyword.to_string(),
                 doc_comment: None,
-                signature: None,
+                signature,
                 visibility,
                 container,
                 depth: if has_container { 1 } else { 0 },
