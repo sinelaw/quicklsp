@@ -705,6 +705,48 @@ impl Workspace {
             .unwrap_or_default()
     }
 
+    /// Find the best-scoped local definition for a name at a given cursor position.
+    ///
+    /// When multiple locals share the same name (e.g., shadowed variables in nested
+    /// blocks), picks the **nearest definition that precedes the cursor**, preferring
+    /// deeper scopes (inner blocks shadow outer ones).
+    ///
+    /// For example, with cursor on line 5:
+    /// ```c
+    /// void foo(void) {
+    ///     int x = 1;        // line 2, depth 1 — candidate
+    ///     if (cond) {
+    ///         int x = 2;    // line 4, depth 2 — better candidate (deeper, still before cursor)
+    ///         use(x);       // line 5 — cursor here → picks line 4
+    ///     }
+    /// }
+    /// ```
+    pub fn find_local_definition_at(
+        &self,
+        name: &str,
+        file: &Path,
+        cursor_line: usize,
+    ) -> Option<SymbolLocation> {
+        self.files.get(file).and_then(|entry| {
+            entry.symbols.iter()
+                .filter(|s| {
+                    s.depth > 0
+                        && s.name == name
+                        && s.line <= cursor_line
+                        // If scope_end_line is set, the cursor must be within scope
+                        && s.scope_end_line.map_or(true, |end| cursor_line <= end)
+                })
+                .max_by_key(|s| {
+                    // Prefer: (1) deeper scope, (2) closer to cursor line
+                    (s.depth, s.line)
+                })
+                .map(|s| SymbolLocation {
+                    file: file.to_path_buf(),
+                    symbol: s.clone(),
+                })
+        })
+    }
+
     /// Rank definitions so the most contextually relevant one comes first.
     ///
     /// Scoring heuristic (higher = better):
@@ -1546,6 +1588,7 @@ fn read_symbol(r: &mut impl IoRead) -> std::io::Result<Symbol> {
         visibility,
         container,
         depth,
+        scope_end_line: None,
     })
 }
 

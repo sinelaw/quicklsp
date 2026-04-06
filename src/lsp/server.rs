@@ -495,10 +495,15 @@ impl LanguageServer for QuickLspServer {
         if defs.is_empty() {
             defs = self.dep_index.find_definitions(&symbol);
         }
-        // Fall back to file-local definitions (locals, params, struct fields)
+        // Fall back to file-local definitions (locals, params, struct fields),
+        // using scope-aware lookup to handle shadowed variables correctly.
         if defs.is_empty() {
             if let Some(ref path) = current_file {
-                defs = self.workspace.find_local_definitions(&symbol, path);
+                if let Some(local) = self.workspace.find_local_definition_at(
+                    &symbol, path, pos.line as usize,
+                ) {
+                    defs.push(local);
+                }
             }
         }
         self.workspace
@@ -678,10 +683,15 @@ impl LanguageServer for QuickLspServer {
         if defs.is_empty() {
             defs = self.dep_index.find_definitions(&symbol);
         }
-        // Fall back to file-local definitions (locals, params, struct fields)
+        // Fall back to file-local definitions (locals, params, struct fields),
+        // using scope-aware lookup to handle shadowed variables correctly.
         if defs.is_empty() {
             if let Some(ref path) = current_file {
-                defs = self.workspace.find_local_definitions(&symbol, path);
+                if let Some(local) = self.workspace.find_local_definition_at(
+                    &symbol, path, pos.line as usize,
+                ) {
+                    defs.push(local);
+                }
             }
         }
         self.workspace

@@ -1155,3 +1155,67 @@ void caller(void) {
         refs.len()
     );
 }
+
+/// Scope-aware local variable resolution: when the same name is declared in
+/// nested blocks (shadowing), find_local_definition_at should pick the
+/// innermost declaration that precedes the cursor.
+#[test]
+fn local_variable_scope_shadowing() {
+    let ws = Workspace::new();
+    let source = r#"void foo(void) {
+    int x = 1;
+    if (1) {
+        int x = 2;
+        x;
+    }
+    x;
+}
+"#;
+    let path = PathBuf::from("/src/shadow.c");
+    ws.index_file(path.clone(), source.to_string());
+
+    // Both 'x' declarations should exist as locals
+    let all_x = ws.find_local_definitions("x", &path);
+    assert_eq!(all_x.len(), 2, "Should find 2 declarations of 'x', got {}", all_x.len());
+
+    // Cursor on line 4 (inside if block, after inner `int x = 2;` on line 3):
+    // should resolve to the inner x (line 3, depth 2)
+    let inner = ws.find_local_definition_at("x", &path, 4);
+    assert!(inner.is_some(), "Should find inner x at cursor line 4");
+    let inner = inner.unwrap();
+    assert_eq!(inner.symbol.line, 3, "Should pick inner x on line 3, got line {}", inner.symbol.line);
+
+    // Cursor on line 6 (after the if block closed):
+    // should resolve to the outer x (line 1, depth 1)
+    let outer = ws.find_local_definition_at("x", &path, 6);
+    assert!(outer.is_some(), "Should find outer x at cursor line 6");
+    let outer = outer.unwrap();
+    assert_eq!(outer.symbol.line, 1, "Should pick outer x on line 1, got line {}", outer.symbol.line);
+}
+
+/// Scope-aware resolution for for-loop variables.
+#[test]
+fn local_variable_scope_for_loop() {
+    let ws = Workspace::new();
+    let source = r#"void bar(void) {
+    for (int i = 0; i < 10; i++) {
+        i;
+    }
+    for (int i = 0; i < 5; i++) {
+        i;
+    }
+}
+"#;
+    let path = PathBuf::from("/src/forloop.c");
+    ws.index_file(path.clone(), source.to_string());
+
+    // Cursor on line 2 (inside first for loop): should find the first i (line 1)
+    let first = ws.find_local_definition_at("i", &path, 2);
+    assert!(first.is_some(), "Should find i at cursor line 2");
+    assert_eq!(first.unwrap().symbol.line, 1, "Should pick first loop's i on line 1");
+
+    // Cursor on line 5 (inside second for loop): should find the second i (line 4)
+    let second = ws.find_local_definition_at("i", &path, 5);
+    assert!(second.is_some(), "Should find i at cursor line 5");
+    assert_eq!(second.unwrap().symbol.line, 4, "Should pick second loop's i on line 4");
+}

@@ -22,6 +22,11 @@ pub struct Symbol {
     pub container: Option<String>,
     /// Brace/indentation depth of the definition.
     pub depth: usize,
+    /// End line of the enclosing scope (for local variables).
+    /// Used for scope-aware resolution: a local declared at line N with
+    /// scope_end_line M is only visible for cursor positions in [N, M].
+    /// None means the scope extends to end-of-file (or is not tracked).
+    pub scope_end_line: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -96,6 +101,7 @@ impl Symbol {
                     visibility: ctx.map(|c| c.visibility).unwrap_or(Visibility::Unknown),
                     container: ctx.and_then(|c| c.container.clone()),
                     depth: ctx.map(|c| c.depth).unwrap_or(0),
+                    scope_end_line: None,
                 });
                 ctx_idx += 1;
                 i += 2;
