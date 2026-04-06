@@ -87,6 +87,10 @@ pub struct Workspace {
     /// Populated by did_open, updated by did_change, removed by did_close.
     open_sources: DashMap<PathBuf, String>,
 
+    /// Cached tree-sitter parse trees for editor-open files.
+    /// Enables accurate AST node queries at cursor positions.
+    syntax_cache: crate::syntax_cache::SyntaxCache,
+
     /// Reverse index: symbol name → list of (file_id, symbol_index) refs.
     /// This is the primary lookup structure for go-to-definition.
     /// Refs are resolved on demand via `files` to avoid duplicating Symbol data.
@@ -114,6 +118,7 @@ impl Workspace {
         Self {
             files: DashMap::new(),
             open_sources: DashMap::new(),
+            syntax_cache: crate::syntax_cache::SyntaxCache::new(),
             definitions: DashMap::new(),
             file_ids: DashMap::new(),
             id_to_path: std::sync::RwLock::new(Vec::new()),
@@ -162,6 +167,10 @@ impl Workspace {
 
     /// Index a file from the editor: tokenize, extract symbols, store source text.
     pub fn index_file(&self, path: PathBuf, source: String) {
+        let lang = path.extension()
+            .and_then(|e| e.to_str())
+            .and_then(LangFamily::from_extension);
+        self.syntax_cache.update(&path, &source, lang);
         self.open_sources.insert(path.clone(), source.clone());
         self.index_file_core(path, &source, true);
     }
@@ -650,6 +659,14 @@ impl Workspace {
         self.remove_definitions_for_file(path);
         self.files.remove(path);
         self.open_sources.remove(path);
+        self.syntax_cache.remove(path);
+    }
+
+    /// Close an editor-open file: remove source text and cached parse tree,
+    /// but keep the indexed symbols (they're still valid from the last save).
+    pub fn close_file(&self, path: &Path) {
+        self.open_sources.remove(path);
+        self.syntax_cache.remove(path);
     }
 
     /// Remove all definition entries for a given file from the reverse index.
@@ -918,6 +935,11 @@ impl Workspace {
     pub fn file_source_from_uri(&self, uri: &Url) -> Option<String> {
         let path = uri.to_file_path().ok()?;
         self.file_source(&path)
+    }
+
+    /// Access the syntax cache for AST node queries.
+    pub fn syntax_cache(&self) -> &crate::syntax_cache::SyntaxCache {
+        &self.syntax_cache
     }
 
     /// Search for symbols by name, with fuzzy/typo tolerance.

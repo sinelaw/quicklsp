@@ -7,6 +7,7 @@ pub mod deps;
 pub mod fuzzy;
 pub mod lsp;
 pub mod parsing;
+pub mod syntax_cache;
 pub mod word_index;
 pub mod workspace;
 
