@@ -26,7 +26,8 @@ use crate::parsing::symbols::Symbol;
 use crate::parsing::tokenizer::{self, LangFamily};
 use crate::parsing::tree_sitter_parse;
 use crate::word_index::{
-    collect_file_mtimes, index_dir_for_project, word_hash, IndexMeta, LogIndex, LogWriter,
+    collect_file_mtimes, index_dir_for_project, word_hash, FileData, IndexMeta, LogIndex,
+    LogWriter,
 };
 
 /// A symbol definition with its file location.
@@ -322,7 +323,23 @@ impl Workspace {
         self.fuzzy_dirty
             .store(true, std::sync::atomic::Ordering::Release);
 
-        let changed = changed_files(&meta, file_mtimes);
+        let mut changed = changed_files(&meta, file_mtimes);
+
+        // Detect files that are in file_mtimes (on disk) but missing from
+        // the log index — this happens when a previous cold scan raced with
+        // didOpen and the file was skipped from the log writer.
+        if changed.is_empty() && index.file_count() < file_mtimes.len() {
+            for (path, _) in file_mtimes {
+                let path_str = path.to_string_lossy();
+                if !index.path_lookup.contains_key(path_str.as_ref()) {
+                    tracing::info!(
+                        "Warm startup: file missing from log index: {}",
+                        path.display()
+                    );
+                    changed.push(path.clone());
+                }
+            }
+        }
 
         if changed.is_empty() {
             tracing::info!(
@@ -376,6 +393,54 @@ impl Workspace {
                     symbols: fd.symbols,
                     lang: fd.lang,
                 },
+            );
+        }
+    }
+
+    /// Merge files that were opened via didOpen (and thus skipped by
+    /// `collect_paths`) into the in-memory `LogIndex` so that
+    /// `find_references` covers all workspace files.
+    fn merge_skipped_files_into_index(&self, index: &mut LogIndex) {
+        for entry in self.files.iter() {
+            let path = entry.key();
+            let path_str = path.to_string_lossy();
+            if index.path_lookup.contains_key(path_str.as_ref()) {
+                continue; // Already in the log index
+            }
+            // This file was opened via didOpen but skipped by scan.
+            // Compute its word hashes from the editor's source text (or disk).
+            let source = if let Some(src) = self.open_sources.get(path) {
+                src.clone()
+            } else if let Ok(src) = std::fs::read_to_string(path) {
+                src
+            } else {
+                continue;
+            };
+            let (_symbols, word_hashes, _lang) = Self::parse_file(path, &source);
+            if word_hashes.is_empty() {
+                continue;
+            }
+            // Assign a new path_id and insert into the index.
+            let path_id = index.path_table.len() as u32;
+            let owned = path_str.into_owned();
+            index.path_table.push(owned.clone());
+            index.path_lookup.insert(owned, path_id);
+            for &wh in &word_hashes {
+                index.postings.entry(wh).or_default().push(path_id);
+            }
+            // Add to files map so file_count is accurate.
+            index.files.insert(
+                path_id,
+                FileData {
+                    word_hashes,
+                    symbols: Vec::new(),
+                    lang: entry.value().lang,
+                    mtime: 0,
+                },
+            );
+            tracing::debug!(
+                "Merged didOpen file into word index: {}",
+                path.display()
             );
         }
     }
@@ -597,6 +662,12 @@ impl Workspace {
                     }
                     // Populate workspace files/definitions from the log.
                     self.populate_from_log_index(&mut index);
+
+                    // Merge files that were opened via didOpen (and thus skipped
+                    // by collect_paths) into the word index so find_references
+                    // covers all workspace files.
+                    self.merge_skipped_files_into_index(&mut index);
+
                     tracing::info!(
                         "Log index loaded: {} files, {} hashes, {:.1}s, {}",
                         index.file_count(),
@@ -2518,5 +2589,43 @@ mod tests {
 
         let refs = ws.find_references("sole_function");
         assert_eq!(refs.len(), 2, "sole_function: 1 def + 1 call = 2 refs");
+    }
+
+    /// Issue 2: When a file is opened via didOpen (index_file) BEFORE
+    /// scan_directory runs, collect_paths skips it. That file is then
+    /// missing from the word index, so find_references can't find
+    /// cross-file references through that file.
+    #[test]
+    fn did_open_before_scan_still_included_in_word_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.rs");
+        let b = dir.path().join("b.rs");
+        let c = dir.path().join("c.rs");
+        std::fs::write(&a, "fn shared() {}\nfn only_a() {}").unwrap();
+        std::fs::write(&b, "fn caller_b() { shared(); }").unwrap();
+        std::fs::write(&c, "fn caller_c() { shared(); }").unwrap();
+
+        let ws = Workspace::new();
+
+        // Simulate the editor race: didOpen for a.rs arrives before scan.
+        ws.index_file(a, "fn shared() {}\nfn only_a() {}".to_string());
+
+        // scan_directory skips a.rs (already in self.files).
+        ws.scan_directory(dir.path(), None);
+
+        // Definitions for all files should be present.
+        assert_eq!(ws.find_definitions("shared").len(), 1);
+        assert_eq!(ws.find_definitions("caller_b").len(), 1);
+        assert_eq!(ws.find_definitions("caller_c").len(), 1);
+
+        // Critical: find_references for "shared" must include ALL 3 files.
+        // Before the fix, a.rs was missing from the word index because
+        // collect_paths skipped it, so only b.rs and c.rs were found.
+        let refs = ws.find_references("shared");
+        assert!(
+            refs.len() >= 3,
+            "shared should have >= 3 references (def in a + call in b + call in c), got {}",
+            refs.len()
+        );
     }
 }
