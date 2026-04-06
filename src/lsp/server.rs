@@ -14,6 +14,7 @@ use tower_lsp::{Client, LanguageServer};
 
 use crate::deps::DependencyIndex;
 use crate::parsing::symbols::{self, SymbolKind as QuickSymbolKind};
+use crate::syntax_cache::IdentContext;
 use crate::workspace::{SymbolLocation, Workspace};
 
 /// Negotiated position encoding for this session.
@@ -174,68 +175,6 @@ impl QuickLspServer {
         }
         Some(chars[q_start..q_end].iter().collect())
     }
-
-    /// Detect the identifier context at the cursor position.
-    ///
-    /// Returns a hint about what kind of identifier the cursor is on:
-    /// - `IdentKind::Field` if preceded by `->` or `.` (struct member access)
-    /// - `IdentKind::Type` if preceded by `struct`/`enum`/`union`/`typedef`
-    /// - `IdentKind::Plain` otherwise
-    pub fn ident_kind_at_position(content: &str, line_idx: usize, col: usize) -> IdentKind {
-        let line = match content.lines().nth(line_idx) {
-            Some(l) => l,
-            None => return IdentKind::Plain,
-        };
-        let chars: Vec<char> = line.chars().collect();
-        if col > chars.len() {
-            return IdentKind::Plain;
-        }
-
-        // Find start of the current word
-        let mut word_start = col;
-        while word_start > 0 && is_ident_char(chars[word_start - 1]) {
-            word_start -= 1;
-        }
-
-        // Check for `->` or `.` before the word → field access
-        if word_start >= 2 && chars[word_start - 2] == '-' && chars[word_start - 1] == '>' {
-            return IdentKind::Field;
-        }
-        if word_start >= 1 && chars[word_start - 1] == '.' {
-            return IdentKind::Field;
-        }
-
-        // Check for type-introducing keywords before the word
-        // Skip whitespace before the identifier
-        let mut before = word_start;
-        while before > 0 && chars[before - 1] == ' ' {
-            before -= 1;
-        }
-        // Extract the preceding word
-        let kw_end = before;
-        while before > 0 && is_ident_char(chars[before - 1]) {
-            before -= 1;
-        }
-        if before < kw_end {
-            let kw: String = chars[before..kw_end].iter().collect();
-            if matches!(kw.as_str(), "struct" | "enum" | "union" | "typedef") {
-                return IdentKind::Type;
-            }
-        }
-
-        IdentKind::Plain
-    }
-}
-
-/// Hint about what kind of identifier the cursor is on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IdentKind {
-    /// Struct field access (after `->` or `.`)
-    Field,
-    /// Type name (after `struct`, `enum`, `union`, `typedef`)
-    Type,
-    /// No special context
-    Plain,
 }
 
 fn is_ident_char(ch: char) -> bool {
@@ -530,7 +469,11 @@ impl LanguageServer for QuickLspServer {
         }
     }
 
-    async fn did_close(&self, _params: DidCloseTextDocumentParams) {}
+    async fn did_close(&self, params: DidCloseTextDocumentParams) {
+        if let Ok(path) = params.text_document.uri.to_file_path() {
+            self.workspace.close_file(&path);
+        }
+    }
 
     async fn goto_definition(
         &self,
@@ -552,11 +495,15 @@ impl LanguageServer for QuickLspServer {
             None => return Ok(None),
         };
         let qualifier = Self::qualifier_at_position(&source, pos.line as usize, char_col);
-        let ident_kind = Self::ident_kind_at_position(&source, pos.line as usize, char_col);
         let current_file = uri.to_file_path().ok();
+        let ident_ctx = current_file.as_ref().map(|path| {
+            self.workspace.syntax_cache().ident_context_at(
+                path, pos.line as usize, char_col, &source,
+            )
+        }).unwrap_or(IdentContext::Plain);
 
-        let mut defs = match ident_kind {
-            IdentKind::Field => {
+        let mut defs = match ident_ctx {
+            IdentContext::FieldAccess => {
                 // For field access (ctx->field, obj.field), look for struct field
                 // definitions first, then fall back to global definitions.
                 let mut field_defs = Vec::new();
@@ -567,18 +514,17 @@ impl LanguageServer for QuickLspServer {
                         .collect();
                 }
                 if field_defs.is_empty() {
-                    // Fall back to global (e.g., field name is also a global symbol)
                     self.workspace.find_definitions(&symbol)
                 } else {
                     field_defs
                 }
             }
-            IdentKind::Type => {
+            IdentContext::TypeRef => {
                 // For type positions (struct Foo, enum Bar), only look at global
                 // type definitions — skip locals.
                 self.workspace.find_definitions(&symbol)
             }
-            IdentKind::Plain => {
+            IdentContext::FunctionCall | IdentContext::Plain => {
                 let mut d = self.workspace.find_definitions(&symbol);
                 if d.is_empty() {
                     d = self.dep_index.find_definitions(&symbol);
@@ -770,11 +716,15 @@ impl LanguageServer for QuickLspServer {
 
         // Find definitions and rank them by context (qualifier + same-file + ident kind)
         let qualifier = Self::qualifier_at_position(&source, pos.line as usize, char_col);
-        let ident_kind = Self::ident_kind_at_position(&source, pos.line as usize, char_col);
         let current_file = uri.to_file_path().ok();
+        let ident_ctx = current_file.as_ref().map(|path| {
+            self.workspace.syntax_cache().ident_context_at(
+                path, pos.line as usize, char_col, &source,
+            )
+        }).unwrap_or(IdentContext::Plain);
 
-        let mut defs = match ident_kind {
-            IdentKind::Field => {
+        let mut defs = match ident_ctx {
+            IdentContext::FieldAccess => {
                 let mut field_defs = Vec::new();
                 if let Some(ref path) = current_file {
                     field_defs = self.workspace.find_local_definitions(&symbol, path)
@@ -788,10 +738,10 @@ impl LanguageServer for QuickLspServer {
                     field_defs
                 }
             }
-            IdentKind::Type => {
+            IdentContext::TypeRef => {
                 self.workspace.find_definitions(&symbol)
             }
-            IdentKind::Plain => {
+            IdentContext::FunctionCall | IdentContext::Plain => {
                 let mut d = self.workspace.find_definitions(&symbol);
                 if d.is_empty() {
                     d = self.dep_index.find_definitions(&symbol);
