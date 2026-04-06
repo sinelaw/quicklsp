@@ -133,6 +133,42 @@ fn extract_definition(node: Node, source: &str, symbols: &mut Vec<Symbol>) {
                     Visibility::Unknown,
                 ));
             }
+            // For `typedef enum { ... } Name` or `typedef struct { ... } Name`,
+            // also extract the inner definitions (enum values, struct fields).
+            if let Some(type_node) = node.child_by_field_name("type") {
+                match type_node.kind() {
+                    "enum_specifier" => {
+                        // Extract enumerators from the anonymous enum
+                        if let Some(body) = type_node.child_by_field_name("body") {
+                            let mut body_cursor = body.walk();
+                            for child in body.children(&mut body_cursor) {
+                                if child.kind() == "enumerator" {
+                                    if let Some(name_node) = child.child_by_field_name("name") {
+                                        let name = node_text(name_node, source).to_string();
+                                        symbols.push(make_symbol(
+                                            name,
+                                            SymbolKind::Constant,
+                                            name_node.start_position().row,
+                                            name_node.start_position().column,
+                                            "enum",
+                                            Visibility::Unknown,
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    "struct_specifier" | "union_specifier" => {
+                        // Extract fields from the anonymous struct/union
+                        if let Some(body) = type_node.child_by_field_name("body") {
+                            let typedef_name = node.child_by_field_name("declarator")
+                                .map(|d| node_text(innermost_declarator_name(d), source));
+                            extract_struct_fields(body, source, symbols, typedef_name);
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
         "preproc_def" | "preproc_function_def" => {
             if let Some(name_node) = node.child_by_field_name("name") {
@@ -168,7 +204,25 @@ fn innermost_declarator_name(mut node: Node) -> Node {
                 if let Some(decl) = node.child_by_field_name("declarator") {
                     node = decl;
                 } else {
-                    break;
+                    // parenthesized_declarator may not have a "declarator" field;
+                    // look for the first named child that is a declarator-like node
+                    let mut found = false;
+                    let mut cursor = node.walk();
+                    for child in node.named_children(&mut cursor) {
+                        match child.kind() {
+                            "identifier" | "type_identifier" | "field_identifier"
+                            | "pointer_declarator" | "function_declarator"
+                            | "array_declarator" | "parenthesized_declarator" => {
+                                node = child;
+                                found = true;
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    if !found {
+                        break;
+                    }
                 }
             }
             _ => break,
@@ -465,6 +519,44 @@ int main() {
 
         // Check occurrences exist
         assert!(!result.occurrences.is_empty(), "should have occurrences");
+    }
+
+    #[test]
+    fn test_c_parser_typedef_enum_and_fnptr() {
+        let source = r#"
+typedef enum {
+    LOG_DEBUG,
+    LOG_INFO,
+    LOG_ERROR
+} LogLevel;
+
+typedef void (*RequestHandler)(int a, int b);
+typedef int (*Validator)(const char *s);
+
+typedef struct {
+    int fd;
+    int state;
+} Connection;
+"#;
+        let result = CParser::parse(source);
+        let names: Vec<&str> = result.symbols.iter().map(|s| s.name.as_str()).collect();
+
+        // typedef enum members
+        assert!(names.contains(&"LOG_DEBUG"), "should find LOG_DEBUG, got: {:?}", names);
+        assert!(names.contains(&"LOG_INFO"), "should find LOG_INFO, got: {:?}", names);
+        assert!(names.contains(&"LOG_ERROR"), "should find LOG_ERROR, got: {:?}", names);
+        assert!(names.contains(&"LogLevel"), "should find typedef LogLevel, got: {:?}", names);
+
+        // Function pointer typedefs
+        assert!(names.contains(&"RequestHandler"), "should find RequestHandler, got: {:?}", names);
+        assert!(names.contains(&"Validator"), "should find Validator, got: {:?}", names);
+
+        // Typedef struct
+        assert!(names.contains(&"Connection"), "should find Connection, got: {:?}", names);
+
+        // Struct fields inside typedef struct
+        assert!(names.contains(&"fd"), "should find field fd, got: {:?}", names);
+        assert!(names.contains(&"state"), "should find field state, got: {:?}", names);
     }
 
     #[test]
