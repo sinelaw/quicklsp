@@ -4,10 +4,10 @@
 
 use tree_sitter::Node;
 
-use crate::parsing::symbols::SymbolKind;
+use crate::parsing::symbols::{Symbol, SymbolKind};
 use crate::parsing::tokenizer::Visibility;
 
-use super::common::{self, QueryParseConfig};
+use super::common::{self, make_contained_symbol, node_text, QueryParseConfig};
 use super::{ParseResult, TsParser};
 
 const PYTHON_IDENT_KINDS: &[&str] = &["identifier"];
@@ -60,7 +60,7 @@ impl TsParser for PythonParser {
                 identifier_kinds: PYTHON_IDENT_KINDS,
                 def_keyword: python_def_keyword,
                 visibility: |_node: Node, _source: &str| Visibility::Unknown,
-                post_process: None,
+                post_process: Some(python_post_process),
             },
         );
         // Post-process: apply name-based visibility and constant detection
@@ -76,6 +76,200 @@ impl TsParser for PythonParser {
         }
         result
     }
+}
+
+/// Post-process: extract Python function parameters and assignment
+/// locals inside function bodies so `find_local_definition_at` can
+/// resolve them.
+fn python_post_process(root: Node, source: &str, symbols: &mut Vec<Symbol>) {
+    walk_python(root, source, symbols, None, 0, None);
+}
+
+fn walk_python(
+    node: Node,
+    source: &str,
+    symbols: &mut Vec<Symbol>,
+    container: Option<&str>,
+    depth: usize,
+    scope_end: Option<usize>,
+) {
+    match node.kind() {
+        "function_definition" => {
+            let name_text = node
+                .child_by_field_name("name")
+                .map(|n| node_text(n, source).to_string());
+            let body_end = node
+                .child_by_field_name("body")
+                .map(|b| b.end_position().row)
+                .unwrap_or_else(|| node.end_position().row);
+
+            if let Some(params) = node.child_by_field_name("parameters") {
+                extract_python_params(
+                    params,
+                    source,
+                    symbols,
+                    name_text.as_deref(),
+                    depth + 1,
+                    body_end,
+                );
+            }
+            if let Some(body) = node.child_by_field_name("body") {
+                let new_container = name_text.as_deref().or(container);
+                let mut cursor = body.walk();
+                for child in body.children(&mut cursor) {
+                    walk_python(
+                        child,
+                        source,
+                        symbols,
+                        new_container,
+                        depth + 1,
+                        Some(body_end),
+                    );
+                }
+            }
+            return;
+        }
+        // An assignment inside a function body introduces a local binding
+        // (only when we're actually inside a function — depth > 0 — so
+        // that module-level assignments stay globals handled by the SCM query).
+        "assignment" if depth > 0 => {
+            if let Some(left) = node.child_by_field_name("left") {
+                let end = scope_end.unwrap_or_else(|| node.end_position().row);
+                collect_python_assignment_targets(left, source, symbols, container, depth, end);
+            }
+            if let Some(right) = node.child_by_field_name("right") {
+                walk_python(right, source, symbols, container, depth, scope_end);
+            }
+            return;
+        }
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk_python(child, source, symbols, container, depth, scope_end);
+    }
+}
+
+fn extract_python_params(
+    params: Node,
+    source: &str,
+    symbols: &mut Vec<Symbol>,
+    fn_name: Option<&str>,
+    depth: usize,
+    scope_end: usize,
+) {
+    let mut cursor = params.walk();
+    for child in params.children(&mut cursor) {
+        // Collect identifiers inside the parameter node. Python has a few
+        // variants: bare `identifier`, `typed_parameter`, `default_parameter`,
+        // `typed_default_parameter`, `list_splat_pattern`, `dictionary_splat_pattern`.
+        match child.kind() {
+            "identifier" => {
+                push_python_local(
+                    child,
+                    source,
+                    symbols,
+                    fn_name,
+                    depth,
+                    scope_end,
+                    "parameter",
+                );
+            }
+            "typed_parameter"
+            | "default_parameter"
+            | "typed_default_parameter"
+            | "list_splat_pattern"
+            | "dictionary_splat_pattern" => {
+                // The bound name is the first `identifier` descendant.
+                if let Some(ident) = first_python_identifier(child) {
+                    push_python_local(
+                        ident,
+                        source,
+                        symbols,
+                        fn_name,
+                        depth,
+                        scope_end,
+                        "parameter",
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_python_assignment_targets(
+    target: Node,
+    source: &str,
+    symbols: &mut Vec<Symbol>,
+    container: Option<&str>,
+    depth: usize,
+    scope_end: usize,
+) {
+    match target.kind() {
+        "identifier" => {
+            push_python_local(
+                target, source, symbols, container, depth, scope_end, "variable",
+            );
+        }
+        "pattern_list" | "tuple_pattern" | "list_pattern" => {
+            let mut cursor = target.walk();
+            for child in target.children(&mut cursor) {
+                collect_python_assignment_targets(
+                    child, source, symbols, container, depth, scope_end,
+                );
+            }
+        }
+        // attribute (self.x = …) / subscript (a[0] = …) / etc. are not new
+        // bindings — they mutate an existing object.
+        _ => {}
+    }
+}
+
+fn push_python_local(
+    ident: Node,
+    source: &str,
+    symbols: &mut Vec<Symbol>,
+    container: Option<&str>,
+    depth: usize,
+    scope_end: usize,
+    def_keyword: &str,
+) {
+    let name = node_text(ident, source).to_string();
+    if name.is_empty() || name == "_" {
+        return;
+    }
+    let line = ident.start_position().row;
+    let col = ident.start_position().column;
+    if symbols.iter().any(|s| s.line == line && s.col == col) {
+        return;
+    }
+    symbols.push(make_contained_symbol(
+        name,
+        SymbolKind::Variable,
+        line,
+        col,
+        def_keyword,
+        Visibility::Private,
+        container,
+        depth,
+        Some(scope_end),
+        None,
+    ));
+}
+
+fn first_python_identifier(node: Node) -> Option<Node> {
+    if node.kind() == "identifier" {
+        return Some(node);
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if let Some(found) = first_python_identifier(child) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 fn python_def_keyword(_kind: SymbolKind, suffix: &str) -> &'static str {
