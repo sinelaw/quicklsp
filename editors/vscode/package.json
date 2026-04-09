@@ -2,7 +2,7 @@
   "name": "quicklsp-vscode",
   "displayName": "QuickLSP",
   "description": "High-performance, heuristic-driven universal Language Server for C, C++, Rust, Go, Python, JavaScript, TypeScript, Java, and Ruby.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "sinelaw",
   "license": "GPL-2.0",
   "repository": {
