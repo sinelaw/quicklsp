@@ -26,8 +26,7 @@ use crate::parsing::symbols::Symbol;
 use crate::parsing::tokenizer::{self, LangFamily};
 use crate::parsing::tree_sitter_parse;
 use crate::word_index::{
-    collect_file_mtimes, index_dir_for_project, word_hash, FileData, IndexMeta, LogIndex,
-    LogWriter,
+    collect_file_mtimes, index_dir_for_project, word_hash, FileData, IndexMeta, LogIndex, LogWriter,
 };
 
 /// A symbol definition with its file location.
@@ -438,10 +437,7 @@ impl Workspace {
                     mtime: 0,
                 },
             );
-            tracing::debug!(
-                "Merged didOpen file into word index: {}",
-                path.display()
-            );
+            tracing::debug!("Merged didOpen file into word index: {}", path.display());
         }
     }
 

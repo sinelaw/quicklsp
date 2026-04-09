@@ -106,11 +106,7 @@ fn signature_from_node(node: Node, name: &str, source: &str) -> Option<String> {
     let text = &source[start..end];
     let first_line = text.lines().next()?.trim();
     // Get the part before `{` (e.g. "typedef struct")
-    let prefix = first_line
-        .split('{')
-        .next()
-        .unwrap_or(first_line)
-        .trim();
+    let prefix = first_line.split('{').next().unwrap_or(first_line).trim();
     if prefix.is_empty() {
         return Some(name.to_string());
     }
