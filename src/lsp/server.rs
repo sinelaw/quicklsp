@@ -537,24 +537,23 @@ impl LanguageServer for QuickLspServer {
                 self.workspace.find_definitions(&symbol)
             }
             IdentContext::FunctionCall | IdentContext::Plain => {
-                let mut d = self.workspace.find_definitions(&symbol);
-                if d.is_empty() {
-                    d = self.dep_index.find_definitions(&symbol);
-                }
-                // Fall back to file-local definitions (locals, params, struct fields),
-                // using scope-aware lookup to handle shadowed variables correctly.
-                if d.is_empty() {
-                    if let Some(ref path) = current_file {
-                        if let Some(local) = self.workspace.find_local_definition_at(
-                            &symbol,
-                            path,
-                            pos.line as usize,
-                        ) {
-                            d.push(local);
-                        }
+                // File-local definitions (let-bindings, parameters) shadow
+                // globals and dependencies in Rust-like scoping rules, so
+                // check them first. Only fall through to workspace-wide and
+                // dep-index lookups when no local is in scope.
+                let local = current_file.as_ref().and_then(|path| {
+                    self.workspace
+                        .find_local_definition_at(&symbol, path, pos.line as usize)
+                });
+                if let Some(local) = local {
+                    vec![local]
+                } else {
+                    let mut d = self.workspace.find_definitions(&symbol);
+                    if d.is_empty() {
+                        d = self.dep_index.find_definitions(&symbol);
                     }
+                    d
                 }
-                d
             }
         };
 
