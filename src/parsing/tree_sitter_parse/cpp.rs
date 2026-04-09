@@ -94,18 +94,18 @@ pub struct CppParser;
 impl TsParser for CppParser {
     fn parse(source: &str) -> ParseResult {
         let lang: tree_sitter::Language = tree_sitter_cpp::LANGUAGE.into();
-        let mut result = common::run_query_parse(
+        common::run_query_parse(
             source,
             &QueryParseConfig {
                 language: lang,
                 query_source: CPP_QUERY,
                 identifier_kinds: CPP_IDENT_KINDS,
+                scope_kinds: super::c::C_SCOPE_KINDS,
                 def_keyword: cpp_def_keyword,
                 visibility: cpp_visibility,
                 post_process: Some(cpp_post_process),
             },
-        );
-        result
+        )
     }
 }
 

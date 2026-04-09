@@ -8,7 +8,7 @@ use tree_sitter::Node;
 use crate::parsing::symbols::{Symbol, SymbolKind};
 use crate::parsing::tokenizer::Visibility;
 
-use super::common::{self, make_contained_symbol, node_text, QueryParseConfig};
+use super::common::{self, node_text, QueryParseConfig};
 use super::{ParseResult, TsParser};
 
 const JS_IDENT_KINDS: &[&str] = &["identifier", "property_identifier"];
@@ -79,24 +79,58 @@ const JS_QUERY: &str = r#"
   (lexical_declaration
     (variable_declarator
       name: (identifier) @name) @definition.variable))
+
+; ── Function parameters ──────────────────────────────────────────────────
+(formal_parameters
+  (identifier) @name) @definition.parameter
+
+(formal_parameters
+  (assignment_pattern
+    left: (identifier) @name)) @definition.parameter
+
+(formal_parameters
+  (rest_pattern
+    (identifier) @name)) @definition.parameter
+
+(arrow_function
+  parameter: (identifier) @name) @definition.parameter
+
+; ── Local variable declarations (let / const / var) ────────────────────
+; These match ANYWHERE in the tree — the shared engine only promotes the
+; symbol to a local when the match is inside a function scope (otherwise
+; it stays as a top-level global handled by the existing captures above).
+(variable_declarator
+  name: (identifier) @name) @definition.local
+
 "#;
 
 pub struct JsParser;
 
+/// JS nodes that introduce a new function scope. Shared with TypeScript.
+pub(super) const JS_SCOPE_KINDS: &[&str] = &[
+    "function_declaration",
+    "function_expression",
+    "function",
+    "arrow_function",
+    "method_definition",
+    "generator_function_declaration",
+    "generator_function",
+];
+
 impl TsParser for JsParser {
     fn parse(source: &str) -> ParseResult {
-        let mut result = common::run_query_parse(
+        common::run_query_parse(
             source,
             &QueryParseConfig {
                 language: tree_sitter_javascript::LANGUAGE.into(),
                 query_source: JS_QUERY,
                 identifier_kinds: JS_IDENT_KINDS,
+                scope_kinds: JS_SCOPE_KINDS,
                 def_keyword: js_def_keyword,
                 visibility: |_node: Node, _source: &str| Visibility::Unknown,
                 post_process: Some(js_post_process),
             },
-        );
-        result
+        )
     }
 }
 
@@ -111,225 +145,11 @@ fn js_def_keyword(_kind: SymbolKind, suffix: &str) -> &'static str {
     }
 }
 
-/// Post-process: detect exports and const vs let/var, and extract
-/// function parameters / mark in-function variable declarations as locals.
+/// Post-process: detect exports and const vs let/var.
+/// Locals / parameters are handled declaratively via `@definition.local`
+/// and `@definition.parameter` SCM rules in `JS_QUERY`.
 fn js_post_process(root: Node, source: &str, symbols: &mut Vec<Symbol>) {
     detect_exports_and_const(root, source, symbols);
-    walk_js_for_fn_scopes(root, source, symbols);
-}
-
-/// Walk the tree to find function scopes. For each function, extract
-/// its parameters and mark variable declarations in its body as locals
-/// (depth ≥ 1 with a scope_end_line).
-fn walk_js_for_fn_scopes(node: Node, source: &str, symbols: &mut Vec<Symbol>) {
-    let is_fn = matches!(
-        node.kind(),
-        "function_declaration"
-            | "function_expression"
-            | "function"
-            | "arrow_function"
-            | "method_definition"
-            | "generator_function_declaration"
-            | "generator_function"
-    );
-
-    if is_fn {
-        let fn_name = node
-            .child_by_field_name("name")
-            .map(|n| node_text(n, source).to_string());
-        let body_end = node
-            .child_by_field_name("body")
-            .map(|b| b.end_position().row)
-            .unwrap_or_else(|| node.end_position().row);
-
-        if let Some(params) = node.child_by_field_name("parameters") {
-            extract_js_params(params, source, symbols, fn_name.as_deref(), body_end);
-        }
-        if let Some(body) = node.child_by_field_name("body") {
-            mark_js_locals_in_body(body, source, symbols, fn_name.as_deref(), 1, body_end);
-        }
-    }
-
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        walk_js_for_fn_scopes(child, source, symbols);
-    }
-}
-
-fn mark_js_locals_in_body(
-    node: Node,
-    source: &str,
-    symbols: &mut Vec<Symbol>,
-    container: Option<&str>,
-    depth: usize,
-    scope_end: usize,
-) {
-    // Don't recurse into nested function scopes — they have their own walker pass.
-    if matches!(
-        node.kind(),
-        "function_declaration"
-            | "function_expression"
-            | "function"
-            | "arrow_function"
-            | "method_definition"
-            | "generator_function_declaration"
-            | "generator_function"
-    ) {
-        return;
-    }
-
-    if node.kind() == "variable_declarator" {
-        if let Some(name_node) = node.child_by_field_name("name") {
-            // `name_node` may be a destructuring pattern; walk to find identifiers.
-            mark_js_pattern_as_local(name_node, source, symbols, container, depth, scope_end);
-        }
-    }
-
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        mark_js_locals_in_body(child, source, symbols, container, depth, scope_end);
-    }
-}
-
-/// Walk a JS binding pattern (identifier / object_pattern / array_pattern
-/// / rest_pattern / assignment_pattern) and update every matching symbol
-/// in `symbols` to be a local. Identifiers not yet in `symbols` are
-/// appended (e.g. destructured names that the SCM query didn't catch).
-fn mark_js_pattern_as_local(
-    node: Node,
-    source: &str,
-    symbols: &mut Vec<Symbol>,
-    container: Option<&str>,
-    depth: usize,
-    scope_end: usize,
-) {
-    match node.kind() {
-        "identifier" => {
-            let line = node.start_position().row;
-            let col = node.start_position().column;
-            // Existing symbol? Promote to local in place.
-            let mut found = false;
-            for sym in symbols.iter_mut() {
-                if sym.line == line && sym.col == col {
-                    sym.depth = depth;
-                    sym.container = container.map(String::from);
-                    sym.scope_end_line = Some(scope_end);
-                    sym.def_keyword = "variable".to_string();
-                    sym.kind = SymbolKind::Variable;
-                    found = true;
-                    break;
-                }
-            }
-            if !found {
-                push_js_local_ident(
-                    node, source, symbols, container, depth, scope_end, "variable",
-                );
-            }
-        }
-        // `property_identifier` appears in shorthand like `{ x }` — that's a binding.
-        "shorthand_property_identifier_pattern" => {
-            push_js_local_ident(
-                node, source, symbols, container, depth, scope_end, "variable",
-            );
-        }
-        _ => {
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                mark_js_pattern_as_local(child, source, symbols, container, depth, scope_end);
-            }
-        }
-    }
-}
-
-fn extract_js_params(
-    params: Node,
-    source: &str,
-    symbols: &mut Vec<Symbol>,
-    fn_name: Option<&str>,
-    scope_end: usize,
-) {
-    let mut cursor = params.walk();
-    for child in params.children(&mut cursor) {
-        match child.kind() {
-            "identifier" => {
-                push_js_local_ident(child, source, symbols, fn_name, 1, scope_end, "parameter");
-            }
-            "assignment_pattern" | "rest_pattern" | "array_pattern" | "object_pattern" => {
-                collect_js_idents(child, source, symbols, fn_name, 1, scope_end, "parameter");
-            }
-            _ => {}
-        }
-    }
-}
-
-fn collect_js_idents(
-    node: Node,
-    source: &str,
-    symbols: &mut Vec<Symbol>,
-    container: Option<&str>,
-    depth: usize,
-    scope_end: usize,
-    def_keyword: &str,
-) {
-    match node.kind() {
-        "identifier" | "shorthand_property_identifier_pattern" => {
-            push_js_local_ident(
-                node,
-                source,
-                symbols,
-                container,
-                depth,
-                scope_end,
-                def_keyword,
-            );
-        }
-        _ => {
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                collect_js_idents(
-                    child,
-                    source,
-                    symbols,
-                    container,
-                    depth,
-                    scope_end,
-                    def_keyword,
-                );
-            }
-        }
-    }
-}
-
-fn push_js_local_ident(
-    ident: Node,
-    source: &str,
-    symbols: &mut Vec<Symbol>,
-    container: Option<&str>,
-    depth: usize,
-    scope_end: usize,
-    def_keyword: &str,
-) {
-    let name = node_text(ident, source).to_string();
-    if name.is_empty() {
-        return;
-    }
-    let line = ident.start_position().row;
-    let col = ident.start_position().column;
-    if symbols.iter().any(|s| s.line == line && s.col == col) {
-        return;
-    }
-    symbols.push(make_contained_symbol(
-        name,
-        SymbolKind::Variable,
-        line,
-        col,
-        def_keyword,
-        Visibility::Unknown,
-        container,
-        depth,
-        Some(scope_end),
-        None,
-    ));
 }
 
 fn detect_exports_and_const(root: Node, source: &str, symbols: &mut Vec<Symbol>) {

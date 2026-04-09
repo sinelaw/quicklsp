@@ -1474,3 +1474,224 @@ fn bug4_rust_local_shadows_global() {
         "Local `path` should resolve to caller.rs, not other.rs"
     );
 }
+
+// =========================================================================
+// Multi-language local/parameter indexing coverage
+//
+// The SCM-based local & parameter capture engine (common::run_query_parse
+// handling of `@definition.local` / `@definition.parameter`) must work
+// uniformly across every language that provides SCM rules for those
+// captures. These tests mirror the Rust Bug #4 reproductions for
+// Python, JavaScript, TypeScript, Java, and C++.
+//
+// C already has dedicated tests (local_variable_scope_shadowing /
+// local_variable_scope_for_loop above).
+// =========================================================================
+
+// ── Python ───────────────────────────────────────────────────────────────
+
+#[test]
+fn python_fn_parameter_indexed_as_local() {
+    let ws = Workspace::new();
+    let source = "def foo(unique_param):\n    return unique_param + 1\n";
+    let path = PathBuf::from("/src/sample.py");
+    ws.index_file(path.clone(), source.to_string());
+
+    let def = ws.find_local_definition_at("unique_param", &path, 1);
+    assert!(
+        def.is_some(),
+        "Python fn parameter `unique_param` should be a local"
+    );
+    assert_eq!(def.unwrap().symbol.line, 0);
+}
+
+#[test]
+fn python_assignment_local_indexed() {
+    let ws = Workspace::new();
+    let source = "def foo(count):\n    id_table = count + 1\n    return id_table\n";
+    let path = PathBuf::from("/src/sample.py");
+    ws.index_file(path.clone(), source.to_string());
+
+    let def = ws.find_local_definition_at("id_table", &path, 2);
+    assert!(
+        def.is_some(),
+        "Python `id_table = …` inside a fn body should be a local"
+    );
+    assert_eq!(def.unwrap().symbol.line, 1);
+}
+
+#[test]
+fn python_local_shadows_module_global() {
+    let ws = Workspace::new();
+    ws.index_file(
+        PathBuf::from("/src/other.py"),
+        "path = \"/tmp\"\n".to_string(),
+    );
+    let caller = PathBuf::from("/src/caller.py");
+    ws.index_file(
+        caller.clone(),
+        "def run():\n    path = 1\n    return path + 1\n".to_string(),
+    );
+
+    let local = ws.find_local_definition_at("path", &caller, 2);
+    assert!(local.is_some(), "Python local `path` should be indexed");
+    assert_eq!(local.unwrap().file, caller);
+}
+
+// ── JavaScript ───────────────────────────────────────────────────────────
+
+#[test]
+fn js_fn_parameter_indexed_as_local() {
+    let ws = Workspace::new();
+    let source = "function foo(unique_param) {\n    return unique_param + 1;\n}\n";
+    let path = PathBuf::from("/src/sample.js");
+    ws.index_file(path.clone(), source.to_string());
+
+    let def = ws.find_local_definition_at("unique_param", &path, 1);
+    assert!(
+        def.is_some(),
+        "JavaScript fn parameter `unique_param` should be a local"
+    );
+    assert_eq!(def.unwrap().symbol.line, 0);
+}
+
+#[test]
+fn js_let_binding_inside_fn_is_local() {
+    let ws = Workspace::new();
+    let source =
+        "function foo(count) {\n    const id_table = count + 1;\n    return id_table;\n}\n";
+    let path = PathBuf::from("/src/sample.js");
+    ws.index_file(path.clone(), source.to_string());
+
+    let def = ws.find_local_definition_at("id_table", &path, 2);
+    assert!(
+        def.is_some(),
+        "JS `const id_table = …` inside fn body should be a local"
+    );
+    assert_eq!(def.unwrap().symbol.line, 1);
+}
+
+#[test]
+fn js_top_level_const_stays_global() {
+    let ws = Workspace::new();
+    let source = "const GLOBAL_VAR = 1;\n";
+    let path = PathBuf::from("/src/sample.js");
+    ws.index_file(path.clone(), source.to_string());
+
+    // Top-level — no enclosing function scope — should end up as a
+    // global definition, not a local.
+    let defs = ws.find_definitions("GLOBAL_VAR");
+    assert!(
+        !defs.is_empty(),
+        "Top-level JS `const GLOBAL_VAR` should be indexed as a global"
+    );
+    assert!(ws
+        .find_local_definition_at("GLOBAL_VAR", &path, 0)
+        .is_none());
+}
+
+// ── TypeScript ───────────────────────────────────────────────────────────
+
+#[test]
+fn ts_required_parameter_indexed_as_local() {
+    let ws = Workspace::new();
+    let source = "function foo(unique_param: number): number {\n    return unique_param + 1;\n}\n";
+    let path = PathBuf::from("/src/sample.ts");
+    ws.index_file(path.clone(), source.to_string());
+
+    let def = ws.find_local_definition_at("unique_param", &path, 1);
+    assert!(
+        def.is_some(),
+        "TS required_parameter `unique_param` should be a local"
+    );
+    assert_eq!(def.unwrap().symbol.line, 0);
+}
+
+#[test]
+fn ts_let_binding_inside_fn_is_local() {
+    let ws = Workspace::new();
+    let source = "function foo(count: number): number {\n    \
+                  const id_table: number = count + 1;\n    \
+                  return id_table;\n}\n";
+    let path = PathBuf::from("/src/sample.ts");
+    ws.index_file(path.clone(), source.to_string());
+
+    let def = ws.find_local_definition_at("id_table", &path, 2);
+    assert!(
+        def.is_some(),
+        "TS `const id_table = …` inside fn body should be a local"
+    );
+    assert_eq!(def.unwrap().symbol.line, 1);
+}
+
+// ── Java ─────────────────────────────────────────────────────────────────
+
+#[test]
+fn java_formal_parameter_indexed_as_local() {
+    let ws = Workspace::new();
+    let source = "public class C {\n    \
+                  public int add(int uniqueParam) {\n        \
+                  return uniqueParam + 1;\n    }\n}\n";
+    let path = PathBuf::from("/src/C.java");
+    ws.index_file(path.clone(), source.to_string());
+
+    let def = ws.find_local_definition_at("uniqueParam", &path, 2);
+    assert!(
+        def.is_some(),
+        "Java formal_parameter `uniqueParam` should be a local"
+    );
+    assert_eq!(def.unwrap().symbol.line, 1);
+}
+
+#[test]
+fn java_local_variable_declaration_is_local() {
+    let ws = Workspace::new();
+    let source = "public class C {\n    \
+                  public int add(int count) {\n        \
+                  int idTable = count + 1;\n        \
+                  return idTable;\n    }\n}\n";
+    let path = PathBuf::from("/src/C.java");
+    ws.index_file(path.clone(), source.to_string());
+
+    let def = ws.find_local_definition_at("idTable", &path, 3);
+    assert!(
+        def.is_some(),
+        "Java `int idTable = …` inside method body should be a local"
+    );
+    assert_eq!(def.unwrap().symbol.line, 2);
+}
+
+// ── C++ ──────────────────────────────────────────────────────────────────
+//
+// C++ reuses the C walker for in-function locals, so these tests exercise
+// the same path but through `sample.cpp`-style files.
+
+#[test]
+fn cpp_fn_parameter_indexed_as_local() {
+    let ws = Workspace::new();
+    let source = "int compute(int uniqueParam) {\n    return uniqueParam + 1;\n}\n";
+    let path = PathBuf::from("/src/sample.cpp");
+    ws.index_file(path.clone(), source.to_string());
+
+    let def = ws.find_local_definition_at("uniqueParam", &path, 1);
+    assert!(
+        def.is_some(),
+        "C++ parameter `uniqueParam` should be a local"
+    );
+    assert_eq!(def.unwrap().symbol.line, 0);
+}
+
+#[test]
+fn cpp_local_variable_declaration_is_local() {
+    let ws = Workspace::new();
+    let source = "int compute(int count) {\n    int idTable = count + 1;\n    return idTable;\n}\n";
+    let path = PathBuf::from("/src/sample.cpp");
+    ws.index_file(path.clone(), source.to_string());
+
+    let def = ws.find_local_definition_at("idTable", &path, 2);
+    assert!(
+        def.is_some(),
+        "C++ `int idTable = …` inside fn body should be a local"
+    );
+    assert_eq!(def.unwrap().symbol.line, 1);
+}

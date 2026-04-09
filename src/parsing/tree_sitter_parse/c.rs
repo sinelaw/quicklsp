@@ -86,24 +86,28 @@ const C_QUERY: &str = r#"
 
 pub struct CParser;
 
+/// C nodes that introduce a new function scope (used by scope-aware
+/// `@definition.local` / `@definition.parameter` captures). Shared with
+/// C++ since tree-sitter-cpp uses the same node kind.
+pub(super) const C_SCOPE_KINDS: &[&str] = &["function_definition"];
+
 impl TsParser for CParser {
     fn parse(source: &str) -> ParseResult {
         let lang: tree_sitter::Language = tree_sitter_c::LANGUAGE.into();
 
         // Use query-based parsing for main definitions
-        let mut result = common::run_query_parse(
+        common::run_query_parse(
             source,
             &QueryParseConfig {
                 language: lang,
                 query_source: C_QUERY,
                 identifier_kinds: C_IDENT_KINDS,
+                scope_kinds: C_SCOPE_KINDS,
                 def_keyword: c_def_keyword,
                 visibility: c_visibility,
                 post_process: Some(c_post_process),
             },
-        );
-
-        result
+        )
     }
 }
 

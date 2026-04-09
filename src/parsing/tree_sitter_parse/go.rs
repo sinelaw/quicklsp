@@ -69,6 +69,9 @@ const GO_QUERY: &str = r#"
 
 pub struct GoParser;
 
+/// Go nodes that introduce a new function scope.
+const GO_SCOPE_KINDS: &[&str] = &["function_declaration", "method_declaration", "func_literal"];
+
 impl TsParser for GoParser {
     fn parse(source: &str) -> ParseResult {
         let mut result = common::run_query_parse(
@@ -77,6 +80,7 @@ impl TsParser for GoParser {
                 language: tree_sitter_go::LANGUAGE.into(),
                 query_source: GO_QUERY,
                 identifier_kinds: GO_IDENT_KINDS,
+                scope_kinds: GO_SCOPE_KINDS,
                 def_keyword: go_def_keyword,
                 visibility: |_node: Node, _source: &str| Visibility::Unknown,
                 post_process: Some(go_post_process),

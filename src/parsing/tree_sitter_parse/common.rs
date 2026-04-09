@@ -220,9 +220,23 @@ pub struct QueryParseConfig {
     pub language: tree_sitter::Language,
     /// SCM query source with `@name` and `@definition.*` captures.
     /// Optional: `@container` for parent type/class name.
+    ///
+    /// Special capture suffixes that trigger scope-aware handling:
+    ///   * `@definition.local`     — the `@name` is a local variable
+    ///   * `@definition.parameter` — the `@name` is a function parameter
+    ///
+    /// For these, `run_query_parse` walks up from the name node to the
+    /// nearest function-like ancestor (see [`scope_kinds`]) and sets
+    /// `depth` / `scope_end_line` / `container` automatically. No
+    /// per-language tree walker is needed for the common case.
     pub query_source: &'static str,
     /// Node kinds that count as identifiers for occurrence collection.
     pub identifier_kinds: &'static [&'static str],
+    /// Node kinds that introduce a new function/method scope. Used by
+    /// the scope-aware handling of `@definition.local` /
+    /// `@definition.parameter` captures to compute `depth`,
+    /// `scope_end_line`, and `container`.
+    pub scope_kinds: &'static [&'static str],
     /// Map SymbolKind to def_keyword string for this language.
     pub def_keyword: fn(SymbolKind, &str) -> &'static str,
     /// Detect visibility from a definition node.
@@ -251,8 +265,45 @@ fn capture_to_kind(capture_name: &str) -> Option<SymbolKind> {
         "field" => Some(SymbolKind::Variable),
         "variant" => Some(SymbolKind::Constant),
         "constructor" => Some(SymbolKind::Function),
+        "local" => Some(SymbolKind::Variable),
+        "parameter" => Some(SymbolKind::Variable),
         _ => None,
     }
+}
+
+/// Walk up from a captured name node, looking for the nearest ancestor
+/// whose kind appears in `scope_kinds`. Returns the `(depth, scope_end,
+/// container)` for a `@definition.local` / `@definition.parameter`
+/// capture. If no enclosing scope is found, returns `None` — the caller
+/// should then treat the capture as a top-level global.
+fn find_enclosing_scope(
+    name_node: Node,
+    source: &str,
+    scope_kinds: &[&str],
+) -> Option<(usize, usize, Option<String>)> {
+    let mut depth: usize = 0;
+    let mut enclosing: Option<Node> = None;
+    let mut cursor = name_node.parent();
+    while let Some(n) = cursor {
+        if scope_kinds.contains(&n.kind()) {
+            depth += 1;
+            if enclosing.is_none() {
+                enclosing = Some(n);
+            }
+        }
+        cursor = n.parent();
+    }
+    let node = enclosing?;
+    // Prefer the body's end row if available, otherwise fall back to
+    // the whole scope node.
+    let end = node
+        .child_by_field_name("body")
+        .map(|b| b.end_position().row)
+        .unwrap_or_else(|| node.end_position().row);
+    let container = node
+        .child_by_field_name("name")
+        .map(|n| node_text(n, source).to_string());
+    Some((depth, end, container))
 }
 
 /// Default def_keyword: use the capture suffix directly.
@@ -269,6 +320,8 @@ pub fn default_def_keyword(kind: SymbolKind, capture_suffix: &str) -> &'static s
         "type" => "type",
         "constant" | "variant" => "const",
         "variable" | "field" => "variable",
+        "local" => "variable",
+        "parameter" => "parameter",
         "module" => "mod",
         "macro" => "macro",
         "constructor" => "constructor",
@@ -375,6 +428,33 @@ pub fn run_query_parse(source: &str, config: &QueryParseConfig) -> ParseResult {
             } else {
                 None
             };
+
+            // Scope-aware handling for local variable and parameter captures.
+            // Walk up to find an enclosing function/method and compute depth
+            // + scope_end_line + container automatically.
+            let is_scoped = matches!(suffix, "local" | "parameter");
+            if is_scoped {
+                if let Some((scope_depth, scope_end, scope_container)) =
+                    find_enclosing_scope(name_cap.node, source, config.scope_kinds)
+                {
+                    symbols.push(Symbol {
+                        name,
+                        kind,
+                        line,
+                        col,
+                        def_keyword: def_keyword.to_string(),
+                        doc_comment: None,
+                        signature,
+                        visibility,
+                        container: scope_container,
+                        depth: scope_depth.max(1),
+                        scope_end_line: Some(scope_end),
+                    });
+                    continue;
+                }
+                // No enclosing function — treat as a module-level global.
+                // Fall through to the default path below.
+            }
 
             let container = container_capture.map(|c| node_text(c.node, source).to_string());
 
