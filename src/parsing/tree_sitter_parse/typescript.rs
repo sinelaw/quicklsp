@@ -8,7 +8,7 @@ use tree_sitter::Node;
 use crate::parsing::symbols::{Symbol, SymbolKind};
 use crate::parsing::tokenizer::Visibility;
 
-use super::common::{self, node_text, QueryParseConfig};
+use super::common::{self, make_contained_symbol, node_text, QueryParseConfig};
 use super::{ParseResult, TsParser};
 
 const TS_IDENT_KINDS: &[&str] = &["identifier", "property_identifier", "type_identifier"];
@@ -178,9 +178,226 @@ fn ts_def_keyword(_kind: SymbolKind, suffix: &str) -> &'static str {
     }
 }
 
-/// Post-process: detect exports and const vs let/var.
+/// Post-process: detect exports and const vs let/var, and extract
+/// function parameters / promote in-function variable declarations
+/// to locals (depth ≥ 1).
 fn ts_post_process(root: Node, source: &str, symbols: &mut Vec<Symbol>) {
     walk_for_export_and_const(root, source, symbols);
+    walk_ts_for_fn_scopes(root, source, symbols);
+}
+
+fn walk_ts_for_fn_scopes(node: Node, source: &str, symbols: &mut Vec<Symbol>) {
+    let is_fn = matches!(
+        node.kind(),
+        "function_declaration"
+            | "function_expression"
+            | "function"
+            | "arrow_function"
+            | "method_definition"
+            | "generator_function_declaration"
+            | "generator_function"
+    );
+
+    if is_fn {
+        let fn_name = node
+            .child_by_field_name("name")
+            .map(|n| node_text(n, source).to_string());
+        let body_end = node
+            .child_by_field_name("body")
+            .map(|b| b.end_position().row)
+            .unwrap_or_else(|| node.end_position().row);
+
+        if let Some(params) = node.child_by_field_name("parameters") {
+            extract_ts_params(params, source, symbols, fn_name.as_deref(), body_end);
+        }
+        if let Some(body) = node.child_by_field_name("body") {
+            mark_ts_locals_in_body(body, source, symbols, fn_name.as_deref(), 1, body_end);
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk_ts_for_fn_scopes(child, source, symbols);
+    }
+}
+
+fn mark_ts_locals_in_body(
+    node: Node,
+    source: &str,
+    symbols: &mut Vec<Symbol>,
+    container: Option<&str>,
+    depth: usize,
+    scope_end: usize,
+) {
+    if matches!(
+        node.kind(),
+        "function_declaration"
+            | "function_expression"
+            | "function"
+            | "arrow_function"
+            | "method_definition"
+            | "generator_function_declaration"
+            | "generator_function"
+    ) {
+        return;
+    }
+
+    if node.kind() == "variable_declarator" {
+        if let Some(name_node) = node.child_by_field_name("name") {
+            mark_ts_pattern_as_local(name_node, source, symbols, container, depth, scope_end);
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        mark_ts_locals_in_body(child, source, symbols, container, depth, scope_end);
+    }
+}
+
+fn mark_ts_pattern_as_local(
+    node: Node,
+    source: &str,
+    symbols: &mut Vec<Symbol>,
+    container: Option<&str>,
+    depth: usize,
+    scope_end: usize,
+) {
+    match node.kind() {
+        "identifier" => {
+            let line = node.start_position().row;
+            let col = node.start_position().column;
+            let mut found = false;
+            for sym in symbols.iter_mut() {
+                if sym.line == line && sym.col == col {
+                    sym.depth = depth;
+                    sym.container = container.map(String::from);
+                    sym.scope_end_line = Some(scope_end);
+                    sym.def_keyword = "variable".to_string();
+                    sym.kind = SymbolKind::Variable;
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                push_ts_local_ident(
+                    node, source, symbols, container, depth, scope_end, "variable",
+                );
+            }
+        }
+        "shorthand_property_identifier_pattern" => {
+            push_ts_local_ident(
+                node, source, symbols, container, depth, scope_end, "variable",
+            );
+        }
+        _ => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                mark_ts_pattern_as_local(child, source, symbols, container, depth, scope_end);
+            }
+        }
+    }
+}
+
+fn extract_ts_params(
+    params: Node,
+    source: &str,
+    symbols: &mut Vec<Symbol>,
+    fn_name: Option<&str>,
+    scope_end: usize,
+) {
+    let mut cursor = params.walk();
+    for child in params.children(&mut cursor) {
+        // TypeScript wraps params in `required_parameter` / `optional_parameter`
+        // nodes, each containing a `pattern` field.
+        match child.kind() {
+            "identifier" => {
+                push_ts_local_ident(child, source, symbols, fn_name, 1, scope_end, "parameter");
+            }
+            "required_parameter" | "optional_parameter" => {
+                if let Some(pat) = child.child_by_field_name("pattern") {
+                    collect_ts_idents(pat, source, symbols, fn_name, 1, scope_end, "parameter");
+                } else {
+                    collect_ts_idents(child, source, symbols, fn_name, 1, scope_end, "parameter");
+                }
+            }
+            "assignment_pattern" | "rest_pattern" | "array_pattern" | "object_pattern" => {
+                collect_ts_idents(child, source, symbols, fn_name, 1, scope_end, "parameter");
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_ts_idents(
+    node: Node,
+    source: &str,
+    symbols: &mut Vec<Symbol>,
+    container: Option<&str>,
+    depth: usize,
+    scope_end: usize,
+    def_keyword: &str,
+) {
+    match node.kind() {
+        "identifier" | "shorthand_property_identifier_pattern" => {
+            push_ts_local_ident(
+                node,
+                source,
+                symbols,
+                container,
+                depth,
+                scope_end,
+                def_keyword,
+            );
+        }
+        // Skip type annotations — they're not bindings.
+        "type_annotation" | "type_identifier" | "predefined_type" => {}
+        _ => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                collect_ts_idents(
+                    child,
+                    source,
+                    symbols,
+                    container,
+                    depth,
+                    scope_end,
+                    def_keyword,
+                );
+            }
+        }
+    }
+}
+
+fn push_ts_local_ident(
+    ident: Node,
+    source: &str,
+    symbols: &mut Vec<Symbol>,
+    container: Option<&str>,
+    depth: usize,
+    scope_end: usize,
+    def_keyword: &str,
+) {
+    let name = node_text(ident, source).to_string();
+    if name.is_empty() {
+        return;
+    }
+    let line = ident.start_position().row;
+    let col = ident.start_position().column;
+    if symbols.iter().any(|s| s.line == line && s.col == col) {
+        return;
+    }
+    symbols.push(make_contained_symbol(
+        name,
+        SymbolKind::Variable,
+        line,
+        col,
+        def_keyword,
+        Visibility::Unknown,
+        container,
+        depth,
+        Some(scope_end),
+        None,
+    ));
 }
 
 fn walk_for_export_and_const(node: Node, source: &str, symbols: &mut Vec<Symbol>) {

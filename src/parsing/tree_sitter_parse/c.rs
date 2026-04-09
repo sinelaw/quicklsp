@@ -286,7 +286,11 @@ fn extract_file_scope_vars(node: Node, source: &str, symbols: &mut Vec<Symbol>) 
 }
 
 /// Extract function parameters and local variables.
-fn extract_params_and_locals(node: Node, source: &str, symbols: &mut Vec<Symbol>) {
+///
+/// Exposed as `pub(super)` so the C++ parser can reuse it — tree-sitter-cpp
+/// shares the same node kinds for `function_definition`, `declaration`,
+/// `parameter_declaration`, and `compound_statement`.
+pub(super) fn extract_params_and_locals(node: Node, source: &str, symbols: &mut Vec<Symbol>) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
@@ -317,6 +321,19 @@ fn extract_params_and_locals(node: Node, source: &str, symbols: &mut Vec<Symbol>
                 }
             }
             "preproc_ifdef" | "preproc_if" | "preproc_elif" | "preproc_else" | "preproc_ifndef" => {
+                extract_params_and_locals(child, source, symbols);
+            }
+            // Recurse into C++ constructs so that function definitions declared
+            // inside classes, structs, and namespaces still get their
+            // parameters/locals extracted. The class extractor in `cpp.rs`
+            // only handles the method *signatures*, not their bodies.
+            "class_specifier"
+            | "struct_specifier"
+            | "namespace_definition"
+            | "template_declaration"
+            | "linkage_specification"
+            | "field_declaration_list"
+            | "declaration_list" => {
                 extract_params_and_locals(child, source, symbols);
             }
             _ => {}

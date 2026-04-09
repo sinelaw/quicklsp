@@ -136,11 +136,17 @@ fn cpp_visibility(node: Node, source: &str) -> Visibility {
 }
 
 /// Post-process: extract class bodies (methods, fields with access specifiers),
-/// typedef function pointers, and file-scope declarations.
+/// typedef function pointers, file-scope declarations, and function-body
+/// locals / parameters.
 fn cpp_post_process(root: Node, source: &str, symbols: &mut Vec<Symbol>) {
     extract_class_bodies(root, source, symbols);
     extract_typedef_function_ptrs(root, source, symbols);
     extract_file_scope_vars(root, source, symbols);
+    // tree-sitter-cpp shares the `function_definition` / `declaration` /
+    // `parameter_declaration` / `compound_statement` node kinds with
+    // tree-sitter-c, so the C extractor handles plain C++ function bodies.
+    // (Class-member methods are handled by `extract_class_bodies` above.)
+    super::c::extract_params_and_locals(root, source, symbols);
 }
 
 /// Walk the tree to find class/struct bodies and extract their members
