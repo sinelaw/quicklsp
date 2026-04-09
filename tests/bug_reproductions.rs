@@ -1624,6 +1624,39 @@ fn ts_let_binding_inside_fn_is_local() {
     assert_eq!(def.unwrap().symbol.line, 1);
 }
 
+/// When a local `const` shadows a module-level `const` of the same name
+/// in a different file, the local must win — otherwise go-to-definition
+/// jumps to the unrelated top-level declaration.
+#[test]
+fn ts_local_shadows_module_global() {
+    let ws = Workspace::new();
+    // Module-level `path` in other.ts.
+    ws.index_file(
+        PathBuf::from("/src/other.ts"),
+        "export const path: string = \"/tmp\";\n".to_string(),
+    );
+    // Local `const path = …` inside a function in caller.ts.
+    let caller = PathBuf::from("/src/caller.ts");
+    ws.index_file(
+        caller.clone(),
+        "function run(): number {\n    \
+         const path: number = 1;\n    \
+         return path + 1;\n}\n"
+            .to_string(),
+    );
+
+    let local = ws.find_local_definition_at("path", &caller, 2);
+    assert!(
+        local.is_some(),
+        "TS local `const path = …` should be indexed as a local"
+    );
+    assert_eq!(
+        local.unwrap().file,
+        caller,
+        "TS local `path` should resolve to caller.ts, not other.ts"
+    );
+}
+
 // ── Java ─────────────────────────────────────────────────────────────────
 
 #[test]
@@ -1661,6 +1694,38 @@ fn java_local_variable_declaration_is_local() {
     assert_eq!(def.unwrap().symbol.line, 2);
 }
 
+/// A local `int path = …` inside a method must shadow a class field
+/// of the same name declared in a different source file.
+#[test]
+fn java_local_shadows_field() {
+    let ws = Workspace::new();
+    // Field `path` on a class in another file.
+    ws.index_file(
+        PathBuf::from("/src/Other.java"),
+        "public class Other {\n    public static int path = 7;\n}\n".to_string(),
+    );
+    let caller = PathBuf::from("/src/Caller.java");
+    ws.index_file(
+        caller.clone(),
+        "public class Caller {\n    \
+         public int run() {\n        \
+         int path = 1;\n        \
+         return path + 1;\n    }\n}\n"
+            .to_string(),
+    );
+
+    let local = ws.find_local_definition_at("path", &caller, 3);
+    assert!(
+        local.is_some(),
+        "Java local `int path = …` should be indexed as a local"
+    );
+    assert_eq!(
+        local.unwrap().file,
+        caller,
+        "Java local `path` should resolve to Caller.java, not Other.java"
+    );
+}
+
 // ── C++ ──────────────────────────────────────────────────────────────────
 //
 // C++ reuses the C walker for in-function locals, so these tests exercise
@@ -1694,4 +1759,31 @@ fn cpp_local_variable_declaration_is_local() {
         "C++ `int idTable = …` inside fn body should be a local"
     );
     assert_eq!(def.unwrap().symbol.line, 1);
+}
+
+/// A local `int path = …` in a C++ function must shadow a file-scope
+/// global `int path` declared in a different translation unit.
+#[test]
+fn cpp_local_shadows_file_scope_global() {
+    let ws = Workspace::new();
+    ws.index_file(
+        PathBuf::from("/src/other.cpp"),
+        "int path = 7;\n".to_string(),
+    );
+    let caller = PathBuf::from("/src/caller.cpp");
+    ws.index_file(
+        caller.clone(),
+        "int run() {\n    int path = 1;\n    return path + 1;\n}\n".to_string(),
+    );
+
+    let local = ws.find_local_definition_at("path", &caller, 2);
+    assert!(
+        local.is_some(),
+        "C++ local `int path = …` should be indexed as a local"
+    );
+    assert_eq!(
+        local.unwrap().file,
+        caller,
+        "C++ local `path` should resolve to caller.cpp, not other.cpp"
+    );
 }
