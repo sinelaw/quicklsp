@@ -18,47 +18,65 @@ supports:
 
 > **Experimental — not ready for production use or any serious purpose.**
 
-## Prerequisites
+## Installing
 
-You need the `quicklsp` binary available on your system. From the repo root:
+### From a release `.vsix` (recommended)
+
+Every GitHub release publishes a **platform-specific** `.vsix` with the
+matching `quicklsp` binary pre-bundled. No separate install step is needed —
+the extension finds the server inside its own install directory.
+
+Grab the one for your platform from
+[Releases](https://github.com/sinelaw/quicklsp/releases):
+
+| Platform                | Asset                                             |
+| ----------------------- | ------------------------------------------------- |
+| Linux x86_64            | `quicklsp-vscode-<ver>-linux-x64.vsix`            |
+| Linux aarch64           | `quicklsp-vscode-<ver>-linux-arm64.vsix`          |
+| macOS Intel             | `quicklsp-vscode-<ver>-darwin-x64.vsix`           |
+| macOS Apple Silicon     | `quicklsp-vscode-<ver>-darwin-arm64.vsix`         |
+| Windows x86_64          | `quicklsp-vscode-<ver>-win32-x64.vsix`            |
+
+Then install:
 
 ```sh
-cargo install --path .
+code --install-extension quicklsp-vscode-<ver>-<target>.vsix
 ```
 
-This installs `quicklsp` into `~/.cargo/bin` (make sure that's on your `PATH`).
-Alternatively, build with `cargo build --release` and point
-`quicklsp.serverPath` at `target/release/quicklsp`.
+Once the extension is published to the VS Code Marketplace, the Marketplace
+will auto-deliver the correct platform-specific build.
 
-## Building the extension
+> **macOS note:** The bundled Darwin binary is not notarized. On first launch
+> macOS Gatekeeper may block it — open *System Settings → Privacy & Security*
+> and click **Allow anyway**, or set `quicklsp.serverPath` to a locally-built
+> binary.
 
-From `editors/vscode`:
+### From source (developers)
+
+If you have a Rust toolchain and want the extension to pick up your own build:
 
 ```sh
+# Build the server
+cargo build --release
+
+# Build & install the extension (without a bundled binary)
+cd editors/vscode
 npm install
 npm run compile
-```
-
-To produce a `.vsix` package:
-
-```sh
-npm install -g @vscode/vsce   # once
 npm run package
+code --install-extension quicklsp-vscode.vsix
 ```
 
-Install the resulting `.vsix` via `code --install-extension quicklsp-vscode-*.vsix`
-or through the Extensions view (`Install from VSIX...`).
-
-### Running from source
-
-Open `editors/vscode` in VS Code and press `F5` to launch an Extension
-Development Host with QuickLSP loaded.
+With no bundled `server/` directory the extension falls back to
+`<repo>/target/release/quicklsp` when its install directory is inside the
+repo (useful when launching the Extension Development Host via `F5`), or to
+`quicklsp` on `PATH` as a last resort.
 
 ## Settings
 
 | Setting                 | Default                                | Description                                                    |
 | ----------------------- | -------------------------------------- | -------------------------------------------------------------- |
-| `quicklsp.serverPath`   | `quicklsp`                             | Path to the `quicklsp` executable (absolute, relative, or on `PATH`). |
+| `quicklsp.serverPath`   | `""` (auto-detect)                    | Override the server binary location. Leave empty to use the bundled binary, the repo-local `target/release/quicklsp`, or `PATH` (in that order). |
 | `quicklsp.serverArgs`   | `[]`                                   | Extra CLI args passed to the server.                           |
 | `quicklsp.logLevel`     | `info`                                 | `RUST_LOG` level forwarded to the server process.              |
 | `quicklsp.trace.server` | `off`                                  | LSP message tracing (`off` / `messages` / `verbose`).          |

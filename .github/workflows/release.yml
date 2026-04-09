@@ -89,8 +89,33 @@ jobs:
           if-no-files-found: error
 
   build-extension:
-    name: Package VS Code extension
+    name: Package VS Code extension (${{ matrix.vsce_target }})
+    needs: build-binary
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rust_target: x86_64-unknown-linux-gnu
+            vsce_target: linux-x64
+            binary: quicklsp
+            archive_glob: '*.tar.gz'
+          - rust_target: aarch64-unknown-linux-gnu
+            vsce_target: linux-arm64
+            binary: quicklsp
+            archive_glob: '*.tar.gz'
+          - rust_target: x86_64-apple-darwin
+            vsce_target: darwin-x64
+            binary: quicklsp
+            archive_glob: '*.tar.gz'
+          - rust_target: aarch64-apple-darwin
+            vsce_target: darwin-arm64
+            binary: quicklsp
+            archive_glob: '*.tar.gz'
+          - rust_target: x86_64-pc-windows-msvc
+            vsce_target: win32-x64
+            binary: quicklsp.exe
+            archive_glob: '*.zip'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -115,17 +140,48 @@ jobs:
         working-directory: editors/vscode
         run: npm run compile
 
+      - name: Download matching quicklsp binary artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: quicklsp-${{ matrix.rust_target }}
+          path: /tmp/quicklsp-binary
+
+      - name: Extract binary into editors/vscode/server
+        shell: bash
+        run: |
+          mkdir -p /tmp/quicklsp-extracted
+          archive=$(find /tmp/quicklsp-binary -type f -name '${{ matrix.archive_glob }}' | head -n1)
+          echo "Using archive: $archive"
+          case "$archive" in
+            *.tar.gz) tar -xzf "$archive" -C /tmp/quicklsp-extracted ;;
+            *.zip)    unzip -q "$archive" -d /tmp/quicklsp-extracted ;;
+            *) echo "unexpected archive: $archive"; exit 1 ;;
+          esac
+          mkdir -p editors/vscode/server
+          found=$(find /tmp/quicklsp-extracted -type f -name '${{ matrix.binary }}' | head -n1)
+          if [ -z "$found" ]; then
+            echo "Could not locate ${{ matrix.binary }} inside archive"
+            find /tmp/quicklsp-extracted
+            exit 1
+          fi
+          cp "$found" "editors/vscode/server/${{ matrix.binary }}"
+          chmod +x "editors/vscode/server/${{ matrix.binary }}" || true
+          ls -la editors/vscode/server
+
       - name: Install vsce
         run: npm install -g @vscode/vsce
 
-      - name: Package extension (.vsix)
+      - name: Package platform-specific .vsix
         working-directory: editors/vscode
-        run: vsce package --out "quicklsp-vscode-${RELEASE_TAG}.vsix"
+        run: |
+          vsce package \
+            --target ${{ matrix.vsce_target }} \
+            --out "quicklsp-vscode-${RELEASE_TAG}-${{ matrix.vsce_target }}.vsix"
 
       - name: Upload .vsix artifact
         uses: actions/upload-artifact@v4
         with:
-          name: quicklsp-vscode-extension
+          name: quicklsp-vscode-${{ matrix.vsce_target }}
           path: editors/vscode/quicklsp-vscode-*.vsix
           if-no-files-found: error
 

@@ -1,3 +1,5 @@
 node_modules/
 out/
 *.vsix
+# Binary dropped in by the release workflow before `vsce package --target ...`
+server/

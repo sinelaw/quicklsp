@@ -62,8 +62,8 @@
       "properties": {
         "quicklsp.serverPath": {
           "type": "string",
-          "default": "quicklsp",
-          "description": "Path to the quicklsp executable. Defaults to 'quicklsp' (expected to be on PATH)."
+          "default": "",
+          "description": "Optional override for the quicklsp executable. Leave empty to auto-detect: (1) the server bundled in a platform-specific .vsix, (2) a repo-local 'target/release/quicklsp' when developing the extension, (3) 'quicklsp' on PATH."
         },
         "quicklsp.serverArgs": {
           "type": "array",
