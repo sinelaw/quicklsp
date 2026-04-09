@@ -58,6 +58,9 @@ const RUBY_QUERY: &str = r#"
 
 pub struct RubyParser;
 
+/// Ruby nodes that introduce a new method/block scope.
+const RUBY_SCOPE_KINDS: &[&str] = &["method", "singleton_method", "block", "lambda"];
+
 impl TsParser for RubyParser {
     fn parse(source: &str) -> ParseResult {
         let mut result = common::run_query_parse(
@@ -66,6 +69,7 @@ impl TsParser for RubyParser {
                 language: tree_sitter_ruby::LANGUAGE.into(),
                 query_source: RUBY_QUERY,
                 identifier_kinds: RUBY_IDENT_KINDS,
+                scope_kinds: RUBY_SCOPE_KINDS,
                 def_keyword: ruby_def_keyword,
                 visibility: |_node: Node, _source: &str| Visibility::Unknown,
                 post_process: None,

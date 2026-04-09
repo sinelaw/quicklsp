@@ -8,7 +8,7 @@ use tree_sitter::Node;
 use crate::parsing::symbols::{Symbol, SymbolKind};
 use crate::parsing::tokenizer::Visibility;
 
-use super::common::{self, make_contained_symbol, node_text, QueryParseConfig};
+use super::common::{self, node_text, QueryParseConfig};
 use super::{ParseResult, TsParser};
 
 const JAVA_IDENT_KINDS: &[&str] = &["identifier", "type_identifier"];
@@ -77,9 +77,41 @@ const JAVA_QUERY: &str = r#"
     (enum_body_declarations
       (method_declaration
         name: (identifier) @name) @definition.method)))
+
+; ── Method / constructor parameters ──────────────────────────────────────
+(formal_parameter
+  name: (identifier) @name) @definition.parameter
+
+(spread_parameter
+  (variable_declarator
+    name: (identifier) @name)) @definition.parameter
+
+; ── Local variable declarations inside method bodies ────────────────────
+(local_variable_declaration
+  declarator: (variable_declarator
+    name: (identifier) @name)) @definition.local
+
+; ── Enhanced for loop: `for (Type x : iter)` ────────────────────────────
+(enhanced_for_statement
+  name: (identifier) @name) @definition.local
+
+; ── try-with-resources: `try (Type x = …)` ──────────────────────────────
+(resource
+  name: (identifier) @name) @definition.local
+
+; ── catch (Exception e) ─────────────────────────────────────────────────
+(catch_formal_parameter
+  name: (identifier) @name) @definition.local
 "#;
 
 pub struct JavaParser;
+
+/// Java nodes that introduce a new method/constructor scope.
+const JAVA_SCOPE_KINDS: &[&str] = &[
+    "method_declaration",
+    "constructor_declaration",
+    "lambda_expression",
+];
 
 impl TsParser for JavaParser {
     fn parse(source: &str) -> ParseResult {
@@ -89,164 +121,19 @@ impl TsParser for JavaParser {
                 language: tree_sitter_java::LANGUAGE.into(),
                 query_source: JAVA_QUERY,
                 identifier_kinds: JAVA_IDENT_KINDS,
+                scope_kinds: JAVA_SCOPE_KINDS,
                 def_keyword: java_def_keyword,
                 visibility: java_visibility,
-                post_process: Some(java_post_process),
+                post_process: None,
             },
         )
     }
 }
 
-/// Post-process: extract Java method/constructor parameters and
-/// `local_variable_declaration` bindings inside method bodies.
-fn java_post_process(root: Node, source: &str, symbols: &mut Vec<Symbol>) {
-    walk_java(root, source, symbols);
-}
-
-fn walk_java(node: Node, source: &str, symbols: &mut Vec<Symbol>) {
-    match node.kind() {
-        "method_declaration" | "constructor_declaration" => {
-            let name_text = node
-                .child_by_field_name("name")
-                .map(|n| node_text(n, source).to_string());
-            let body_end = node
-                .child_by_field_name("body")
-                .map(|b| b.end_position().row)
-                .unwrap_or_else(|| node.end_position().row);
-
-            if let Some(params) = node.child_by_field_name("parameters") {
-                extract_java_params(params, source, symbols, name_text.as_deref(), 1, body_end);
-            }
-            if let Some(body) = node.child_by_field_name("body") {
-                mark_java_locals_in_body(body, source, symbols, name_text.as_deref(), 1, body_end);
-            }
-        }
-        _ => {}
-    }
-
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        walk_java(child, source, symbols);
-    }
-}
-
-fn extract_java_params(
-    params: Node,
-    source: &str,
-    symbols: &mut Vec<Symbol>,
-    fn_name: Option<&str>,
-    depth: usize,
-    scope_end: usize,
-) {
-    let mut cursor = params.walk();
-    for child in params.children(&mut cursor) {
-        if child.kind() == "formal_parameter" || child.kind() == "spread_parameter" {
-            if let Some(name_node) = child.child_by_field_name("name") {
-                push_java_local(
-                    name_node,
-                    source,
-                    symbols,
-                    fn_name,
-                    depth,
-                    scope_end,
-                    "parameter",
-                );
-            }
-        }
-    }
-}
-
-fn mark_java_locals_in_body(
-    node: Node,
-    source: &str,
-    symbols: &mut Vec<Symbol>,
-    container: Option<&str>,
-    depth: usize,
-    scope_end: usize,
-) {
-    // Don't recurse into nested method/constructor bodies — they have
-    // their own scope handled by `walk_java`.
-    if matches!(
-        node.kind(),
-        "method_declaration"
-            | "constructor_declaration"
-            | "class_declaration"
-            | "interface_declaration"
-            | "enum_declaration"
-            | "record_declaration"
-    ) {
-        return;
-    }
-
-    if node.kind() == "local_variable_declaration" {
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            if child.kind() == "variable_declarator" {
-                if let Some(name_node) = child.child_by_field_name("name") {
-                    push_java_local(
-                        name_node, source, symbols, container, depth, scope_end, "variable",
-                    );
-                }
-            }
-        }
-    }
-
-    // `enhanced_for_statement` binds a loop variable.
-    if node.kind() == "enhanced_for_statement" {
-        if let Some(name_node) = node.child_by_field_name("name") {
-            let body_end = node
-                .child_by_field_name("body")
-                .map(|b| b.end_position().row)
-                .unwrap_or(scope_end);
-            push_java_local(
-                name_node,
-                source,
-                symbols,
-                container,
-                depth + 1,
-                body_end,
-                "variable",
-            );
-        }
-    }
-
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        mark_java_locals_in_body(child, source, symbols, container, depth, scope_end);
-    }
-}
-
-fn push_java_local(
-    ident: Node,
-    source: &str,
-    symbols: &mut Vec<Symbol>,
-    container: Option<&str>,
-    depth: usize,
-    scope_end: usize,
-    def_keyword: &str,
-) {
-    let name = node_text(ident, source).to_string();
-    if name.is_empty() {
-        return;
-    }
-    let line = ident.start_position().row;
-    let col = ident.start_position().column;
-    if symbols.iter().any(|s| s.line == line && s.col == col) {
-        return;
-    }
-    symbols.push(make_contained_symbol(
-        name,
-        SymbolKind::Variable,
-        line,
-        col,
-        def_keyword,
-        Visibility::Private,
-        container,
-        depth,
-        Some(scope_end),
-        None,
-    ));
-}
+// Locals and parameters are captured declaratively via `@definition.local`
+// and `@definition.parameter` rules in `JAVA_QUERY` above. The shared
+// query engine walks up to `method_declaration` / `constructor_declaration`
+// / `lambda_expression` ancestors to compute depth / scope_end_line.
 
 fn java_def_keyword(_kind: SymbolKind, suffix: &str) -> &'static str {
     match suffix {
