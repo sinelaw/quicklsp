@@ -1312,3 +1312,165 @@ fn local_variable_scope_for_loop() {
         "Should pick second loop's i on line 4"
     );
 }
+
+// =========================================================================
+// Bug #4: Rust local variables (`let` bindings) and function parameters are
+// never indexed, so go-to-definition on a local returns nothing (or jumps
+// to an unrelated global symbol that happens to share the same name).
+//
+// Root cause: the Rust tree-sitter query in
+// `src/parsing/tree_sitter_parse/rust.rs` captures only item-level
+// definitions (fn, struct, enum, trait, const, static, mod, macros,
+// struct fields, enum variants, impl methods). It has no capture for
+// `let_declaration` (`identifier_pattern` inside `let` bindings) or for
+// function `parameter`/`self_parameter` nodes. Because of this, locals
+// never reach the per-file symbol list, so `find_local_definitions` /
+// `find_local_definition_at` always return empty for Rust.
+//
+// Observable symptom (tested against quicklsp's own source tree via
+// neovim):
+//   * cursor on a unique local like `let id_table = ...` —
+//     `textDocument/definition` returns `null` (looks like "nothing
+//     happens" in the editor).
+//   * cursor on a common local like `let path = ...` — the server falls
+//     through to the global lookup and jumps to an unrelated `path`
+//     symbol in another file.
+// =========================================================================
+
+/// Rust `let` bindings must be extracted as local symbols so that
+/// go-to-definition on a local variable resolves to the `let` line.
+#[test]
+fn bug4_rust_let_binding_indexed_as_local() {
+    let ws = Workspace::new();
+    // Line 0: `pub fn foo(count: usize) -> usize {`
+    // Line 1: `    let id_table = count + 1;`
+    // Line 2: `    id_table`
+    // Line 3: `}`
+    let source = "pub fn foo(count: usize) -> usize {\n\
+                  \x20   let id_table = count + 1;\n\
+                  \x20   id_table\n\
+                  }\n";
+    let path = PathBuf::from("/src/sample.rs");
+    ws.index_file(path.clone(), source.to_string());
+
+    // `id_table` is a unique identifier, so the only way for the server
+    // to find it is through the per-file local index.
+    let locals = ws.find_local_definitions("id_table", &path);
+    assert!(
+        !locals.is_empty(),
+        "BUG #4: Rust `let id_table = ...` is not indexed — \
+         the tree-sitter Rust query has no capture for `let_declaration`"
+    );
+
+    // Cursor on line 2 (the use site `id_table`): scope-aware lookup
+    // must return the let binding on line 1.
+    let def = ws.find_local_definition_at("id_table", &path, 2);
+    assert!(
+        def.is_some(),
+        "BUG #4: find_local_definition_at returned None for `id_table` — \
+         Rust locals never reach the symbol table"
+    );
+    assert_eq!(
+        def.unwrap().symbol.line,
+        1,
+        "Should resolve to the `let id_table = ...` line"
+    );
+}
+
+/// Rust function parameters must be extracted as local symbols so that
+/// go-to-definition on a parameter use resolves to the parameter binding.
+#[test]
+fn bug4_rust_fn_parameter_indexed_as_local() {
+    let ws = Workspace::new();
+    // Line 0: `pub fn foo(unique_param: usize) -> usize {`
+    // Line 1: `    unique_param + 1`
+    // Line 2: `}`
+    let source = "pub fn foo(unique_param: usize) -> usize {\n\
+                  \x20   unique_param + 1\n\
+                  }\n";
+    let path = PathBuf::from("/src/sample.rs");
+    ws.index_file(path.clone(), source.to_string());
+
+    let locals = ws.find_local_definitions("unique_param", &path);
+    assert!(
+        !locals.is_empty(),
+        "BUG #4: Rust fn parameter `unique_param` is not indexed — \
+         the tree-sitter Rust query has no capture for function parameters"
+    );
+
+    let def = ws.find_local_definition_at("unique_param", &path, 1);
+    assert!(
+        def.is_some(),
+        "BUG #4: find_local_definition_at returned None for fn parameter \
+         `unique_param`"
+    );
+    assert_eq!(
+        def.unwrap().symbol.line,
+        0,
+        "Should resolve to the signature line of `foo`"
+    );
+}
+
+/// End-to-end reproduction of what the user observes in the editor:
+/// `textDocument/definition` on the use of a local `let` binding should
+/// return the let line. Today it returns empty because locals are not
+/// indexed and `find_definitions` (global) also finds nothing.
+#[test]
+fn bug4_rust_goto_definition_on_let_binding() {
+    let ws = Workspace::new();
+    let source = "pub fn foo(count: usize) -> usize {\n\
+                  \x20   let id_table = count + 1;\n\
+                  \x20   id_table\n\
+                  }\n";
+    let path = PathBuf::from("/src/sample.rs");
+    ws.index_file(path.clone(), source.to_string());
+
+    // Global definitions must be empty (it's a local), and the local
+    // lookup must succeed. Today BOTH are empty, which is why the editor
+    // sees "nothing happens".
+    assert!(
+        ws.find_definitions("id_table").is_empty(),
+        "Precondition: `id_table` should not be a global symbol"
+    );
+    let local = ws.find_local_definition_at("id_table", &path, 2);
+    assert!(
+        local.is_some(),
+        "BUG #4: Go-to-definition on the use of a Rust `let` binding \
+         returns nothing — Rust locals are not extracted by the parser"
+    );
+}
+
+/// When a local variable shadows a global symbol, go-to-definition on
+/// the local must prefer the local — otherwise the editor silently jumps
+/// to the wrong file. This is the `path` case observed against the real
+/// quicklsp workspace: `let path = &id_table[...]` in `resolve_refs`
+/// currently jumps to an unrelated `path` in a test fixture.
+#[test]
+fn bug4_rust_local_shadows_global() {
+    let ws = Workspace::new();
+    // Global `path` defined in one file.
+    ws.index_file(
+        PathBuf::from("/src/other.rs"),
+        "pub const path: &str = \"/tmp\";\n".to_string(),
+    );
+    // Local `path` defined via `let` in another file.
+    let caller_path = PathBuf::from("/src/caller.rs");
+    let caller_src = "pub fn run() -> usize {\n\
+                      \x20   let path = 1usize;\n\
+                      \x20   path + 1\n\
+                      }\n";
+    ws.index_file(caller_path.clone(), caller_src.to_string());
+
+    // The local lookup must find the `let path = 1;` on line 1.
+    let local = ws.find_local_definition_at("path", &caller_path, 2);
+    assert!(
+        local.is_some(),
+        "BUG #4: local `let path = ...` not indexed, so the editor falls \
+         through to the global `pub const path` in other.rs"
+    );
+    assert_eq!(
+        local.unwrap().file,
+        caller_path,
+        "Local `path` should resolve to caller.rs, not other.rs"
+    );
+}
