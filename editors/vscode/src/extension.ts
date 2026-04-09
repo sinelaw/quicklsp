@@ -66,7 +66,6 @@ export async function deactivate(): Promise<void> {
 
 async function startClient(context: vscode.ExtensionContext): Promise<void> {
   const config = vscode.workspace.getConfiguration('quicklsp');
-  const configuredPath = config.get<string>('serverPath', 'quicklsp');
   const serverArgs = config.get<string[]>('serverArgs', []);
   const logLevel = config.get<string>('logLevel', 'info');
   const configuredLanguages = config.get<string[]>('languages', [...ALL_SUPPORTED_LANGUAGES]);
@@ -82,15 +81,28 @@ async function startClient(context: vscode.ExtensionContext): Promise<void> {
     return;
   }
 
-  const resolvedPath = resolveServerPath(configuredPath);
-  if (!resolvedPath) {
+  // Detect an explicit user override (as opposed to the default 'quicklsp'
+  // value). Only an override blocks fallback to the bundled binary.
+  const inspection = config.inspect<string>('serverPath');
+  const explicitOverride =
+    inspection?.workspaceFolderValue ??
+    inspection?.workspaceValue ??
+    inspection?.globalValue;
+
+  const resolved = resolveServerPath(context, explicitOverride);
+  if (!resolved) {
+    const attempted = explicitOverride ?? '(auto-detect)';
     const message =
-      `QuickLSP: could not find the 'quicklsp' executable at '${configuredPath}'. ` +
-      `Install it (e.g. 'cargo install --path .') or set 'quicklsp.serverPath' in your settings.`;
+      `QuickLSP: could not locate the 'quicklsp' executable (tried: ${attempted}). ` +
+      `Install a release .vsix bundled with the server, build 'cargo build --release' ` +
+      `in the repo, or set 'quicklsp.serverPath' explicitly.`;
     outputChannel?.appendLine(message);
     vscode.window.showErrorMessage(message);
     return;
   }
+
+  const { path: resolvedPath, source } = resolved;
+  outputChannel?.appendLine(`Resolved quicklsp from: ${source}`);
 
   outputChannel?.appendLine(`Starting QuickLSP server: ${resolvedPath} ${serverArgs.join(' ')}`);
   outputChannel?.appendLine(`Enabled languages: ${selectedLanguages.join(', ')}`);
@@ -167,29 +179,73 @@ async function restartClient(context: vscode.ExtensionContext): Promise<void> {
   await startClient(context);
 }
 
+interface ResolvedServer {
+  path: string;
+  source: string;
+}
+
 /**
- * Resolve the configured server path. If the path is absolute or relative to a
- * workspace folder we check that it exists; otherwise we defer to the OS to
- * locate it via PATH by returning the command name as-is.
+ * Locate the `quicklsp` binary.
+ *
+ * Priority:
+ *   1. Explicit `quicklsp.serverPath` override from user/workspace settings.
+ *   2. Binary bundled inside a platform-specific `.vsix`
+ *      (`<extensionPath>/server/quicklsp[.exe]`).
+ *   3. Repo-local release build used during extension development
+ *      (`<extensionPath>/../../target/release/quicklsp[.exe]`).
+ *   4. Bare command name `quicklsp` — deferred to the OS PATH resolver.
  */
-function resolveServerPath(configured: string): string | undefined {
-  if (!configured) {
-    return undefined;
-  }
+function resolveServerPath(
+  context: vscode.ExtensionContext,
+  explicitOverride: string | undefined
+): ResolvedServer | undefined {
+  const exeName = process.platform === 'win32' ? 'quicklsp.exe' : 'quicklsp';
 
-  if (path.isAbsolute(configured)) {
-    return fs.existsSync(configured) ? configured : undefined;
-  }
+  // 1. Explicit override — trust it, but still verify existence for absolute
+  //    or workspace-relative paths so users get a clear error.
+  if (explicitOverride && explicitOverride.trim().length > 0) {
+    const override = explicitOverride.trim();
 
-  // Relative paths are resolved against the first workspace folder, if any.
-  const folders = vscode.workspace.workspaceFolders;
-  if (folders && folders.length > 0 && (configured.includes('/') || configured.includes('\\'))) {
-    const candidate = path.resolve(folders[0].uri.fsPath, configured);
-    if (fs.existsSync(candidate)) {
-      return candidate;
+    if (path.isAbsolute(override)) {
+      return fs.existsSync(override)
+        ? { path: override, source: `explicit (${override})` }
+        : undefined;
     }
+
+    if (override.includes('/') || override.includes('\\')) {
+      const folders = vscode.workspace.workspaceFolders;
+      if (folders && folders.length > 0) {
+        const candidate = path.resolve(folders[0].uri.fsPath, override);
+        if (fs.existsSync(candidate)) {
+          return { path: candidate, source: `explicit relative (${candidate})` };
+        }
+      }
+      return undefined;
+    }
+
+    // Bare command name — defer to PATH.
+    return { path: override, source: `explicit on PATH (${override})` };
   }
 
-  // Bare command name — assume it's on PATH and let the OS resolve it.
-  return configured;
+  // 2. Bundled with a platform-specific .vsix.
+  const bundled = path.join(context.extensionPath, 'server', exeName);
+  if (fs.existsSync(bundled)) {
+    return { path: bundled, source: `bundled (${bundled})` };
+  }
+
+  // 3. Repo-local dev build (useful when launching via F5 in this repo).
+  const repoDev = path.resolve(
+    context.extensionPath,
+    '..',
+    '..',
+    'target',
+    'release',
+    exeName
+  );
+  if (fs.existsSync(repoDev)) {
+    return { path: repoDev, source: `repo-local dev build (${repoDev})` };
+  }
+
+  // 4. Last resort: bare command name, let the OS search PATH.
+  return { path: exeName, source: `PATH lookup (${exeName})` };
 }

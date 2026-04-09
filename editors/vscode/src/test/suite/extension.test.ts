@@ -72,4 +72,17 @@ suite('QuickLSP VS Code Extension', () => {
       );
     }
   });
+
+  test('quicklsp.serverPath defaults to empty (auto-detect)', () => {
+    const ext = vscode.extensions.getExtension(EXTENSION_ID);
+    assert.ok(ext);
+    const props = ext!.packageJSON.contributes?.configuration?.properties ?? {};
+    const serverPathSchema = props['quicklsp.serverPath'];
+    assert.ok(serverPathSchema, 'quicklsp.serverPath schema missing');
+    assert.strictEqual(
+      serverPathSchema.default,
+      '',
+      'expected empty-string default so resolver can auto-detect bundled/dev/PATH'
+    );
+  });
 });
