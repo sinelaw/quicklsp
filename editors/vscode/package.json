@@ -1,0 +1,155 @@
+{
+  "name": "quicklsp-vscode",
+  "displayName": "QuickLSP",
+  "description": "High-performance, heuristic-driven universal Language Server for C, C++, Rust, Go, Python, JavaScript, TypeScript, Java, and Ruby.",
+  "version": "0.1.0",
+  "publisher": "sinelaw",
+  "license": "GPL-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sinelaw/quicklsp.git"
+  },
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Linters",
+    "Other"
+  ],
+  "keywords": [
+    "lsp",
+    "language-server",
+    "quicklsp",
+    "c",
+    "cpp",
+    "rust",
+    "go",
+    "python",
+    "javascript",
+    "typescript",
+    "java",
+    "ruby"
+  ],
+  "activationEvents": [
+    "onLanguage:c",
+    "onLanguage:cpp",
+    "onLanguage:rust",
+    "onLanguage:go",
+    "onLanguage:python",
+    "onLanguage:javascript",
+    "onLanguage:javascriptreact",
+    "onLanguage:typescript",
+    "onLanguage:typescriptreact",
+    "onLanguage:java",
+    "onLanguage:ruby"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "quicklsp.restart",
+        "title": "QuickLSP: Restart Language Server"
+      },
+      {
+        "command": "quicklsp.showOutput",
+        "title": "QuickLSP: Show Output Channel"
+      }
+    ],
+    "configuration": {
+      "type": "object",
+      "title": "QuickLSP",
+      "properties": {
+        "quicklsp.serverPath": {
+          "type": "string",
+          "default": "quicklsp",
+          "description": "Path to the quicklsp executable. Defaults to 'quicklsp' (expected to be on PATH)."
+        },
+        "quicklsp.serverArgs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Additional command-line arguments passed to the quicklsp server."
+        },
+        "quicklsp.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "Traces the communication between VS Code and the quicklsp language server."
+        },
+        "quicklsp.logLevel": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warn",
+            "info",
+            "debug",
+            "trace"
+          ],
+          "default": "info",
+          "description": "RUST_LOG level passed to the quicklsp server process."
+        },
+        "quicklsp.languages": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "c",
+              "cpp",
+              "rust",
+              "go",
+              "python",
+              "javascript",
+              "javascriptreact",
+              "typescript",
+              "typescriptreact",
+              "java",
+              "ruby"
+            ]
+          },
+          "default": [
+            "c",
+            "cpp",
+            "rust",
+            "go",
+            "python",
+            "javascript",
+            "javascriptreact",
+            "typescript",
+            "typescriptreact",
+            "java",
+            "ruby"
+          ],
+          "description": "List of VS Code language IDs for which QuickLSP should be activated."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "type-check": "tsc --noEmit -p ./",
+    "pretest": "npm run compile",
+    "test": "node ./out/test/runTest.js",
+    "package": "vsce package --out quicklsp-vscode.vsix"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.10",
+    "@types/node": "^18.19.0",
+    "@types/vscode": "^1.75.0",
+    "@vscode/test-electron": "^2.5.2",
+    "glob": "^11.1.0",
+    "mocha": "^11.7.5",
+    "typescript": "^5.4.5"
+  }
+}
