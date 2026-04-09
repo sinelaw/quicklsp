@@ -647,10 +647,7 @@ impl LanguageServer for QuickLspServer {
                 // body or struct). Top-level definitions — including those inside
                 // #ifdef or namespace blocks — always have depth == 0.
                 !(s.depth > 0
-                    && matches!(
-                        s.def_keyword.as_str(),
-                        "variable" | "parameter" | "field"
-                    ))
+                    && matches!(s.def_keyword.as_str(), "variable" | "parameter" | "field"))
             })
             .map(|s| {
                 let line_str = lines.get(s.line).copied().unwrap_or("");

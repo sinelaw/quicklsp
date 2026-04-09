@@ -345,7 +345,12 @@ pub fn mark(source: &str, tag: &str, token: &str) -> (u32, u32) {
 }
 
 /// Open a fixture file via textDocument/didOpen. Returns (uri, source).
-pub fn open_fixture(server: &mut LspServer, dir: &Path, filename: &str, lang: &str) -> (String, String) {
+pub fn open_fixture(
+    server: &mut LspServer,
+    dir: &Path,
+    filename: &str,
+    lang: &str,
+) -> (String, String) {
     let file_path = dir.join(filename);
     let source = std::fs::read_to_string(&file_path).unwrap();
     let file_uri = format!("file://{}", file_path.display());
@@ -396,7 +401,12 @@ impl TestResults {
 
 // ── Assertion helpers ────────────────────────────────────────────
 
-pub fn check_hover_contains(t: &mut TestResults, resp: &serde_json::Value, substring: &str, ctx: &str) {
+pub fn check_hover_contains(
+    t: &mut TestResults,
+    resp: &serde_json::Value,
+    substring: &str,
+    ctx: &str,
+) {
     if resp.get("error").is_some() {
         t.check(false, format!("{ctx}: hover error: {resp}"));
         return;
@@ -413,7 +423,12 @@ pub fn check_hover_contains(t: &mut TestResults, resp: &serde_json::Value, subst
     );
 }
 
-pub fn check_hover_not_contains(t: &mut TestResults, resp: &serde_json::Value, bad: &str, ctx: &str) {
+pub fn check_hover_not_contains(
+    t: &mut TestResults,
+    resp: &serde_json::Value,
+    bad: &str,
+    ctx: &str,
+) {
     if resp.get("error").is_some() || resp["result"].is_null() {
         t.check(false, format!("{ctx}: hover returned error/null"));
         return;
@@ -550,9 +565,7 @@ pub fn check_completion_contains(
     }
     let result = &resp["result"];
     // Completion can be an array or a CompletionList { items: [...] }
-    let items = result
-        .as_array()
-        .or_else(|| result["items"].as_array());
+    let items = result.as_array().or_else(|| result["items"].as_array());
     match items {
         None => {
             t.check(false, format!("{ctx}: completion result has no items"));
@@ -567,22 +580,19 @@ pub fn check_completion_contains(
     }
 }
 
-pub fn check_completion_non_empty(
-    t: &mut TestResults,
-    resp: &serde_json::Value,
-    ctx: &str,
-) {
+pub fn check_completion_non_empty(t: &mut TestResults, resp: &serde_json::Value, ctx: &str) {
     if resp.get("error").is_some() {
         t.check(false, format!("{ctx}: completion error: {resp}"));
         return;
     }
     let result = &resp["result"];
-    let items = result
-        .as_array()
-        .or_else(|| result["items"].as_array());
+    let items = result.as_array().or_else(|| result["items"].as_array());
     match items {
         None => t.check(false, format!("{ctx}: completion result has no items")),
-        Some(arr) => t.check(!arr.is_empty(), format!("{ctx}: completion returned empty list")),
+        Some(arr) => t.check(
+            !arr.is_empty(),
+            format!("{ctx}: completion returned empty list"),
+        ),
     }
 }
 
