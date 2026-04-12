@@ -192,6 +192,13 @@ impl Manifest {
         }
         tx.commit()
     }
+
+    /// Drop every manifest row. Used on parser-version bump, when every
+    /// cached row is no longer guaranteed to match a FileUnit in Layer A.
+    pub fn clear(&mut self) -> rusqlite::Result<()> {
+        self.conn.execute("DELETE FROM manifest", [])?;
+        Ok(())
+    }
 }
 
 fn row_from_sql(r: &rusqlite::Row) -> rusqlite::Result<ManifestRow> {

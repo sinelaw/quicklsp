@@ -138,6 +138,17 @@ impl Workspace {
         &self.metrics
     }
 
+    /// Test-only: simulate a parser-version bump by overwriting the
+    /// manifest's stored parser_version. After this, the next scan
+    /// behaves as if every cached row were stale.
+    pub fn test_force_manifest_parser_version(&self, v: u32) {
+        if let Ok(guard) = self.cache.read() {
+            if let Some(state) = guard.as_ref() {
+                let _ = state.force_set_parser_version(v);
+            }
+        }
+    }
+
     /// Get or create a FileId for a path. Thread-safe.
     fn get_or_create_file_id(&self, path: &Path) -> FileId {
         if let Some(id) = self.file_ids.get(path) {
@@ -367,13 +378,19 @@ impl Workspace {
         progress: Option<&(dyn Fn(usize, usize) + Send + Sync)>,
     ) -> ScanStats {
         // ── Phase 1: open cache ──────────────────────────────────────────
+        // CacheState::open requires XDG_CACHE_HOME or HOME. On POSIX this
+        // is effectively always present; if not, the scan returns an error
+        // rather than silently degrading — a silent fallback would mask
+        // misconfiguration and produce non-reproducible results.
         let mut state = match CacheState::open(root, self.metrics.clone()) {
             Ok(s) => s,
             Err(e) => {
-                tracing::warn!("Cannot open cache at {}: {e}", root.display());
-                // Degenerate fall-through: treat every file as a cold parse,
-                // no persistence. (Layer A unavailable → parse everything.)
-                return self.scan_directory_no_cache(root, progress);
+                tracing::error!("Cannot open cache at {}: {e}", root.display());
+                return ScanStats {
+                    indexed: 0,
+                    skipped: 0,
+                    errors: 1,
+                };
             }
         };
 
@@ -574,9 +591,11 @@ impl Workspace {
         {
             let mut m = state.manifest.lock().unwrap();
             if !parser_ok {
-                // Parser version mismatch: wipe all stale rows first.
-                let stale: Vec<String> = existing_rows.keys().cloned().collect();
-                let _ = m.delete_rows(&stale);
+                // Parser version mismatch (or first scan): drop every prior
+                // row unconditionally — they may reference FileUnits written
+                // at a different parser version that are not guaranteed to
+                // exist for us.
+                let _ = m.clear();
                 let _ = m.set_parser_version(PARSER_VERSION);
             }
             if !rows.is_empty() {
@@ -662,64 +681,6 @@ impl Workspace {
                     cb(count, total_files);
                 }
             }
-        }
-    }
-
-    /// Degraded scan when the cache cannot be opened (no XDG_CACHE, no HOME).
-    /// Parses every file directly into `self.files` without persistence.
-    fn scan_directory_no_cache(
-        &self,
-        root: &Path,
-        progress: Option<&(dyn Fn(usize, usize) + Send + Sync)>,
-    ) -> ScanStats {
-        let mut paths = Vec::new();
-        let mut skipped = 0usize;
-        Self::collect_paths(root, &self.open_sources, &mut paths, &mut skipped, 0);
-        let total_files = paths.len();
-        let indexed = AtomicUsize::new(0);
-        let errors = AtomicUsize::new(0);
-        let last_progress = AtomicUsize::new(0);
-
-        paths.par_chunks(100).for_each(|chunk| {
-            for path in chunk {
-                match std::fs::read_to_string(path) {
-                    Ok(source) => {
-                        let (symbols, _wh, lang) = Self::parse_file(path, &source);
-                        let fid = self.get_or_create_file_id(path);
-                        for (idx, sym) in symbols.iter().enumerate() {
-                            let is_local = sym.depth > 0
-                                && matches!(
-                                    sym.def_keyword.as_str(),
-                                    "variable" | "parameter" | "field"
-                                );
-                            if !is_local {
-                                self.definitions
-                                    .entry(sym.name.clone())
-                                    .or_default()
-                                    .push(SymbolRef {
-                                        file_id: fid,
-                                        symbol_idx: idx as u32,
-                                    });
-                            }
-                        }
-                        self.files
-                            .insert(path.clone(), FileEntry { symbols, lang });
-                        Self::progress_bump(&indexed, &last_progress, progress, total_files);
-                    }
-                    Err(_) => {
-                        errors.fetch_add(1, Relaxed);
-                    }
-                }
-            }
-        });
-
-        self.fuzzy_dirty
-            .store(true, std::sync::atomic::Ordering::Release);
-
-        ScanStats {
-            indexed: indexed.load(Relaxed),
-            skipped,
-            errors: errors.load(Relaxed),
         }
     }
 

@@ -111,6 +111,17 @@ impl CacheState {
         }
     }
 
+    /// Test-only: force the manifest's stored parser_version to `v`.
+    /// Used by integration tests to simulate a parser-version bump without
+    /// recompiling the PARSER_VERSION constant.
+    pub fn force_set_parser_version(&self, v: ParserVersion) -> std::io::Result<()> {
+        let m = self.manifest.lock().map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::Other, "manifest poisoned")
+        })?;
+        m.set_parser_version(v)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+    }
+
     /// Ensure the manifest's `parser_version` matches. If it doesn't, wipe
     /// the manifest (but not Layer A — other parser versions may share it).
     pub fn check_parser_version(&self, current: ParserVersion) -> std::io::Result<bool> {
