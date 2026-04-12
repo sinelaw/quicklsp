@@ -244,7 +244,158 @@ The design preserves the existing engine shape (`Workspace`, `Symbol`, posting
 lists, rayon-parallel scan) and migrates the cache layer underneath — no rewrite
 of the LSP surface, just a change in what the cache is keyed by and where it lives.
 
-## 9. Open Questions
+## 9. Integration Tests — Objective Validation
+
+These tests validate that the **end-to-end objectives** of the design are met.
+They are behavior-focused (properties over implementation details) and live in
+`tests/cache_v3/`. Each test asserts both a **performance property** (no
+spurious work) and a **correctness property** (results match a baseline).
+
+### 9.1 Instrumentation hooks (test-only)
+
+To measure "no massive scanning", the engine exposes counters under a
+`#[cfg(any(test, feature = "metrics"))]` gate:
+
+```rust
+struct ScanMetrics {
+    files_stat_called:     AtomicU64,
+    files_bytes_read:      AtomicU64,
+    files_blake3_hashed:   AtomicU64,
+    files_parsed:          AtomicU64,   // full tokenize/symbol-extract pass
+    layer_a_writes:        AtomicU64,
+    layer_a_hits:          AtomicU64,
+    manifest_rows_copied:  AtomicU64,   // subsumption
+}
+```
+
+Tests read these before/after operations and assert deltas.
+
+### 9.2 Correctness baseline
+
+Every behavioral test pairs its property assertion with a **result-equivalence
+check** against a freshly-built workspace on the same source, using a
+`query_fixture()` helper that exercises:
+
+- `workspace/symbol` (global fuzzy search) for N representative names.
+- `textDocument/definition` for N (file, line, col) pairs.
+- `textDocument/references` for N symbols.
+- `textDocument/documentSymbol` per file.
+
+The fixture's outputs are normalized (paths → rel_paths, stable sort) and
+compared by equality. **Any reuse optimization that changes observable results
+fails the test.** This is the correctness backstop for every performance claim
+below.
+
+### 9.3 Test matrix
+
+| # | Scenario | Performance property | Correctness property |
+| - | -------- | -------------------- | -------------------- |
+| T1 | Second clone of a known repo at a new path | `files_parsed == 0`; `layer_a_writes == 0`; `files_blake3_hashed ≤ files_stat_called` | Query results identical to first clone |
+| T2 | `git worktree add` of known repo | `files_parsed == 0`; `layer_a_writes == 0` | Identical queries on both worktrees |
+| T3 | Branch switch within one worktree, N files changed | `files_parsed ≤ N`; `layer_a_writes ≤ N` | Results reflect the new branch |
+| T4 | Open parent of indexed subtree | `manifest_rows_copied == rows(child)`; `files_parsed == 0` for subtree | Queries against subtree return same results as before; new siblings indexed |
+| T5 | Open child of indexed parent | `manifest_rows_copied == rows_matching_prefix`; `files_parsed == 0`; `files_blake3_hashed == 0` | Queries restricted to child match parent's results on those paths |
+| T6 | Cross-repo vendored duplicate | Second project's scan: `files_parsed == 0` for duplicated files | `definition`/`references` resolve locally within each project (no cross-project leakage) |
+| T7 | Symbolic link / bind mount / fresh path to same canonical tree | `files_parsed == 0`; Layer B reuses an existing manifest via canonical-path collapse | Identical queries |
+| T8 | Concurrent LSP instances on two worktrees of same repo | No corruption; both processes complete; `layer_a_writes` is the set-union, not the multiset | Identical queries per worktree |
+| T9 | Two LSP instances on the **same** worktree | Only one full scan observed (advisory scan-lock honored); second waits and short-circuits | Identical query results from both |
+| T10 | Force kill during scan | Next start completes; no duplicate Layer A entries; manifest either matches last generation or rebuilds cleanly | Results match fresh baseline |
+| T11 | Parser version bump | All paths re-parse once; Layer A grows with new `parser_v` keys; old entries untouched | Results reflect new parser |
+| T12 | Content change only (whitespace edit → re-save) | `layer_a_writes == 1` (new hash); manifest updates 1 row | Results reflect edit |
+| T13 | Path rename, content unchanged | `files_parsed == 0`; `layer_a_writes == 0`; manifest updates 1 row | Results resolve under new path |
+| T14 | Non-git project opened in two locations | Each location scans independently (no identity match); Layer A still dedups identical files | Identical queries both locations |
+| T15 | Unsaved buffer visibility | Overlay wins within the owning process; other LSP process sees on-disk state | Queries reflect overlay for owner; unaffected elsewhere |
+
+### 9.4 Representative test sketches
+
+**T1 — Clone reuse (the headline test)**
+
+```
+// Setup
+index(repo_a_at_path_1)              // cold, populates Layer A
+baseline := query_fixture(repo_a_at_path_1)
+reset_metrics()
+
+// Act
+index(repo_a_at_path_2)              // second clone, different path
+
+// Assert properties
+assert files_parsed == 0
+assert layer_a_writes == 0
+assert manifest_rows_copied == 0      // no subsumption, just Layer A hits
+assert query_fixture(repo_a_at_path_2) == baseline
+```
+
+**T4 — Parent subsumption**
+
+```
+index(/repo/src)                      // cold
+sub_baseline := query_fixture(/repo/src)
+reset_metrics()
+
+index(/repo)
+
+assert manifest_rows_copied >= file_count(/repo/src)
+assert files_parsed <= file_count(/repo) - file_count(/repo/src)
+// Queries over the subtree must still match:
+assert query_fixture(/repo/src, restrict=True) == sub_baseline
+// And must see the new siblings:
+assert query_fixture(/repo).contains_symbols_from(/repo/tests)
+```
+
+**T8 — Concurrent worktrees**
+
+```
+spawn LSP_1 on worktree_1
+spawn LSP_2 on worktree_2
+in parallel: each does full index + full query_fixture
+
+assert both complete within timeout
+assert no "database is locked" / "segment corrupt" errors in logs
+assert union of parsed files across both == unique_content_count
+assert query results on each worktree match single-process baselines
+```
+
+**T10 — Crash safety**
+
+```
+spawn scanner, SIGKILL halfway through
+restart, run to completion
+assert layer_a has no duplicate hashes
+assert query_fixture() == fresh_baseline_query_fixture()
+```
+
+### 9.5 Fixtures
+
+- **Synthetic repo generator** — deterministic tree of N files across supported
+  languages, with configurable size/duplication to cover Layer A hit rates.
+- **Real-repo smoke test** — pin a small public repo (e.g. a tagged
+  `ripgrep`/`serde` snapshot fetched into `tests/fixtures/` once) and run T1,
+  T2, T3, T4 against it. Guarded behind a feature flag to keep CI fast.
+- **Harness** — a `TestHarness` that:
+  - redirects `XDG_CACHE_HOME` to a temp dir (isolated per test),
+  - spawns real `Workspace` instances (not mocks),
+  - can `git init` / `git clone` / `git worktree add` in tempdirs,
+  - drives the LSP via its real tower-lsp surface so tests exercise the same
+    path production code does.
+
+### 9.6 What we explicitly do **not** test here
+
+- Internal storage engine specifics (segment layout, LMDB txn sizes). Those are
+  covered by unit tests in the relevant modules.
+- Tokenizer correctness on individual files. Already covered by existing
+  `tests/` for the parser.
+- Absolute wall-clock numbers. Tests assert **ratios and counts**
+  (`files_parsed == 0`), not timings, so they're stable across CI hardware.
+
+### 9.7 CI integration
+
+- T1–T7, T11–T15 run on every PR (fast, < ~30s total on synthetic fixtures).
+- T8–T10 (concurrency, crash) run on a nightly workflow with higher timeouts.
+- Metrics regressions (e.g. `files_parsed` creeping above expected bounds in
+  a property test) fail loudly rather than silently degrading.
+
+## 10. Open Questions
 
 - Should `git_oid → blake3` be precomputed at worktree open, or populated lazily?
   Recommend lazy first, precompute later based on telemetry.
