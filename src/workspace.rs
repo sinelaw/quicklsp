@@ -385,16 +385,34 @@ impl Workspace {
         let total_files = paths.len();
 
         // Load existing rows keyed by rel_path (for stat-freshness check).
-        let existing_rows: std::collections::HashMap<String, crate::cache::ManifestRow> = if parser_ok {
-            let m = state.manifest.lock().unwrap();
-            m.all_rows()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|r| (r.rel_path.clone(), r))
-                .collect()
-        } else {
-            std::collections::HashMap::new()
-        };
+        let mut existing_rows: std::collections::HashMap<String, crate::cache::ManifestRow> =
+            if parser_ok {
+                let m = state.manifest.lock().unwrap();
+                m.all_rows()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|r| (r.rel_path.clone(), r))
+                    .collect()
+            } else {
+                std::collections::HashMap::new()
+            };
+
+        // Manifest subsumption (design §5.2): pull in rows from prior
+        // manifests under the same repo_id whose working_dir is an ancestor
+        // or descendant of ours. Our own manifest rows take precedence.
+        let subsumed = state.collect_subsumable_rows();
+        let subsumed_count = subsumed.len() as u64;
+        for r in subsumed {
+            existing_rows.entry(r.rel_path.clone()).or_insert(r);
+        }
+        if subsumed_count > 0 {
+            self.metrics
+                .manifest_rows_copied
+                .fetch_add(subsumed_count, Relaxed);
+            tracing::info!(
+                "manifest subsumption: borrowed {subsumed_count} rows from sibling worktrees"
+            );
+        }
 
         // ── Phase 3: parallel scan → Vec<ScanMsg> ────────────────────────
         let indexed = AtomicUsize::new(0);
