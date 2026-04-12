@@ -58,6 +58,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ahash = "0.8.12"
 
+# Cache v3: content-addressable storage
+blake3 = "1"
+bincode = "1"
+rusqlite = { version = "0.31", features = ["bundled"] }
+
 # Tree-sitter parsing for accurate definitions across all languages
 tree-sitter = "0.25"
 tree-sitter-c = "0.23"

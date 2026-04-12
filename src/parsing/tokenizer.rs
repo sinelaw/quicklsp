@@ -192,7 +192,7 @@ pub enum TokenKind {
 }
 
 /// Visibility of a definition.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Visibility {
     Public,
     Private,
@@ -238,7 +238,7 @@ pub struct DefContext {
 }
 
 /// Language family determines comment/string syntax and definition keywords.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum LangFamily {
     /// Rust: fn, struct, enum, trait, type, const, static, mod
     Rust,

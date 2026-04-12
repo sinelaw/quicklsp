@@ -3,6 +3,7 @@
 //! Single unified `Workspace` engine that tokenizes all files and serves
 //! every LSP operation from one data structure.
 
+pub mod cache;
 pub mod deps;
 pub mod fuzzy;
 pub mod lsp;
