@@ -14,6 +14,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::Arc;
 
 use dashmap::DashMap;
 use rayon::iter::{ParallelBridge, ParallelIterator};
@@ -21,13 +22,12 @@ use rayon::slice::ParallelSlice;
 
 use tower_lsp::lsp_types::Url;
 
+use crate::cache::state::{build_row, CacheOps, CacheState};
+use crate::cache::{word_hash_fnv1a as word_hash, ContentHash, FileUnit, ScanMetrics, PARSER_VERSION};
 use crate::fuzzy::deletion_neighborhood::DeletionIndex;
 use crate::parsing::symbols::Symbol;
 use crate::parsing::tokenizer::{self, LangFamily};
 use crate::parsing::tree_sitter_parse;
-use crate::word_index::{
-    collect_file_mtimes, index_dir_for_project, word_hash, FileData, IndexMeta, LogIndex, LogWriter,
-};
 
 /// A symbol definition with its file location.
 #[derive(Debug, Clone)]
@@ -67,14 +67,16 @@ struct FileEntry {
     lang: Option<LangFamily>,
 }
 
-/// Message sent from parallel scan threads to the log writer thread.
-/// Contains everything needed to write one file's data to the log.
-struct LogWriteMsg {
+/// Message sent from parallel scan threads to the coordinator.
+/// Holds the result of processing one file during a scan.
+struct ScanMsg {
     path: PathBuf,
-    word_hashes: Vec<u32>,
-    symbols: Vec<Symbol>,
-    lang: Option<LangFamily>,
-    mtime: u64,
+    rel_path: String,
+    content_hash: ContentHash,
+    size: u64,
+    mtime_ns: i128,
+    /// Pre-loaded or freshly-parsed FileUnit. Always set.
+    unit: FileUnit,
 }
 
 /// Unified workspace index. One engine, one path, all operations.
@@ -107,9 +109,12 @@ pub struct Workspace {
     /// Set to true when definitions change; cleared when fuzzy index is rebuilt.
     fuzzy_dirty: std::sync::atomic::AtomicBool,
 
-    /// On-disk word index for memory-efficient reference lookups.
+    /// Cache v3 runtime state (Layer A + Layer B + in-memory postings).
     /// None until the first scan_directory completes.
-    word_index: std::sync::RwLock<Option<LogIndex>>,
+    cache: std::sync::RwLock<Option<CacheState>>,
+
+    /// Metric counters exposed to integration tests for objective validation.
+    metrics: Arc<ScanMetrics>,
 }
 
 impl Workspace {
@@ -123,8 +128,14 @@ impl Workspace {
             id_to_path: std::sync::RwLock::new(Vec::new()),
             fuzzy: std::sync::RwLock::new(DeletionIndex::new()),
             fuzzy_dirty: std::sync::atomic::AtomicBool::new(false),
-            word_index: std::sync::RwLock::new(None),
+            cache: std::sync::RwLock::new(None),
+            metrics: Arc::new(ScanMetrics::new()),
         }
+    }
+
+    /// Test-visible scan metrics.
+    pub fn metrics(&self) -> &Arc<ScanMetrics> {
+        &self.metrics
     }
 
     /// Get or create a FileId for a path. Thread-safe.
@@ -281,101 +292,13 @@ impl Workspace {
             .store(false, std::sync::atomic::Ordering::Release);
     }
 
-    /// Try to load cached symbols from a persisted index.
-    ///
-    /// Returns:
-    /// - `WarmResult::FullyFresh` if all files match and nothing needs re-indexing.
-    /// - `WarmResult::PartiallyStale(changed)` if symbols were loaded but some files
-    ///   changed and need re-indexing (the word index must be rebuilt).
-    /// - `WarmResult::Cold` if no usable cache exists.
-    fn try_warm_startup(
-        &self,
-        root: &Path,
-        file_mtimes: &[(PathBuf, std::time::SystemTime)],
-    ) -> WarmResult {
-        let index_dir = match index_dir_for_project(root) {
-            Some(d) => d,
-            None => return WarmResult::Cold,
-        };
-
-        let meta = match IndexMeta::load(&index_dir) {
-            Ok(m) => m,
-            Err(_) => return WarmResult::Cold,
-        };
-
-        if meta.version != crate::word_index::persistence::CURRENT_VERSION {
-            return WarmResult::Cold;
-        }
-
-        // Load the log index (contains paths, word hashes, symbols).
-        let mut index = match LogIndex::load(&index_dir) {
-            Ok(Some(idx)) => idx,
-            Ok(None) => return WarmResult::Cold,
-            Err(e) => {
-                tracing::warn!("Failed to load log index: {e}");
-                return WarmResult::Cold;
-            }
-        };
-
-        // Populate workspace files/definitions/file_ids from the loaded log.
-        self.populate_from_log_index(&mut index);
-        self.fuzzy_dirty
-            .store(true, std::sync::atomic::Ordering::Release);
-
-        let mut changed = changed_files(&meta, file_mtimes);
-
-        // Detect files that are in file_mtimes (on disk) but missing from
-        // the log index — this happens when a previous cold scan raced with
-        // didOpen and the file was skipped from the log writer.
-        if changed.is_empty() && index.file_count() < file_mtimes.len() {
-            for (path, _) in file_mtimes {
-                let path_str = path.to_string_lossy();
-                if !index.path_lookup.contains_key(path_str.as_ref()) {
-                    tracing::info!(
-                        "Warm startup: file missing from log index: {}",
-                        path.display()
-                    );
-                    changed.push(path.clone());
-                }
-            }
-        }
-
-        if changed.is_empty() {
-            tracing::info!(
-                "Warm startup: loaded {} hashes, {} files, {} definitions from {}",
-                index.unique_hash_count(),
-                index.file_count(),
-                self.definitions.len(),
-                index_dir.display(),
-            );
-            *self.word_index.write().unwrap() = Some(index);
-            WarmResult::FullyFresh
-        } else {
-            tracing::info!(
-                "Warm startup: {} cached files loaded, {} files changed",
-                index.file_count(),
-                changed.len(),
-            );
-            // Don't store the index — it will be rebuilt after re-parsing changed files.
-            WarmResult::PartiallyStale(changed)
-        }
-    }
-
-    /// Populate workspace data structures by moving data out of a LogIndex.
-    /// Consumes the `files` from the index to avoid cloning symbols.
-    fn populate_from_log_index(&self, index: &mut LogIndex) {
-        let mut id_table = self.id_to_path.write().unwrap();
-        let files = std::mem::take(&mut index.files);
-        for (path_id, fd) in files {
-            let path_str = &index.path_table[path_id as usize];
-            let path = PathBuf::from(path_str);
-
-            let fid = FileId(id_table.len() as u32);
-            id_table.push(path.clone());
-            self.file_ids.insert(path.clone(), fid);
-
-            // Insert symbols into definitions index.
-            for (idx, sym) in fd.symbols.iter().enumerate() {
+    /// Populate in-memory `files` / `definitions` / `file_ids` for one file.
+    fn install_file_unit(&self, path: PathBuf, unit: &FileUnit) {
+        let fid = self.get_or_create_file_id(&path);
+        for (idx, sym) in unit.symbols.iter().enumerate() {
+            let is_local = sym.depth > 0
+                && matches!(sym.def_keyword.as_str(), "variable" | "parameter" | "field");
+            if !is_local {
                 let sym_ref = SymbolRef {
                     file_id: fid,
                     symbol_idx: idx as u32,
@@ -385,191 +308,353 @@ impl Workspace {
                     .or_default()
                     .push(sym_ref);
             }
-
-            self.files.insert(
-                path,
-                FileEntry {
-                    symbols: fd.symbols,
-                    lang: fd.lang,
-                },
-            );
         }
+        self.files.insert(
+            path,
+            FileEntry {
+                symbols: unit.symbols.clone(),
+                lang: unit.lang,
+            },
+        );
     }
 
-    /// Merge files that were opened via didOpen (and thus skipped by
-    /// `collect_paths`) into the in-memory `LogIndex` so that
-    /// `find_references` covers all workspace files.
-    fn merge_skipped_files_into_index(&self, index: &mut LogIndex) {
-        for entry in self.files.iter() {
+    /// After a scan, walk over any editor-open files that were skipped by
+    /// `collect_paths` (because they were already in `self.files`) and add
+    /// their word hashes to the in-memory posting list so `find_references`
+    /// covers them. Does not write to Layer A — editor overlays are
+    /// per-process (see design §5.5).
+    ///
+    /// `scanned_rels` is the set of rel_paths that were processed this scan
+    /// and thus already have their word_hashes in postings.
+    fn install_open_sources_not_yet_cached(
+        &self,
+        state: &mut CacheState,
+        scanned_rels: &std::collections::HashSet<String>,
+    ) {
+        for entry in self.open_sources.iter() {
             let path = entry.key();
-            let path_str = path.to_string_lossy();
-            if index.path_lookup.contains_key(path_str.as_ref()) {
-                continue; // Already in the log index
-            }
-            // This file was opened via didOpen but skipped by scan.
-            // Compute its word hashes from the editor's source text (or disk).
-            let source = if let Some(src) = self.open_sources.get(path) {
-                src.clone()
-            } else if let Ok(src) = std::fs::read_to_string(path) {
-                src
-            } else {
+            let Some(rel) = state.rel_path(path) else {
                 continue;
             };
-            let (_symbols, word_hashes, _lang) = Self::parse_file(path, &source);
-            if word_hashes.is_empty() {
+            if scanned_rels.contains(&rel) {
                 continue;
             }
-            // Assign a new path_id and insert into the index.
-            let path_id = index.path_table.len() as u32;
-            let owned = path_str.into_owned();
-            index.path_table.push(owned.clone());
-            index.path_lookup.insert(owned, path_id);
-            for &wh in &word_hashes {
-                index.postings.entry(wh).or_default().push(path_id);
+            let source = entry.value().clone();
+            let (_syms, word_hashes, _lang) = Self::parse_file(path, &source);
+            if !word_hashes.is_empty() {
+                state.add_to_postings(&rel, &word_hashes);
             }
-            // Add to files map so file_count is accurate.
-            index.files.insert(
-                path_id,
-                FileData {
-                    word_hashes,
-                    symbols: Vec::new(),
-                    lang: entry.value().lang,
-                    mtime: 0,
-                },
-            );
-            tracing::debug!("Merged didOpen file into word index: {}", path.display());
         }
     }
 
     /// Scan a directory tree and index all files with supported extensions.
     ///
-    /// Phase 0: Compute content hash and try warm startup from persisted index.
-    /// Phase 1: Sequential directory walk to collect file paths.
-    /// Phase 2: Parallel read + tokenize + index (using rayon).
-    /// Phase 3: Rebuild fuzzy index from collected symbols.
-    /// Phase 4: Build on-disk word index from all occurrences.
+    /// Scan a directory tree and index all files with supported extensions.
     ///
-    /// Files already in the index (e.g., from a prior `did_open`) are skipped.
-    /// Scan a directory, index all files, and write the log index.
-    /// The optional `progress` callback receives `(files_done, total_files)`.
+    /// Flow (cache v3):
+    ///   1. Detect repo+worktree identity; open/create cache state (Layer A + B).
+    ///   2. Validate parser_version and stat-freshness against manifest.
+    ///      - If all rows fresh: load FileUnits from Layer A; done.
+    ///   3. Collect candidate paths; partition into fresh (manifest-match) and dirty.
+    ///   4. In parallel, for each dirty path:
+    ///        stat → hash → check Layer A → parse-if-miss → emit ScanMsg.
+    ///   5. Install FileUnits in workspace; bulk-upsert manifest rows; bump generation.
     pub fn scan_directory(
         &self,
         root: &Path,
         progress: Option<&(dyn Fn(usize, usize) + Send + Sync)>,
     ) -> ScanStats {
-        // Phase 0: collect file mtimes and try warm startup
-        let file_mtimes = collect_file_mtimes(root, &should_skip_dir);
-        let warm_result = self.try_warm_startup(root, &file_mtimes);
-
-        if matches!(warm_result, WarmResult::FullyFresh) {
-            let stats = ScanStats {
-                indexed: self.files.len(),
-                skipped: 0,
-                errors: 0,
-            };
-            tracing::info!(
-                "Workspace scan complete (warm): {} files loaded from cache",
-                stats.indexed,
-            );
-            return stats;
-        }
-
-        match warm_result {
-            WarmResult::PartiallyStale(changed) => {
-                // Truly incremental: append only changed files to the log.
-                self.incremental_update(root, &file_mtimes, changed);
-
-                let stats = ScanStats {
-                    indexed: self.files.len(),
-                    skipped: 0,
-                    errors: 0,
-                };
-                tracing::info!(
-                    "Workspace scan complete (incremental): {} files",
-                    stats.indexed,
-                );
-                return stats;
+        // ── Phase 1: open cache ──────────────────────────────────────────
+        let mut state = match CacheState::open(root, self.metrics.clone()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("Cannot open cache at {}: {e}", root.display());
+                // Degenerate fall-through: treat every file as a cold parse,
+                // no persistence. (Layer A unavailable → parse everything.)
+                return self.scan_directory_no_cache(root, progress);
             }
-            WarmResult::Cold => {
-                // Full cold index.
-            }
-            WarmResult::FullyFresh => unreachable!(),
         };
 
-        // Cold path: parallel parse → stream occurrences to writer thread → log.
+        // Parser version check: if bumped, treat manifest as empty.
+        let parser_ok = state.check_parser_version(PARSER_VERSION).unwrap_or(false);
+
+        // ── Phase 2: collect paths and classify against manifest ─────────
         let mut paths = Vec::new();
         let mut skipped = 0usize;
         Self::collect_paths(root, &self.files, &mut paths, &mut skipped, 0);
+        let total_files = paths.len();
 
-        // Build mtime lookup for the writer.
-        let mtime_map: std::collections::HashMap<String, u64> = file_mtimes
-            .iter()
-            .map(|(p, mt)| {
-                let secs = mt
-                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                (p.to_string_lossy().into_owned(), secs)
+        // Load existing rows keyed by rel_path (for stat-freshness check).
+        let existing_rows: std::collections::HashMap<String, crate::cache::ManifestRow> = if parser_ok {
+            let m = state.manifest.lock().unwrap();
+            m.all_rows()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|r| (r.rel_path.clone(), r))
+                .collect()
+        } else {
+            std::collections::HashMap::new()
+        };
+
+        // ── Phase 3: parallel scan → Vec<ScanMsg> ────────────────────────
+        let indexed = AtomicUsize::new(0);
+        let errors = AtomicUsize::new(0);
+        let last_progress = AtomicUsize::new(0);
+
+        let working_dir = state.identity.working_dir.clone();
+        let content_store = state.content_store.clone();
+        let metrics = self.metrics.clone();
+        let existing_rows = Arc::new(existing_rows);
+
+        let scan_results: Vec<ScanMsg> = paths
+            .par_chunks(100)
+            .flat_map_iter(|chunk| {
+                let mut out = Vec::with_capacity(chunk.len());
+                for path in chunk {
+                    let rel_path = rel_path_for(path, &working_dir);
+
+                    let meta = match std::fs::metadata(path) {
+                        Ok(m) => m,
+                        Err(_) => {
+                            errors.fetch_add(1, Relaxed);
+                            continue;
+                        }
+                    };
+                    metrics.files_stat_called.fetch_add(1, Relaxed);
+                    let size = meta.len();
+                    let mtime_ns = meta
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_nanos() as i128)
+                        .unwrap_or(0);
+
+                    // Fast path: stat match → load FileUnit from Layer A.
+                    if let Some(row) = existing_rows.get(&rel_path) {
+                        if row.size == size && row.mtime_ns == mtime_ns {
+                            if let Some(unit) =
+                                content_store.get(&row.content_hash, PARSER_VERSION)
+                            {
+                                out.push(ScanMsg {
+                                    path: path.clone(),
+                                    rel_path: rel_path.clone(),
+                                    content_hash: row.content_hash,
+                                    size,
+                                    mtime_ns,
+                                    unit,
+                                });
+                                Self::progress_bump(
+                                    &indexed,
+                                    &last_progress,
+                                    progress,
+                                    total_files,
+                                );
+                                continue;
+                            }
+                        }
+                    }
+
+                    // Slow path: read + hash + (maybe) parse.
+                    let bytes = match std::fs::read(path) {
+                        Ok(b) => b,
+                        Err(_) => {
+                            errors.fetch_add(1, Relaxed);
+                            continue;
+                        }
+                    };
+                    metrics.files_bytes_read.fetch_add(bytes.len() as u64, Relaxed);
+                    metrics.files_blake3_hashed.fetch_add(1, Relaxed);
+                    let content_hash = ContentHash::of_bytes(&bytes);
+
+                    let source = String::from_utf8_lossy(&bytes).into_owned();
+
+                    let parse_path = path.clone();
+                    let source_ref = &source;
+                    let unit = match CacheOps::ensure_file_unit(
+                        &content_store,
+                        &metrics,
+                        &content_hash,
+                        PARSER_VERSION,
+                        || {
+                            let (symbols, word_hashes, lang) =
+                                Self::parse_file(&parse_path, source_ref);
+                            FileUnit {
+                                parser_version: PARSER_VERSION,
+                                lang,
+                                symbols,
+                                word_hashes,
+                            }
+                        },
+                    ) {
+                        Ok(u) => u,
+                        Err(e) => {
+                            tracing::warn!(
+                                "content_store write failed for {}: {e}",
+                                path.display()
+                            );
+                            errors.fetch_add(1, Relaxed);
+                            continue;
+                        }
+                    };
+
+                    out.push(ScanMsg {
+                        path: path.clone(),
+                        rel_path,
+                        content_hash,
+                        size,
+                        mtime_ns,
+                        unit,
+                    });
+
+                    Self::progress_bump(&indexed, &last_progress, progress, total_files);
+                }
+                out
             })
             .collect();
 
-        // Set up channel: parallel producers → single writer consumer.
-        let (tx, rx) = std::sync::mpsc::sync_channel::<LogWriteMsg>(128);
+        // ── Phase 4: install in memory + collect rows ────────────────────
+        let generation = {
+            let m = state.manifest.lock().unwrap();
+            m.generation().unwrap_or(0) + 1
+        };
+        let mut rows = Vec::with_capacity(scan_results.len());
+        for msg in scan_results {
+            let lang_u32 = msg.unit.lang.map(lang_to_u32);
+            rows.push(build_row(
+                msg.rel_path.clone(),
+                msg.content_hash,
+                lang_u32,
+                msg.size,
+                msg.mtime_ns,
+                generation,
+            ));
+            state.add_to_postings(&msg.rel_path, &msg.unit.word_hashes);
+            self.install_file_unit(msg.path, &msg.unit);
+        }
 
-        // Spawn writer thread.
-        let index_dir = index_dir_for_project(root);
-        let writer_handle = if let Some(ref idx_dir) = index_dir {
-            let _ = std::fs::create_dir_all(idx_dir);
-            let idx_dir = idx_dir.clone();
-            Some(std::thread::spawn(move || -> std::io::Result<()> {
-                let t0 = std::time::Instant::now();
-                let mut w = LogWriter::create(&idx_dir)?;
-                let mut files_written = 0usize;
-                let mut total_hashes = 0usize;
-
-                for msg in rx {
-                    let path_id = w.intern_path(&msg.path)?;
-                    total_hashes += msg.word_hashes.len();
-                    w.write_file_data(
-                        path_id,
-                        msg.mtime,
-                        &msg.word_hashes,
-                        &msg.symbols,
-                        msg.lang,
-                    )?;
-
-                    files_written += 1;
-                    if files_written % 10000 == 0 {
-                        tracing::info!(
-                            "log writer progress: {}/{} files, {} hashes, {:.1}s, {}",
-                            files_written,
-                            "?",
-                            total_hashes,
-                            t0.elapsed().as_secs_f64(),
-                            rss_summary(),
-                        );
+        // Detect rows in manifest that no longer exist on disk → delete.
+        let live_rels: std::collections::HashSet<&str> =
+            rows.iter().map(|r| r.rel_path.as_str()).collect();
+        let mut dead: Vec<String> = Vec::new();
+        if parser_ok {
+            for (rel, _) in existing_rows.iter() {
+                if !live_rels.contains(rel.as_str()) {
+                    // File is in manifest but not in current scan → removed.
+                    // But only delete if it's actually missing (not just outside
+                    // the collect_paths subtree because of skip dirs).
+                    let abs = state.abs_path(rel);
+                    if !abs.exists() {
+                        dead.push(rel.clone());
                     }
                 }
+            }
+        }
 
-                w.flush()?;
-                tracing::info!(
-                    "log writer done: {} files, {} hashes, {:.1}s, {}",
-                    files_written,
-                    total_hashes,
-                    t0.elapsed().as_secs_f64(),
-                    rss_summary(),
-                );
-                Ok(())
-            }))
-        } else {
-            // No index dir — just drain the channel.
-            Some(std::thread::spawn(move || -> std::io::Result<()> {
-                for _ in rx {}
-                Ok(())
-            }))
+        // ── Phase 5: persist manifest changes ────────────────────────────
+        {
+            let mut m = state.manifest.lock().unwrap();
+            if !parser_ok {
+                // Parser version mismatch: wipe all stale rows first.
+                let stale: Vec<String> = existing_rows.keys().cloned().collect();
+                let _ = m.delete_rows(&stale);
+                let _ = m.set_parser_version(PARSER_VERSION);
+            }
+            if !rows.is_empty() {
+                if let Err(e) = m.put_rows(&rows) {
+                    tracing::warn!("manifest upsert failed: {e}");
+                }
+            }
+            if !dead.is_empty() {
+                let _ = m.delete_rows(&dead);
+                // Clean up in-memory state too.
+                for rel in &dead {
+                    let abs = state.abs_path(rel);
+                    self.remove_definitions_for_file(&abs);
+                    self.files.remove(&abs);
+                }
+                drop(m);
+                for rel in &dead {
+                    state.remove_from_postings(rel);
+                }
+            } else {
+                drop(m);
+            }
+            // Re-lock to bump generation.
+            let m = state.manifest.lock().unwrap();
+            let _ = m.set_meta("generation", &generation.to_string());
+        }
+
+        // Fold in didOpen files whose rel_path was not processed this scan
+        // (because collect_paths skipped them as already-indexed).
+        let scanned_rels: std::collections::HashSet<String> =
+            rows.iter().map(|r| r.rel_path.clone()).collect();
+        self.install_open_sources_not_yet_cached(&mut state, &scanned_rels);
+
+        self.fuzzy_dirty
+            .store(true, std::sync::atomic::Ordering::Release);
+
+        // Strip doc_comment/signature to reduce resident memory.
+        for mut entry in self.files.iter_mut() {
+            for sym in &mut entry.value_mut().symbols {
+                sym.doc_comment = None;
+                sym.signature = None;
+            }
+        }
+
+        // Return freed memory to the OS.
+        #[cfg(target_os = "linux")]
+        unsafe {
+            libc::malloc_trim(0);
+        }
+
+        *self.cache.write().unwrap() = Some(state);
+
+        let stats = ScanStats {
+            indexed: indexed.load(Relaxed),
+            skipped,
+            errors: errors.load(Relaxed),
         };
+        tracing::info!(
+            "Workspace scan complete: {} indexed, {} skipped, {} errors, {} removed",
+            stats.indexed,
+            stats.skipped,
+            stats.errors,
+            dead.len(),
+        );
+        stats
+    }
 
-        // Parallel scan: parse files, send to writer.
+    /// Progress reporting helper.
+    fn progress_bump(
+        indexed: &AtomicUsize,
+        last_progress: &AtomicUsize,
+        progress: Option<&(dyn Fn(usize, usize) + Send + Sync)>,
+        total_files: usize,
+    ) {
+        let count = indexed.fetch_add(1, Relaxed) + 1;
+        if let Some(cb) = progress {
+            let prev = last_progress.load(Relaxed);
+            if count >= prev + 500 || count == total_files {
+                if last_progress
+                    .compare_exchange(prev, count, Relaxed, Relaxed)
+                    .is_ok()
+                {
+                    cb(count, total_files);
+                }
+            }
+        }
+    }
+
+    /// Degraded scan when the cache cannot be opened (no XDG_CACHE, no HOME).
+    /// Parses every file directly into `self.files` without persistence.
+    fn scan_directory_no_cache(
+        &self,
+        root: &Path,
+        progress: Option<&(dyn Fn(usize, usize) + Send + Sync)>,
+    ) -> ScanStats {
+        let mut paths = Vec::new();
+        let mut skipped = 0usize;
+        Self::collect_paths(root, &self.files, &mut paths, &mut skipped, 0);
         let total_files = paths.len();
         let indexed = AtomicUsize::new(0);
         let errors = AtomicUsize::new(0);
@@ -579,31 +664,27 @@ impl Workspace {
             for path in chunk {
                 match std::fs::read_to_string(path) {
                     Ok(source) => {
-                        let (symbols, word_hashes, lang) = Self::parse_file(path, &source);
-                        let mtime = mtime_map
-                            .get(&path.to_string_lossy().into_owned())
-                            .copied()
-                            .unwrap_or(0);
-                        let _ = tx.send(LogWriteMsg {
-                            path: path.clone(),
-                            word_hashes,
-                            symbols,
-                            lang,
-                            mtime,
-                        });
-                        let count = indexed.fetch_add(1, Relaxed) + 1;
-                        // Report progress every 500 files.
-                        if let Some(cb) = progress {
-                            let prev = last_progress.load(Relaxed);
-                            if count >= prev + 500 || count == total_files {
-                                if last_progress
-                                    .compare_exchange(prev, count, Relaxed, Relaxed)
-                                    .is_ok()
-                                {
-                                    cb(count, total_files);
-                                }
+                        let (symbols, _wh, lang) = Self::parse_file(path, &source);
+                        let fid = self.get_or_create_file_id(path);
+                        for (idx, sym) in symbols.iter().enumerate() {
+                            let is_local = sym.depth > 0
+                                && matches!(
+                                    sym.def_keyword.as_str(),
+                                    "variable" | "parameter" | "field"
+                                );
+                            if !is_local {
+                                self.definitions
+                                    .entry(sym.name.clone())
+                                    .or_default()
+                                    .push(SymbolRef {
+                                        file_id: fid,
+                                        symbol_idx: idx as u32,
+                                    });
                             }
                         }
+                        self.files
+                            .insert(path.clone(), FileEntry { symbols, lang });
+                        Self::progress_bump(&indexed, &last_progress, progress, total_files);
                     }
                     Err(_) => {
                         errors.fetch_add(1, Relaxed);
@@ -612,102 +693,14 @@ impl Workspace {
             }
         });
 
-        // Close the channel and wait for writer to finish.
-        drop(tx);
-        tracing::info!(
-            "Indexed {} files, waiting for log writer, {}",
-            indexed.load(Relaxed),
-            Self::rss_summary()
-        );
-
-        if let Some(handle) = writer_handle {
-            match handle.join() {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => tracing::warn!("Log writer failed: {e}"),
-                Err(_) => tracing::warn!("Log writer thread panicked"),
-            }
-        }
-
-        // Return freed memory to the OS before the large LogIndex allocation.
-        // Rayon worker threads and the writer thread accumulate freed pages in
-        // glibc's per-thread arenas that won't be returned without this.
-        #[cfg(target_os = "linux")]
-        unsafe {
-            libc::malloc_trim(0);
-        }
-        tracing::info!("After malloc_trim (pre-reload): {}", Self::rss_summary());
-
-        // Load the written log index.
-        if let Some(ref idx_dir) = index_dir {
-            let tl = std::time::Instant::now();
-            match LogIndex::load(idx_dir) {
-                Ok(Some(mut index)) => {
-                    let meta = IndexMeta {
-                        version: crate::word_index::persistence::CURRENT_VERSION,
-                        file_count: index.file_count() as u64,
-                        entry_count: 0,
-                        word_count: index.unique_hash_count() as u64,
-                        built_at: std::time::SystemTime::now()
-                            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0),
-                        file_mtimes: IndexMeta::build_mtime_map(&file_mtimes),
-                    };
-                    if let Err(e) = meta.save(idx_dir) {
-                        tracing::warn!("Failed to save index metadata: {e}");
-                    }
-                    // Populate workspace files/definitions from the log.
-                    self.populate_from_log_index(&mut index);
-
-                    // Merge files that were opened via didOpen (and thus skipped
-                    // by collect_paths) into the word index so find_references
-                    // covers all workspace files.
-                    self.merge_skipped_files_into_index(&mut index);
-
-                    tracing::info!(
-                        "Log index loaded: {} files, {} hashes, {:.1}s, {}",
-                        index.file_count(),
-                        index.unique_hash_count(),
-                        tl.elapsed().as_secs_f64(),
-                        Self::rss_summary(),
-                    );
-                    *self.word_index.write().unwrap() = Some(index);
-                }
-                Ok(None) => tracing::warn!("Log not found after write"),
-                Err(e) => tracing::warn!("Failed to load log index: {e}"),
-            }
-        }
-
         self.fuzzy_dirty
             .store(true, std::sync::atomic::Ordering::Release);
-        tracing::info!("Log index written, {}", Self::rss_summary());
 
-        // Strip doc_comment and signature from symbols to reduce resident memory.
-        for mut entry in self.files.iter_mut() {
-            for sym in &mut entry.value_mut().symbols {
-                sym.doc_comment = None;
-                sym.signature = None;
-            }
-        }
-
-        #[cfg(target_os = "linux")]
-        unsafe {
-            libc::malloc_trim(0);
-        }
-
-        let stats = ScanStats {
+        ScanStats {
             indexed: indexed.load(Relaxed),
             skipped,
             errors: errors.load(Relaxed),
-        };
-        tracing::info!(
-            "Workspace scan complete: {} files indexed, {} skipped, {} errors{}",
-            stats.indexed,
-            stats.skipped,
-            stats.errors,
-            "",
-        );
-        stats
+        }
     }
 
     /// Maximum directory depth for workspace scanning.
@@ -997,10 +990,10 @@ impl Workspace {
     /// If an on-disk word index is available, uses seek-based lookup (O(1) I/O).
     /// Otherwise falls back to word-boundary text search across all files.
     pub fn find_references(&self, name: &str) -> Vec<Reference> {
-        // Use the log-based word index to narrow down to candidate files,
+        // Use the posting list to narrow down to candidate files,
         // then re-scan those files for exact positions.
-        let candidate_files: Option<Vec<PathBuf>> = if let Ok(guard) = self.word_index.read() {
-            guard.as_ref().map(|index| index.find_files(name))
+        let candidate_files: Option<Vec<PathBuf>> = if let Ok(guard) = self.cache.read() {
+            guard.as_ref().map(|state| state.candidate_files(name))
         } else {
             None
         };
@@ -1008,7 +1001,7 @@ impl Workspace {
         let files_to_scan: Vec<PathBuf> = match candidate_files {
             Some(files) if !files.is_empty() => files,
             _ => {
-                // No index or no hits — fall back to scanning all files.
+                // No cache or no hits — fall back to scanning all files.
                 self.files.iter().map(|e| e.key().clone()).collect()
             }
         };
@@ -1138,129 +1131,6 @@ impl Workspace {
         Some((sig, doc))
     }
 
-    /// Incremental update: append only changed files to the existing log.
-    /// O(changed files), not O(total files).
-    fn incremental_update(
-        &self,
-        root: &Path,
-        file_mtimes: &[(PathBuf, std::time::SystemTime)],
-        changed: Vec<PathBuf>,
-    ) {
-        let index_dir = match index_dir_for_project(root) {
-            Some(d) => d,
-            None => {
-                tracing::warn!("Cannot determine cache directory");
-                return;
-            }
-        };
-
-        // Load the existing log index to seed the append writer.
-        let index = match LogIndex::load(&index_dir) {
-            Ok(Some(idx)) => idx,
-            _ => {
-                tracing::warn!("Cannot load existing log for incremental update");
-                return;
-            }
-        };
-
-        // Open log for appending.
-        let mut w = match LogWriter::open_append(&index_dir, &index) {
-            Ok(w) => w,
-            Err(e) => {
-                tracing::warn!("Cannot open log for append: {e}");
-                return;
-            }
-        };
-
-        let mtime_map: std::collections::HashMap<String, u64> = file_mtimes
-            .iter()
-            .map(|(p, mt)| {
-                let secs = mt
-                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                (p.to_string_lossy().into_owned(), secs)
-            })
-            .collect();
-
-        let mut appended = 0usize;
-        for path in &changed {
-            // Check if file still exists (could be deleted).
-            if !path.exists() {
-                // File was removed.
-                if let Some(&pid) = index.path_lookup.get(&path.to_string_lossy().into_owned()) {
-                    if let Err(e) = w.write_file_removed(pid) {
-                        tracing::warn!("Failed to write file removal: {e}");
-                    }
-                    // Update in-memory workspace.
-                    self.remove_definitions_for_file(path);
-                    self.files.remove(path);
-                }
-                continue;
-            }
-
-            let source = match std::fs::read_to_string(path) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-
-            // Parse file: get symbols + hashes, update workspace state.
-            let (symbols, word_hashes, lang) = Self::parse_file(path, &source);
-            self.insert_file_entry(path.clone(), symbols.clone(), lang, false);
-
-            let path_id = match w.intern_path(path) {
-                Ok(id) => id,
-                Err(e) => {
-                    tracing::warn!("intern_path failed: {e}");
-                    continue;
-                }
-            };
-            let mtime = mtime_map
-                .get(&path.to_string_lossy().into_owned())
-                .copied()
-                .unwrap_or(0);
-
-            if let Err(e) = w.write_file_data(path_id, mtime, &word_hashes, &symbols, lang) {
-                tracing::warn!("Failed to write file data: {e}");
-            }
-            appended += 1;
-        }
-
-        if let Err(e) = w.flush() {
-            tracing::warn!("Failed to flush log: {e}");
-            return;
-        }
-        drop(w);
-
-        tracing::info!("Incremental: appended {} files to log", appended);
-
-        // Reload the log to get updated in-memory index.
-        match LogIndex::load(&index_dir) {
-            Ok(Some(new_index)) => {
-                // Update meta.json with new mtimes.
-                let meta = IndexMeta {
-                    version: crate::word_index::persistence::CURRENT_VERSION,
-                    file_count: new_index.file_count() as u64,
-                    entry_count: 0,
-                    word_count: new_index.unique_hash_count() as u64,
-                    built_at: std::time::SystemTime::now()
-                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0),
-                    file_mtimes: IndexMeta::build_mtime_map(file_mtimes),
-                };
-                if let Err(e) = meta.save(&index_dir) {
-                    tracing::warn!("Failed to save meta: {e}");
-                }
-                *self.word_index.write().unwrap() = Some(new_index);
-            }
-            Ok(None) => tracing::warn!("Log not found after incremental append"),
-            Err(e) => tracing::warn!("Failed to reload log: {e}"),
-        }
-
-        self.fuzzy_dirty
-            .store(true, std::sync::atomic::Ordering::Release);
-    }
 
     /// Re-extract doc_comment and signature from source if they were stripped.
     pub fn enrich_symbol_if_needed(&self, loc: &mut SymbolLocation) {
@@ -1436,13 +1306,27 @@ impl Workspace {
         };
         breakdown.push(("fuzzy index", fuzzy_size));
 
-        // 4. log index (in-memory postings + occurrences)
-        let word_index_size = if let Ok(guard) = self.word_index.read() {
-            guard.as_ref().map(|wi| wi.memory_usage()).unwrap_or(0)
+        // 4. cache v3 postings (word_hash → rel_paths)
+        let postings_size = if let Ok(guard) = self.cache.read() {
+            guard
+                .as_ref()
+                .map(|state| {
+                    state
+                        .postings
+                        .iter()
+                        .map(|(_, v)| {
+                            std::mem::size_of::<Vec<String>>()
+                                + v.iter()
+                                    .map(|s| std::mem::size_of::<String>() + s.len())
+                                    .sum::<usize>()
+                        })
+                        .sum()
+                })
+                .unwrap_or(0)
         } else {
             0
         };
-        breakdown.push(("log index (postings)", word_index_size));
+        breakdown.push(("cache postings", postings_size));
 
         // 5. open_sources (should be 0 for scan_directory benchmarks)
         let open_sources_size: usize = self
@@ -1461,10 +1345,6 @@ impl Workspace {
         breakdown
     }
 
-    fn rss_summary() -> String {
-        rss_summary()
-    }
-
     fn symbol_deep_size(sym: &Symbol) -> usize {
         std::mem::size_of::<Symbol>()
             + sym.name.len()
@@ -1481,329 +1361,32 @@ impl Default for Workspace {
     }
 }
 
-// ── Warm startup types ────────────────────────────────────────────────
 
-enum WarmResult {
-    /// All files match — no re-indexing needed.
-    FullyFresh,
-    /// Some files changed — these need re-parsing + word index rebuild.
-    PartiallyStale(Vec<PathBuf>),
-    /// No usable cache — full cold index.
-    Cold,
-}
-
-/// Read RSS and VM from /proc/self/statm.
-fn rss_summary() -> String {
-    let Ok(statm) = std::fs::read_to_string("/proc/self/statm") else {
-        return "rss=N/A".to_string();
-    };
-    let mut fields = statm.split_whitespace();
-    let vm_pages: usize = fields.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-    let rss_pages: usize = fields.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-    let page_size = 4096;
-    format!(
-        "rss={:.0} MB, vm={:.0} MB",
-        (rss_pages * page_size) as f64 / (1024.0 * 1024.0),
-        (vm_pages * page_size) as f64 / (1024.0 * 1024.0),
-    )
-}
-
-/// Compare current file mtimes against the cached meta to find changed files.
-/// Returns paths of files that were added, modified, or removed.
-fn changed_files(
-    meta: &IndexMeta,
-    current_mtimes: &[(PathBuf, std::time::SystemTime)],
-) -> Vec<PathBuf> {
-    let mut changed = Vec::new();
-
-    // Check for new or modified files.
-    for (path, mtime) in current_mtimes {
-        let secs = mtime
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let path_str = path.to_string_lossy();
-        match meta.file_mtimes.get(path_str.as_ref()) {
-            Some(&stored) if stored == secs => {} // unchanged
-            _ => changed.push(path.clone()),      // new or modified
+/// Resolve `path` to a manifest-relative path string rooted at `working_dir`.
+/// Falls back to the absolute path if the file is outside the worktree root
+/// (e.g. symlinked from elsewhere).
+fn rel_path_for(path: &Path, working_dir: &Path) -> String {
+    if let Ok(stripped) = path.strip_prefix(working_dir) {
+        return stripped.to_string_lossy().into_owned();
+    }
+    if let Ok(canon) = std::fs::canonicalize(path) {
+        if let Ok(stripped) = canon.strip_prefix(working_dir) {
+            return stripped.to_string_lossy().into_owned();
         }
     }
-
-    // Check for removed files (in meta but not in current).
-    let current_set: std::collections::HashSet<String> = current_mtimes
-        .iter()
-        .map(|(p, _)| p.to_string_lossy().into_owned())
-        .collect();
-    for path_str in meta.file_mtimes.keys() {
-        if !current_set.contains(path_str) {
-            changed.push(PathBuf::from(path_str));
-        }
-    }
-
-    changed
+    path.to_string_lossy().into_owned()
 }
 
-// ── Symbol persistence for warm startup ───────────────────────────────
-
-use crate::parsing::symbols::SymbolKind;
-use crate::parsing::tokenizer::Visibility;
-use std::io::{BufReader, BufWriter, Read as IoRead, Write as IoWrite};
-
-const SYMBOLS_MAGIC: &[u8; 8] = b"QLSY\x01\x00\x00\x00";
-
-/// Save all file symbols + definitions to a compact binary file.
-/// Excludes doc_comment and signature (already stripped).
-fn save_symbols(files: &DashMap<PathBuf, FileEntry>, index_dir: &Path) -> std::io::Result<()> {
-    let path = index_dir.join("symbols.bin");
-    let mut w = BufWriter::with_capacity(1 << 20, std::fs::File::create(&path)?);
-
-    w.write_all(SYMBOLS_MAGIC)?;
-    let file_count = files.len() as u32;
-    w.write_all(&file_count.to_le_bytes())?;
-
-    for entry in files.iter() {
-        let path_bytes = entry.key().to_string_lossy();
-        let path_bytes = path_bytes.as_bytes();
-        w.write_all(&(path_bytes.len() as u32).to_le_bytes())?;
-        w.write_all(path_bytes)?;
-
-        let lang_byte = match entry.value().lang {
-            None => 0u8,
-            Some(LangFamily::CLike) => 1,
-            Some(LangFamily::Rust) => 2,
-            Some(LangFamily::Python) => 3,
-            Some(LangFamily::JsTs) => 4,
-            Some(LangFamily::Go) => 5,
-            Some(LangFamily::JavaCSharp) => 6,
-            Some(LangFamily::Ruby) => 7,
-        };
-        w.write_all(&[lang_byte])?;
-
-        let sym_count = entry.value().symbols.len() as u32;
-        w.write_all(&sym_count.to_le_bytes())?;
-
-        for sym in &entry.value().symbols {
-            // name
-            w.write_all(&(sym.name.len() as u16).to_le_bytes())?;
-            w.write_all(sym.name.as_bytes())?;
-            // kind
-            w.write_all(&[symbol_kind_to_u8(sym.kind)])?;
-            // line, col
-            w.write_all(&(sym.line as u32).to_le_bytes())?;
-            w.write_all(&(sym.col as u32).to_le_bytes())?;
-            // def_keyword
-            w.write_all(&(sym.def_keyword.len() as u16).to_le_bytes())?;
-            w.write_all(sym.def_keyword.as_bytes())?;
-            // visibility
-            w.write_all(&[visibility_to_u8(sym.visibility)])?;
-            // container
-            match &sym.container {
-                Some(c) => {
-                    w.write_all(&[1u8])?;
-                    w.write_all(&(c.len() as u16).to_le_bytes())?;
-                    w.write_all(c.as_bytes())?;
-                }
-                None => w.write_all(&[0u8])?,
-            }
-            // depth
-            w.write_all(&(sym.depth as u32).to_le_bytes())?;
-        }
-    }
-    w.flush()?;
-    Ok(())
-}
-
-/// Load symbols from disk and populate files, definitions, file_ids, id_to_path.
-fn load_symbols(
-    files: &DashMap<PathBuf, FileEntry>,
-    definitions: &DashMap<String, Vec<SymbolRef>>,
-    file_ids: &DashMap<PathBuf, FileId>,
-    id_to_path: &std::sync::RwLock<Vec<PathBuf>>,
-    index_dir: &Path,
-) -> std::io::Result<()> {
-    let path = index_dir.join("symbols.bin");
-    let mut r = BufReader::with_capacity(1 << 20, std::fs::File::open(&path)?);
-
-    let mut magic = [0u8; 8];
-    r.read_exact(&mut magic)?;
-    if &magic != SYMBOLS_MAGIC {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "bad symbols magic",
-        ));
-    }
-
-    let mut buf4 = [0u8; 4];
-    r.read_exact(&mut buf4)?;
-    let file_count = u32::from_le_bytes(buf4);
-
-    let mut id_table = id_to_path.write().unwrap();
-
-    for _ in 0..file_count {
-        // path
-        r.read_exact(&mut buf4)?;
-        let path_len = u32::from_le_bytes(buf4) as usize;
-        let mut path_bytes = vec![0u8; path_len];
-        r.read_exact(&mut path_bytes)?;
-        let file_path = PathBuf::from(String::from_utf8_lossy(&path_bytes).into_owned());
-
-        // lang
-        let mut lang_byte = [0u8; 1];
-        r.read_exact(&mut lang_byte)?;
-        let lang = match lang_byte[0] {
-            1 => Some(LangFamily::CLike),
-            2 => Some(LangFamily::Rust),
-            3 => Some(LangFamily::Python),
-            4 => Some(LangFamily::JsTs),
-            5 => Some(LangFamily::Go),
-            6 => Some(LangFamily::JavaCSharp),
-            7 => Some(LangFamily::Ruby),
-            _ => None,
-        };
-
-        // sym_count
-        r.read_exact(&mut buf4)?;
-        let sym_count = u32::from_le_bytes(buf4) as usize;
-
-        // Assign file_id
-        let fid = FileId(id_table.len() as u32);
-        id_table.push(file_path.clone());
-        file_ids.insert(file_path.clone(), fid);
-
-        let mut symbols = Vec::with_capacity(sym_count);
-        for sym_idx in 0..sym_count {
-            let sym = read_symbol(&mut r)?;
-
-            // Insert into definitions
-            let sym_ref = SymbolRef {
-                file_id: fid,
-                symbol_idx: sym_idx as u32,
-            };
-            definitions
-                .entry(sym.name.clone())
-                .or_default()
-                .push(sym_ref);
-
-            symbols.push(sym);
-        }
-
-        files.insert(file_path, FileEntry { symbols, lang });
-    }
-
-    Ok(())
-}
-
-fn read_symbol(r: &mut impl IoRead) -> std::io::Result<Symbol> {
-    let mut buf2 = [0u8; 2];
-    let mut buf4 = [0u8; 4];
-    let mut buf1 = [0u8; 1];
-
-    // name
-    r.read_exact(&mut buf2)?;
-    let name_len = u16::from_le_bytes(buf2) as usize;
-    let mut name_bytes = vec![0u8; name_len];
-    r.read_exact(&mut name_bytes)?;
-    let name = String::from_utf8_lossy(&name_bytes).into_owned();
-
-    // kind
-    r.read_exact(&mut buf1)?;
-    let kind = u8_to_symbol_kind(buf1[0]);
-
-    // line, col
-    r.read_exact(&mut buf4)?;
-    let line = u32::from_le_bytes(buf4) as usize;
-    r.read_exact(&mut buf4)?;
-    let col = u32::from_le_bytes(buf4) as usize;
-
-    // def_keyword
-    r.read_exact(&mut buf2)?;
-    let kw_len = u16::from_le_bytes(buf2) as usize;
-    let mut kw_bytes = vec![0u8; kw_len];
-    r.read_exact(&mut kw_bytes)?;
-    let def_keyword = String::from_utf8_lossy(&kw_bytes).into_owned();
-
-    // visibility
-    r.read_exact(&mut buf1)?;
-    let visibility = u8_to_visibility(buf1[0]);
-
-    // container
-    r.read_exact(&mut buf1)?;
-    let container = if buf1[0] == 1 {
-        r.read_exact(&mut buf2)?;
-        let c_len = u16::from_le_bytes(buf2) as usize;
-        let mut c_bytes = vec![0u8; c_len];
-        r.read_exact(&mut c_bytes)?;
-        Some(String::from_utf8_lossy(&c_bytes).into_owned())
-    } else {
-        None
-    };
-
-    // depth
-    r.read_exact(&mut buf4)?;
-    let depth = u32::from_le_bytes(buf4) as usize;
-
-    Ok(Symbol {
-        name,
-        kind,
-        line,
-        col,
-        def_keyword,
-        doc_comment: None,
-        signature: None,
-        visibility,
-        container,
-        depth,
-        scope_end_line: None,
-    })
-}
-
-fn symbol_kind_to_u8(k: SymbolKind) -> u8 {
-    match k {
-        SymbolKind::Function => 0,
-        SymbolKind::Method => 1,
-        SymbolKind::Class => 2,
-        SymbolKind::Struct => 3,
-        SymbolKind::Enum => 4,
-        SymbolKind::Interface => 5,
-        SymbolKind::Constant => 6,
-        SymbolKind::Variable => 7,
-        SymbolKind::Module => 8,
-        SymbolKind::TypeAlias => 9,
-        SymbolKind::Trait => 10,
-        SymbolKind::Unknown => 255,
-    }
-}
-
-fn u8_to_symbol_kind(b: u8) -> SymbolKind {
-    match b {
-        0 => SymbolKind::Function,
-        1 => SymbolKind::Method,
-        2 => SymbolKind::Class,
-        3 => SymbolKind::Struct,
-        4 => SymbolKind::Enum,
-        5 => SymbolKind::Interface,
-        6 => SymbolKind::Constant,
-        7 => SymbolKind::Variable,
-        8 => SymbolKind::Module,
-        9 => SymbolKind::TypeAlias,
-        10 => SymbolKind::Trait,
-        _ => SymbolKind::Unknown,
-    }
-}
-
-fn visibility_to_u8(v: Visibility) -> u8 {
-    match v {
-        Visibility::Public => 0,
-        Visibility::Private => 1,
-        Visibility::Unknown => 2,
-    }
-}
-
-fn u8_to_visibility(b: u8) -> Visibility {
-    match b {
-        0 => Visibility::Public,
-        1 => Visibility::Private,
-        _ => Visibility::Unknown,
+/// Serialize LangFamily as a u32 for the manifest table.
+fn lang_to_u32(l: LangFamily) -> u32 {
+    match l {
+        LangFamily::CLike => 1,
+        LangFamily::Rust => 2,
+        LangFamily::Python => 3,
+        LangFamily::JsTs => 4,
+        LangFamily::Go => 5,
+        LangFamily::JavaCSharp => 6,
+        LangFamily::Ruby => 7,
     }
 }
 
@@ -2472,19 +2055,14 @@ mod tests {
     }
 
     #[test]
-    fn word_index_references_correct_across_batches() {
-        // Verifies the word index (compact entry sort + write + read-back)
-        // produces correct find_references results when entries span
-        // multiple batches. Tests the full pipeline: tokenize → drain →
-        // compact intern → sort → write → disk read.
+    fn cross_file_references_at_scale() {
+        // Verifies find_references is correct when many files share an
+        // identifier — exercises the full posting-list pipeline.
         let dir = tempfile::tempdir().unwrap();
-
-        // Create files that share identifiers across batch boundaries.
-        // File 0-499 (batch 0) and 500-509 (batch 1) all reference "cross_batch_name".
         for i in 0..510 {
             let name = format!("f_{i}.rs");
             let content = format!(
-                "fn func_{i}() {{ cross_batch_name(); }}\nfn cross_batch_name() {{}}",
+                "fn func_{i}() {{ shared_name(); }}\nfn shared_name() {{}}",
                 i = i,
             );
             std::fs::write(dir.path().join(&name), content).unwrap();
@@ -2493,76 +2071,10 @@ mod tests {
         let ws = Workspace::new();
         ws.scan_directory(dir.path(), None);
 
-        // find_references reads from the on-disk word index built by scan_directory.
-        // This exercises the full compact entry pipeline.
-        let refs = ws.find_references("cross_batch_name");
-        // Each file has 2 occurrences of cross_batch_name (call + def)
-        assert_eq!(
-            refs.len(),
-            510 * 2,
-            "cross_batch_name should have {} references (2 per file), got {}",
-            510 * 2,
-            refs.len()
-        );
-
-        // Verify a function that only exists in batch 1 (file 505)
-        let refs = ws.find_references("func_505");
-        assert_eq!(
-            refs.len(),
-            1,
-            "func_505 should have 1 reference, got {}",
-            refs.len()
-        );
-
-        // Verify a function from batch 0 (file 10)
-        let refs = ws.find_references("func_10");
-        assert_eq!(
-            refs.len(),
-            1,
-            "func_10 should have 1 reference, got {}",
-            refs.len()
-        );
-
-        // Verify definitions work across batches too
-        let defs = ws.find_definitions("func_505");
-        assert_eq!(defs.len(), 1);
-        let defs = ws.find_definitions("cross_batch_name");
-        assert_eq!(defs.len(), 510);
-    }
-
-    #[test]
-    fn word_index_sort_order_matches_lexicographic() {
-        // The compact entry builder uses intern IDs and a sort-rank mapping.
-        // Verify that the final on-disk order matches the expected lexicographic
-        // order by querying words that would sort differently by ID vs string.
-        let dir = tempfile::tempdir().unwrap();
-
-        // Create files with identifiers that have a different insertion order
-        // than lexicographic order: "zebra" inserted before "alpha".
-        std::fs::write(dir.path().join("first.rs"), "fn zebra() {}\nfn alpha() {}").unwrap();
-        std::fs::write(
-            dir.path().join("second.rs"),
-            "fn middle() {}\nfn alpha() {}",
-        )
-        .unwrap();
-
-        let ws = Workspace::new();
-        ws.scan_directory(dir.path(), None);
-
-        // All three words should be findable via the word index
-        let refs_alpha = ws.find_references("alpha");
-        assert!(refs_alpha.len() >= 2, "alpha should appear in both files");
-
-        let refs_middle = ws.find_references("middle");
-        assert_eq!(refs_middle.len(), 1);
-
-        let refs_zebra = ws.find_references("zebra");
-        assert_eq!(refs_zebra.len(), 1);
-
-        // Definitions should also work (these go through the SymbolRef path)
-        assert_eq!(ws.find_definitions("alpha").len(), 2);
-        assert_eq!(ws.find_definitions("middle").len(), 1);
-        assert_eq!(ws.find_definitions("zebra").len(), 1);
+        let refs = ws.find_references("shared_name");
+        assert_eq!(refs.len(), 510 * 2, "2 refs per file (call + def)");
+        assert_eq!(ws.find_definitions("shared_name").len(), 510);
+        assert_eq!(ws.find_references("func_505").len(), 1);
     }
 
     #[test]
