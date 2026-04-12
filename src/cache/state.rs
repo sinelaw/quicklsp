@@ -123,6 +123,112 @@ impl CacheState {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         Ok(stored == Some(current))
     }
+
+    /// Locate prior manifests for the same `repo_id` whose `working_dir` is
+    /// an ancestor or descendant of ours (see design §5.2). Returns rows
+    /// re-prefixed to our current `working_dir`. Already-verified Layer A
+    /// hits are trusted; stat validation happens later in the main scan.
+    pub fn collect_subsumable_rows(&self) -> Vec<ManifestRow> {
+        let Some(reg_path) = layout::registry_path() else {
+            return Vec::new();
+        };
+        let Ok(reg) = Registry::open(&reg_path) else {
+            return Vec::new();
+        };
+        let others = reg
+            .worktrees_for_repo(&self.identity.repo_id)
+            .unwrap_or_default();
+
+        let here = &self.identity.working_dir;
+        let mut out: Vec<ManifestRow> = Vec::new();
+        // For deterministic conflict resolution between overlapping subtrees,
+        // higher generation wins; a later pass de-dupes by rel_path.
+        for wt in others {
+            if wt.worktree_key == self.identity.worktree_key {
+                continue;
+            }
+            let other_dir = &wt.working_dir;
+            let relation = path_relation(here, other_dir);
+            let Some(kind) = relation else {
+                continue;
+            };
+            let Some(other_dir_abs) =
+                layout::worktree_dir(&wt.repo_id, &wt.worktree_key)
+            else {
+                continue;
+            };
+            let other_manifest_path = other_dir_abs.join("manifest.sqlite");
+            if !other_manifest_path.exists() {
+                continue;
+            }
+            let Ok(other_manifest) = Manifest::open(&other_manifest_path) else {
+                continue;
+            };
+            match kind {
+                PathRelation::OtherIsDescendant(rel) => {
+                    // Opening a parent of an already-indexed subtree.
+                    // Their rel_paths are relative to other_dir; ours need
+                    // to be prefixed with `rel/`.
+                    let rows = other_manifest.all_rows().unwrap_or_default();
+                    for mut r in rows {
+                        r.rel_path = format!(
+                            "{}{}{}",
+                            rel,
+                            std::path::MAIN_SEPARATOR,
+                            r.rel_path
+                        );
+                        out.push(r);
+                    }
+                }
+                PathRelation::OtherIsAncestor(rel) => {
+                    // Opening a child of an indexed parent. We only want
+                    // their rows under `rel/`, with that prefix stripped.
+                    let prefix_with_sep = format!("{}{}", rel, std::path::MAIN_SEPARATOR);
+                    let rows = other_manifest
+                        .rows_with_prefix(&prefix_with_sep)
+                        .unwrap_or_default();
+                    for mut r in rows {
+                        r.rel_path = r
+                            .rel_path
+                            .strip_prefix(&prefix_with_sep)
+                            .unwrap_or(&r.rel_path)
+                            .to_string();
+                        out.push(r);
+                    }
+                }
+            }
+        }
+        // De-dupe by rel_path, highest generation wins.
+        out.sort_by(|a, b| a.rel_path.cmp(&b.rel_path).then(b.generation.cmp(&a.generation)));
+        out.dedup_by(|a, b| a.rel_path == b.rel_path);
+        out
+    }
+}
+
+#[derive(Debug)]
+enum PathRelation {
+    /// Our working_dir contains the other one; `String` is the sub-path from us to them.
+    OtherIsDescendant(String),
+    /// The other working_dir contains ours; `String` is the sub-path from them to us.
+    OtherIsAncestor(String),
+}
+
+fn path_relation(here: &Path, other: &Path) -> Option<PathRelation> {
+    if let Ok(rel) = other.strip_prefix(here) {
+        let s = rel.to_string_lossy().into_owned();
+        if s.is_empty() {
+            return None;
+        }
+        return Some(PathRelation::OtherIsDescendant(s));
+    }
+    if let Ok(rel) = here.strip_prefix(other) {
+        let s = rel.to_string_lossy().into_owned();
+        if s.is_empty() {
+            return None;
+        }
+        return Some(PathRelation::OtherIsAncestor(s));
+    }
+    None
 }
 
 /// Opaque handle used during a scan: parses a file to a `FileUnit` if
