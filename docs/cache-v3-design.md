@@ -133,8 +133,16 @@ CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
 repo_id, worktree_key := detect_identity(root)
 open manifest (SQLite WAL), open content index (LMDB)
 if manifest matches current parser_version and stat-fresh: warm start
+
+# Manifest subsumption (see §5.2)
 else:
-    par_for each file (rayon):
+    candidates := registry.query(repo_id = this_repo)
+                          .filter(|wt| is_ancestor_or_descendant(root, wt.working_dir))
+    for each candidate, generation-descending:
+        copy+re-prefix rows into new manifest (INSERT ... SELECT)
+        mark those rel_paths as "provisionally fresh"
+
+    par_for each file (rayon), skipping provisionally-fresh paths whose stat matches:
         stat → (size, mtime)
         if clean+tracked in git: hash := git_oid_to_blake3(oid)
         else:                    hash := blake3(read_file)
@@ -145,21 +153,54 @@ else:
 build in-memory posting list from manifest + Layer A
 ```
 
-### 5.2 Branch switch
+### 5.2 Manifest subsumption (parent/child directory reuse)
+
+When a user opens a root whose canonical path is an ancestor or descendant of a
+previously-indexed worktree under the **same `repo_id`**, we reuse that
+manifest instead of scanning from scratch.
+
+**Registry query.** Before scanning, ask the registry for all existing
+`worktree_key`s with matching `repo_id` and filter by canonical-path prefix
+relationship.
+
+**Row copy with prefix rewrite.** For each matching child/parent manifest:
+
+- **Opening a parent** (`/repo/` after `/repo/src/` was indexed): copy all rows
+  from the child manifest, prepending the relative subpath (`src/`) to each
+  `rel_path`. Then scan only the delta — siblings of the child subtree.
+- **Opening a child** (`/repo/src/` after `/repo/` was indexed): copy rows
+  whose `rel_path` starts with `src/`, stripping the prefix. No filesystem
+  scan of content needed beyond the stat-freshness pass.
+
+**Conflict resolution.** Overlapping subtrees (e.g. `/repo/src/` and
+`/repo/src/parser/`): prefer the manifest with the highest `generation`; break
+ties by `built_at`.
+
+**Staleness handling.** Copied rows are "provisionally fresh"; the normal stat
+fast-path (§5.4) validates each. Mismatches fall back to re-hash, which still
+hits Layer A in the common case — no parsing required.
+
+**Properties.**
+- Zero AST work: all `FileUnit`s already live in Layer A (global per user).
+- Zero novel hashing for subsumed paths; at most one stat per file.
+- Works for non-git trees too, as long as `repo_id` agrees (e.g. same
+  canonical-path fingerprint root).
+
+### 5.3 Branch switch
 
 Driven by `didChangeWatchedFiles` or HEAD-change detection, scoped to
 `git diff --name-only old_head new_head`. For each changed path: look up new
 `content_hash`; O(1) resolution via Layer A in the common case; only novel
 content triggers parsing.
 
-### 5.3 Freshness fast-path
+### 5.4 Freshness fast-path
 
 1. `(size, mtime)` match against manifest row → HIT, no hashing.
 2. Else, `git_oid` match against manifest row → HIT, touch mtime.
 3. Else, look up `git_oid_to_blake3` side table → HIT, update manifest row.
 4. Else, read bytes + BLAKE3 + possibly parse.
 
-### 5.4 Unsaved editor buffers
+### 5.5 Unsaved editor buffers
 
 - In-memory overlays in `Workspace`, scoped to the owning LSP process.
 - Overlay wins for that path over any on-disk `FileUnit`.
@@ -178,6 +219,7 @@ content triggers parsing.
 | Layer B engine | SQLite WAL, one DB per worktree | Shared SQLite / custom WAL | Many-reader/one-writer story; indexed path lookups; isolation. |
 | Cross-LSP concurrency | MVCC reads + per-writer locks | Global mutex / bespoke multi-WAL | Scales to N windows without a coordinator. |
 | Cache scope | Global per user | Per-repo | Maximal dedup (e.g. vendored deps); one GC policy. |
+| Parent/child directory reuse | Manifest subsumption via registry + prefix rewrite | Rescan every new root | Opening a parent/child of an indexed subtree costs only a stat pass. |
 | Branch-switch acceleration | Git-diff driven incremental rescan | Snapshots / Merkle manifests | Simplest; uses git's own diff machinery. |
 | GC | Mark-and-sweep over union of manifests | Refcount on write | Race-free under idempotent appends. |
 
@@ -192,6 +234,8 @@ content triggers parsing.
 
 - Opening a **new clone** of a known repo: no parsing, manifest build only.
 - Adding a **new git worktree**: no parsing, manifest build only.
+- Opening a **parent or child** of an already-indexed directory: no parsing,
+  manifest rows copied with a prefix rewrite.
 - **Switching branches:** parse only files whose content actually changed.
 - **Disk usage:** one copy of each unique file's index data per user.
 - **Multiple editor windows** on multiple worktrees: concurrent, no lock contention.
