@@ -293,7 +293,9 @@ impl Workspace {
     }
 
     /// Populate in-memory `files` / `definitions` / `file_ids` for one file.
+    /// Replaces any prior entry for `path` (clears stale definitions first).
     fn install_file_unit(&self, path: PathBuf, unit: &FileUnit) {
+        self.remove_definitions_for_file(&path);
         let fid = self.get_or_create_file_id(&path);
         for (idx, sym) in unit.symbols.iter().enumerate() {
             let is_local = sym.depth > 0
@@ -381,7 +383,7 @@ impl Workspace {
         // ── Phase 2: collect paths and classify against manifest ─────────
         let mut paths = Vec::new();
         let mut skipped = 0usize;
-        Self::collect_paths(root, &self.files, &mut paths, &mut skipped, 0);
+        Self::collect_paths(root, &self.open_sources, &mut paths, &mut skipped, 0);
         let total_files = paths.len();
 
         // Load existing rows keyed by rel_path (for stat-freshness check).
@@ -672,7 +674,7 @@ impl Workspace {
     ) -> ScanStats {
         let mut paths = Vec::new();
         let mut skipped = 0usize;
-        Self::collect_paths(root, &self.files, &mut paths, &mut skipped, 0);
+        Self::collect_paths(root, &self.open_sources, &mut paths, &mut skipped, 0);
         let total_files = paths.len();
         let indexed = AtomicUsize::new(0);
         let errors = AtomicUsize::new(0);
@@ -725,9 +727,13 @@ impl Workspace {
     const MAX_SCAN_DEPTH: usize = 20;
 
     /// Collect file paths eligible for indexing (sequential directory walk).
+    ///
+    /// `open_overlays` contains paths whose content the editor has open
+    /// with unsaved changes — those are skipped so the on-disk state
+    /// doesn't clobber the in-memory overlay.
     fn collect_paths(
         dir: &Path,
-        existing_files: &DashMap<PathBuf, FileEntry>,
+        open_overlays: &DashMap<PathBuf, String>,
         paths: &mut Vec<PathBuf>,
         skipped: &mut usize,
         depth: usize,
@@ -750,7 +756,7 @@ impl Workspace {
                         continue;
                     }
                 }
-                Self::collect_paths(&path, existing_files, paths, skipped, depth + 1);
+                Self::collect_paths(&path, open_overlays, paths, skipped, depth + 1);
             } else if path.is_file() {
                 let has_lang = path
                     .extension()
@@ -762,8 +768,9 @@ impl Workspace {
                     continue;
                 }
 
-                // Skip files already opened by the editor (they have fresher content)
-                if existing_files.contains_key(&path) {
+                // Skip files that the editor has open with unsaved changes —
+                // their in-memory overlay is authoritative.
+                if open_overlays.contains_key(&path) {
                     *skipped += 1;
                     continue;
                 }

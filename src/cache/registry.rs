@@ -83,6 +83,17 @@ impl Registry {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
+
+    /// All registered worktrees (used for subsumption path-prefix queries).
+    pub fn all_worktrees(&self) -> rusqlite::Result<Vec<RegisteredWorktree>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT repo_id, worktree_key, working_dir, last_seen FROM worktrees",
+        )?;
+        let rows = stmt
+            .query_map([], registered_from_sql)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
 }
 
 fn registered_from_sql(r: &rusqlite::Row) -> rusqlite::Result<RegisteredWorktree> {

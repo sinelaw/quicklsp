@@ -135,9 +135,12 @@ impl CacheState {
         let Ok(reg) = Registry::open(&reg_path) else {
             return Vec::new();
         };
-        let others = reg
-            .worktrees_for_repo(&self.identity.repo_id)
-            .unwrap_or_default();
+        // Query all registered worktrees and filter by path relation.
+        // Ancestor/descendant path relationship is sufficient — row
+        // subsumption is independent of git-level repo identity (see
+        // design §5.2). The stat fast-path later validates each row
+        // regardless of origin.
+        let others = reg.all_worktrees().unwrap_or_default();
 
         let here = &self.identity.working_dir;
         let mut out: Vec<ManifestRow> = Vec::new();
