@@ -16,6 +16,10 @@ name = "quicklsp-bench"
 path = "src/bin/bench.rs"
 
 [[bin]]
+name = "quicklsp-cache-demo"
+path = "src/bin/cache_demo.rs"
+
+[[bin]]
 name = "tokenizer-stats"
 path = "src/bin/tokenizer_stats.rs"
 
