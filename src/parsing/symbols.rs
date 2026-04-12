@@ -3,7 +3,7 @@
 use super::tokenizer::{DefContext, LangFamily, Token, TokenKind, Visibility};
 
 /// A symbol extracted from source code.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Symbol {
     pub name: String,
     pub kind: SymbolKind,
@@ -29,7 +29,7 @@ pub struct Symbol {
     pub scope_end_line: Option<usize>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum SymbolKind {
     Function,
     Method,
